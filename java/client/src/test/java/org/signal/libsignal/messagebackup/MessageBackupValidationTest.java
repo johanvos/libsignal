@@ -7,27 +7,52 @@ package org.signal.libsignal.messagebackup;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.UUID;
 import java.util.function.Supplier;
 import org.junit.Test;
 import org.signal.libsignal.protocol.ServiceId.Aci;
+import org.signal.libsignal.protocol.kdf.HKDF;
+import org.signal.libsignal.protocol.util.ByteUtil;
 import org.signal.libsignal.util.ResourceReader;
 
 public class MessageBackupValidationTest {
 
   static MessageBackupKey makeMessageBackupKey() {
-    byte[] masterKey = new byte[32];
-    for (int i = 0; i < masterKey.length; ++i) {
-      masterKey[i] = 'M';
-    }
+    String accountEntropy = "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
     Aci aci = new Aci(new UUID(0x1111111111111111L, 0x1111111111111111L));
-    return new MessageBackupKey(masterKey, aci);
+    return new MessageBackupKey(accountEntropy, aci);
+  }
+
+  static MessageBackupKey makeMessageBackupKeyFromBackupId() {
+    String accountEntropy = "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
+    Aci aci = new Aci(new UUID(0x1111111111111111L, 0x1111111111111111L));
+
+    byte[] backupKey =
+        HKDF.deriveSecrets(
+            accountEntropy.getBytes(StandardCharsets.UTF_8),
+            "20240801_SIGNAL_BACKUP_KEY".getBytes(StandardCharsets.UTF_8),
+            32);
+    byte[] backupId =
+        HKDF.deriveSecrets(
+            backupKey,
+            ByteUtil.combine(
+                "20241024_SIGNAL_BACKUP_ID:".getBytes(StandardCharsets.UTF_8),
+                aci.toServiceIdBinary()),
+            16);
+    try {
+      return new MessageBackupKey(new BackupKey(backupKey), backupId);
+    } catch (Exception e) {
+      throw new AssertionError(e);
+    }
   }
 
   static final String VALID_BACKUP_RESOURCE_NAME = "encryptedbackup.binproto.encrypted";
@@ -47,6 +72,23 @@ public class MessageBackupValidationTest {
     MessageBackup.ValidationResult result =
         MessageBackup.validate(key, BACKUP_PURPOSE, factory, length);
     assertArrayEquals(result.unknownFieldMessages, new String[0]);
+
+    // Verify that the key can also be created from a backup ID and produce the same result.
+    MessageBackupKey keyFromBackupId = makeMessageBackupKeyFromBackupId();
+    MessageBackup.ValidationResult result2 =
+        MessageBackup.validate(keyFromBackupId, BACKUP_PURPOSE, factory, length);
+    assertArrayEquals(result2.unknownFieldMessages, new String[0]);
+  }
+
+  @Test
+  public void messageBackupKeyPartsSmokeTest() {
+    MessageBackupKey key = makeMessageBackupKey();
+    // Just check some basic expectations.
+    byte[] hmacKey = key.getHmacKey();
+    byte[] aesKey = key.getAesKey();
+    assertEquals(32, hmacKey.length);
+    assertEquals(32, aesKey.length);
+    assertFalse(Arrays.equals(hmacKey, aesKey));
   }
 
   @Test

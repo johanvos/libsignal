@@ -3,24 +3,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use neon::prelude::*;
-use neon::types::JsBigInt;
-use paste::paste;
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-
 use std::fmt::Display;
 use std::hash::Hasher;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, RangeInclusive};
 use std::slice;
 
-use crate::io::{InputStream, SyncInputStream};
-use crate::net::chat::{MakeChatListener, ResponseAndDebugInfo};
-use crate::node::chat::NodeMakeChatListener;
-use crate::support::{extend_lifetime, Array, AsType, FixedLengthBincodeSerializable, Serialized};
+use neon::prelude::*;
+use neon::types::JsBigInt;
+use paste::paste;
 
 use super::*;
+use crate::io::{InputStream, SyncInputStream};
+use crate::message_backup::MessageBackupValidationOutcome;
+use crate::net::chat::{ChatListener, ResponseAndDebugInfo};
+use crate::node::chat::NodeChatListener;
+use crate::support::{extend_lifetime, Array, AsType, FixedLengthBincodeSerializable, Serialized};
 
 /// Converts arguments from their JavaScript form to their Rust form.
 ///
@@ -258,6 +258,7 @@ pub(super) const MAX_SAFE_JS_INTEGER: f64 = 9007199254740991.0;
 /// [`Number.MAX_SAFE_INTEGER`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER
 impl SimpleArgTypeInfo for crate::protocol::Timestamp {
     type ArgType = JsNumber;
+    #[allow(clippy::cast_possible_truncation)]
     fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
         let value = foreign.value(cx);
         if !can_convert_js_number_to_int(value, 0.0..=MAX_SAFE_JS_INTEGER) {
@@ -272,6 +273,7 @@ impl SimpleArgTypeInfo for crate::protocol::Timestamp {
 /// [`Number.MAX_SAFE_INTEGER`]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Number/MAX_SAFE_INTEGER
 impl SimpleArgTypeInfo for crate::zkgroup::Timestamp {
     type ArgType = JsNumber;
+    #[allow(clippy::cast_possible_truncation)]
     fn convert_from(cx: &mut FunctionContext, foreign: Handle<Self::ArgType>) -> NeonResult<Self> {
         let value = foreign.value(cx);
         if !can_convert_js_number_to_int(value, 0.0..=MAX_SAFE_JS_INTEGER) {
@@ -338,7 +340,7 @@ impl SimpleArgTypeInfo for libsignal_protocol::Pni {
     }
 }
 
-impl SimpleArgTypeInfo for libsignal_net::cdsi::E164 {
+impl SimpleArgTypeInfo for libsignal_core::E164 {
     type ArgType = <String as SimpleArgTypeInfo>::ArgType;
     fn convert_from(cx: &mut FunctionContext, e164: Handle<Self::ArgType>) -> NeonResult<Self> {
         let e164 = String::convert_from(cx, e164)?;
@@ -650,21 +652,19 @@ bridge_trait!(SignedPreKeyStore);
 bridge_trait!(KyberPreKeyStore);
 bridge_trait!(InputStream);
 
-impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context>
-    for &'storage dyn MakeChatListener
-{
+impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context> for Box<dyn ChatListener> {
     type ArgType = JsObject;
-    type StoredType = NodeMakeChatListener;
+    type StoredType = NodeChatListener;
 
     fn borrow(
         cx: &mut FunctionContext<'context>,
         foreign: Handle<'context, Self::ArgType>,
     ) -> NeonResult<Self::StoredType> {
-        Ok(NodeMakeChatListener::new(cx, foreign))
+        NodeChatListener::new(cx, foreign)
     }
 
     fn load_from(stored: &'storage mut Self::StoredType) -> Self {
-        stored
+        stored.make_listener()
     }
 }
 
@@ -889,7 +889,7 @@ impl<'a> ResultTypeInfo<'a> for () {
     }
 }
 
-impl<'a> ResultTypeInfo<'a> for crate::message_backup::MessageBackupValidationOutcome {
+impl<'a> ResultTypeInfo<'a> for MessageBackupValidationOutcome {
     type ResultType = JsObject;
 
     fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
@@ -898,14 +898,21 @@ impl<'a> ResultTypeInfo<'a> for crate::message_backup::MessageBackupValidationOu
             found_unknown_fields,
         } = self;
         let error_message = error_message.convert_into(cx)?;
-        let unknown_field_messages =
-            make_array(cx, found_unknown_fields.into_iter().map(|s| s.to_string()))?;
+        let unknown_field_messages = found_unknown_fields.as_slice().convert_into(cx)?;
 
         let obj = JsObject::new(cx);
         obj.set(cx, "errorMessage", error_message)?;
         obj.set(cx, "unknownFieldMessages", unknown_field_messages)?;
 
         Ok(obj)
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for &[libsignal_message_backup::FoundUnknownField] {
+    type ResultType = JsArray;
+
+    fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
+        make_array(cx, self.iter().map(ToString::to_string))
     }
 }
 
@@ -971,19 +978,16 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::DebugInfo {
     type ResultType = JsObject;
     fn convert_into(self, cx: &mut impl Context<'a>) -> JsResult<'a, Self::ResultType> {
         let Self {
-            reconnect_count,
             ip_type,
             duration,
             connection_info,
         } = self;
         let obj = JsObject::new(cx);
 
-        let reconnect_count = cx.number(reconnect_count);
         let ip_type = cx.number(ip_type as u8);
         let duration = cx.number(duration.as_millis().try_into().unwrap_or(u32::MAX));
         let connection_info = cx.string(connection_info);
 
-        obj.set(cx, "reconnectCount", reconnect_count)?;
         obj.set(cx, "ipType", ip_type)?;
         obj.set(cx, "durationMillis", duration)?;
         obj.set(cx, "connectionInfo", connection_info)?;
@@ -1068,6 +1072,7 @@ macro_rules! full_range_integer {
         #[doc = "Converts all valid integer values for the type."]
         impl SimpleArgTypeInfo for $typ {
             type ArgType = JsNumber;
+            #[allow(clippy::cast_possible_truncation)]
             fn convert_from(
                 cx: &mut FunctionContext,
                 foreign: Handle<Self::ArgType>,
@@ -1454,7 +1459,7 @@ pub fn clone_from_array_of_wrappers<'a, T: BridgeHandle<Strategy = Mutable<T>> +
 #[macro_export]
 macro_rules! node_bridge_as_handle {
     ( $typ:ty as false $(, $($_:tt)*)? ) => {};
-    ( $typ:ty as $node_name:ident ) => {
+    ( $typ:ty as $node_name:ident $(, mut = false)? ) => {
         ::paste::paste! {
             #[doc = "ts: interface " $typ " { readonly __type: unique symbol; }"]
             impl node::BridgeHandle for $typ {

@@ -7,22 +7,20 @@ use std::convert::TryInto as _;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
-use rand::rngs::OsRng;
-
 use libsignal_bridge_macros::{bridge_fn, bridge_io};
 use libsignal_bridge_types::net::Svr3Clients;
-use libsignal_net::auth::Auth;
-use libsignal_net::svr3::{
-    self, migrate_backup, restore_with_fallback, OpaqueMaskedShareSet, Svr3Client as _,
-};
-
 pub use libsignal_bridge_types::net::{ConnectionManager, Environment, TokioAsyncContext};
+use libsignal_net::auth::Auth;
+use libsignal_net::svr3::traits::*;
+use libsignal_net::svr3::{self, migrate_backup, restore_with_fallback, OpaqueMaskedShareSet};
+use rand::rngs::OsRng;
 
 use crate::support::*;
 use crate::*;
 
 pub(crate) mod cdsi;
 pub(crate) mod chat;
+mod keytrans;
 mod tokio;
 
 bridge_handle_fns!(ConnectionManager, clone = false);
@@ -32,7 +30,7 @@ fn ConnectionManager_new(
     environment: AsType<Environment, u8>,
     user_agent: String,
 ) -> ConnectionManager {
-    ConnectionManager::new(environment.into_inner(), user_agent)
+    ConnectionManager::new(environment.into_inner(), user_agent.as_str())
 }
 
 #[bridge_fn]
@@ -55,6 +53,19 @@ fn ConnectionManager_clear_proxy(connection_manager: &ConnectionManager) {
 #[bridge_fn(jni = false, ffi = false)]
 fn ConnectionManager_set_ipv6_enabled(connection_manager: &ConnectionManager, ipv6_enabled: bool) {
     connection_manager.set_ipv6_enabled(ipv6_enabled)
+}
+
+#[bridge_fn]
+fn ConnectionManager_set_censorship_circumvention_enabled(
+    connection_manager: &ConnectionManager,
+    enabled: bool,
+) {
+    connection_manager.set_censorship_circumvention_enabled(enabled)
+}
+
+#[bridge_fn]
+fn ConnectionManager_on_network_change(connection_manager: &ConnectionManager) {
+    connection_manager.on_network_change()
 }
 
 #[bridge_fn]
@@ -108,7 +119,7 @@ async fn Svr3Migrate(
 
     let clients = Svr3Clients::new(connection_manager, username, enclave_password);
     let share_set = migrate_backup(
-        (clients.previous, clients.current),
+        (&clients.previous, &clients.current),
         &password,
         secret,
         max_tries.into_inner(),
@@ -134,7 +145,7 @@ async fn Svr3Restore(
     // `DataMissing` error, similarly to how the actual migrated-from environment
     // would.
     let restored_secret = restore_with_fallback(
-        (clients.current, clients.previous),
+        (&clients.current, &clients.previous),
         &password,
         share_set,
         &mut rng,
@@ -156,14 +167,31 @@ async fn Svr3Remove(
     client.remove().await
 }
 
+#[bridge_io(TokioAsyncContext, node = false)]
+async fn Svr3Rotate(
+    connection_manager: &ConnectionManager,
+    share_set: Box<[u8]>,
+    username: String,         // hex-encoded uid
+    enclave_password: String, // timestamp:otp(...)
+) -> Result<(), svr3::Error> {
+    // Secret rotation assumes that any migration that needed to happen already
+    // happened, and, just like with `backup`, it is always performed on the
+    // current set of SVR3 enclaves.
+    let client = Svr3Clients::new(connection_manager, username, enclave_password).current;
+    let mut rng = OsRng;
+    let share_set = OpaqueMaskedShareSet::deserialize(&share_set)?;
+    client.rotate(share_set, &mut rng).await
+}
+
 #[cfg(test)]
 mod test {
-    use super::*;
     use test_case::test_case;
+
+    use super::*;
 
     #[test_case(Environment::Staging; "staging")]
     #[test_case(Environment::Prod; "prod")]
     fn can_create_connection_manager(env: Environment) {
-        let _ = ConnectionManager::new(env, "test-user-agent".to_string());
+        let _ = ConnectionManager::new(env, "test-user-agent");
     }
 }

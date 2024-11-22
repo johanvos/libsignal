@@ -32,6 +32,7 @@ USER libsignal
 ENV HOME /home/libsignal
 ENV USER libsignal
 ENV SHELL /bin/bash
+ENV LANG C.UTF-8
 
 WORKDIR /home/libsignal
 
@@ -40,7 +41,7 @@ ARG ANDROID_SDK_FILENAME=commandlinetools-linux-7583922_latest.zip
 ARG ANDROID_SDK_SHA=124f2d5115eee365df6cf3228ffbca6fc3911d16f8025bebd5b1c6e2fcfa7faf
 ARG ANDROID_API_LEVELS=android-34
 ARG ANDROID_BUILD_TOOLS_VERSION=34.0.0
-ARG NDK_VERSION=25.2.9519653
+ARG NDK_VERSION=27.0.12077973
 ENV ANDROID_HOME /home/libsignal/android-sdk
 ENV PATH ${PATH}:${ANDROID_HOME}/tools:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/cmdline-tools/bin
 
@@ -53,7 +54,7 @@ RUN    unzip -q ${ANDROID_SDK_FILENAME} -d android-sdk \
 RUN    yes | sdkmanager --sdk_root=${ANDROID_HOME} "platforms;${ANDROID_API_LEVELS}" "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" "platform-tools" "ndk;${NDK_VERSION}"
 
 # Pre-download Gradle.
-COPY   java/gradle gradle
+COPY   java/gradle/wrapper gradle/wrapper
 COPY   java/gradlew gradlew
 RUN    ./gradlew --version
 
@@ -69,7 +70,7 @@ ADD --chown=libsignal --chmod=755 --checksum=sha256:${RUSTUP_SHA} \
 RUN    /tmp/rustup-init -y --profile minimal --default-toolchain "$(cat rust-toolchain)" \
     && rm -rf /tmp/rustup-init
 
-RUN    rustup target add armv7-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android
+RUN    rustup target add armv7-linux-androideabi aarch64-linux-android i686-linux-android x86_64-linux-android aarch64-unknown-linux-gnu
 
 # Install the full set of tools now that the long setup steps are done.
 # Note that we temporarily hop back to root to do this.
@@ -79,6 +80,7 @@ USER root
 RUN    apt-get install -y \
                clang \
                cmake \
+               crossbuild-essential-arm64 \
                git \
                gpg-agent \
                libclang-dev \

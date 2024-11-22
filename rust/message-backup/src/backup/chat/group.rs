@@ -10,12 +10,13 @@
 use std::fmt::Debug;
 
 use itertools::Itertools as _;
-use libsignal_protocol::{Aci, Pni, ServiceId};
+use libsignal_core::{Aci, Pni, ServiceId};
 use macro_rules_attribute::macro_rules_derive;
 use protobuf::{EnumOrUnknown, Message};
 
+use crate::backup::serialize::UnorderedList;
 use crate::backup::time::Duration;
-use crate::backup::uuid_bytes_to_aci;
+use crate::backup::{serialize, uuid_bytes_to_aci};
 use crate::proto::backup::{
     self as proto, group_invitation_revoked_update, GenericGroupUpdate, GroupAdminStatusUpdate,
     GroupAnnouncementOnlyChangeUpdate, GroupAttributesAccessLevelChangeUpdate, GroupAvatarUpdate,
@@ -45,7 +46,10 @@ macro_rules! TryFromProto {
     ($( #[$attrs:meta] )*
     pub enum GroupChatUpdate { $(
         $VariantName:ident $({
-            $($field:ident : $typ:ty,)*
+            $(
+                $(#[$_attr: meta])*
+                $field:ident : $typ:ty,
+            )*
         })?,
     )* }) => {
         // Expand using the next match for each enum variant.
@@ -82,117 +86,150 @@ macro_rules! TryFromProto {
 
 /// Validated version of [`proto::group_change_chat_update::update::Update`].
 #[allow(clippy::enum_variant_names, non_snake_case)] // names taken from proto message.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[macro_rules_derive(TryFromProto)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum GroupChatUpdate {
     GenericGroupUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
     },
     GroupCreationUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
     },
     GroupNameUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         newGroupName: NoValidation<Option<String>>,
     },
     GroupAvatarUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         wasRemoved: NoValidation<bool>,
     },
     GroupDescriptionUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         newDescription: NoValidation<Option<String>>,
     },
     GroupMembershipAccessLevelChangeUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         accessLevel: AccessLevel,
     },
     GroupAttributesAccessLevelChangeUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         accessLevel: AccessLevel,
     },
     GroupAnnouncementOnlyChangeUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         isAnnouncementOnly: NoValidation<bool>,
     },
     GroupAdminStatusUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         memberAci: Aci,
         wasAdminStatusGranted: NoValidation<bool>,
     },
     GroupMemberLeftUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         aci: Aci,
     },
     GroupMemberRemovedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         removerAci: Option<Aci>,
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         removedAci: Aci,
     },
     SelfInvitedToGroupUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviterAci: Option<Aci>,
     },
     SelfInvitedOtherUserToGroupUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         inviteeServiceId: ServiceId,
     },
     GroupUnknownInviteeUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviterAci: Option<Aci>,
         inviteeCount: NoValidation<u32>,
     },
     GroupInvitationAcceptedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviterAci: Option<Aci>,
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         newMemberAci: Aci,
     },
     GroupInvitationDeclinedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviterAci: Option<Aci>,
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviteeAci: Option<Aci>,
     },
     GroupMemberJoinedUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         newMemberAci: Aci,
     },
     GroupMemberAddedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         newMemberAci: Aci,
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         inviterAci: Option<Aci>,
-        // TODO check that this field doesn't affect the validity of other fields in
-        // the message.
         hadOpenInvitation: NoValidation<bool>,
     },
     GroupSelfInvitationRevokedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         revokerAci: Option<Aci>,
     },
 
     GroupInvitationRevokedUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
-        invitees: Vec<Invitee>,
+        invitees: UnorderedList<Invitee>,
     },
     GroupJoinRequestUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         requestorAci: Aci,
     },
     GroupJoinRequestApprovalUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         requestorAci: Aci,
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         wasApproved: NoValidation<bool>,
     },
     GroupJoinRequestCanceledUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         requestorAci: Aci,
     },
     GroupInviteLinkResetUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
     },
 
     GroupInviteLinkEnabledUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         linkRequiresAdminApproval: NoValidation<bool>,
     },
 
     GroupInviteLinkAdminApprovalUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         linkRequiresAdminApproval: NoValidation<bool>,
     },
     GroupInviteLinkDisabledUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
     },
     GroupMemberJoinedByLinkUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         newMemberAci: Aci,
     },
     GroupV2MigrationUpdate,
@@ -204,16 +241,18 @@ pub enum GroupChatUpdate {
         droppedMembersCount: NoValidation<u32>,
     },
     GroupSequenceOfRequestsAndCancelsUpdate {
+        #[serde(serialize_with = "serialize::service_id_as_string")]
         requestorAci: Aci,
         count: NoValidation<u32>,
     },
     GroupExpirationTimerUpdate {
+        #[serde(serialize_with = "serialize::optional_service_id_as_string")]
         updaterAci: Option<Aci>,
         expiresInMs: Duration,
     },
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum AccessLevel {
     Any,
@@ -221,11 +260,14 @@ pub enum AccessLevel {
     Administrator,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Invitee {
+    #[serde(serialize_with = "serialize::optional_service_id_as_string")]
     pub inviter: Option<Aci>,
+    #[serde(serialize_with = "serialize::optional_service_id_as_string")]
     pub invitee_aci: Option<Aci>,
+    #[serde(serialize_with = "serialize::optional_service_id_as_string")]
     pub invitee_pni: Option<Pni>,
 }
 
@@ -238,8 +280,9 @@ pub struct GroupUpdateError {
     pub field_error: GroupUpdateFieldError,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
+#[serde(transparent)]
 pub struct NoValidation<T>(T);
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -253,6 +296,8 @@ pub enum GroupUpdateFieldError {
     InvalidInvitee(InviteeError),
     /// accessLevel is {0}
     AccessLevelInvalid(&'static str),
+    /// inviter ACI is present but hadOpenInvitation is false
+    InviterMismatch,
 }
 
 #[derive(Debug, displaydoc::Display)]
@@ -321,7 +366,7 @@ impl ValidateFrom<EnumOrUnknown<proto::GroupV2AccessLevel>> for AccessLevel {
     }
 }
 
-impl ValidateFrom<Vec<proto::group_invitation_revoked_update::Invitee>> for Vec<Invitee> {
+impl ValidateFrom<Vec<proto::group_invitation_revoked_update::Invitee>> for UnorderedList<Invitee> {
     fn validate_from(
         invitees: Vec<proto::group_invitation_revoked_update::Invitee>,
     ) -> Result<Self, GroupUpdateFieldError> {
@@ -333,9 +378,9 @@ impl ValidateFrom<Vec<proto::group_invitation_revoked_update::Invitee>> for Vec<
     }
 }
 
-impl ValidateFrom<u32> for Duration {
-    fn validate_from(value: u32) -> Result<Self, GroupUpdateFieldError> {
-        Ok(Self::from_millis(value.into()))
+impl ValidateFrom<u64> for Duration {
+    fn validate_from(value: u64) -> Result<Self, GroupUpdateFieldError> {
+        Ok(Self::from_millis(value))
     }
 }
 
@@ -396,7 +441,29 @@ impl TryFrom<proto::group_change_chat_update::update::Update> for GroupChatUpdat
             Update::GroupInvitationAcceptedUpdate(m) => m.try_into(),
             Update::GroupInvitationDeclinedUpdate(m) => m.try_into(),
             Update::GroupMemberJoinedUpdate(m) => m.try_into(),
-            Update::GroupMemberAddedUpdate(m) => m.try_into(),
+            Update::GroupMemberAddedUpdate(m) => {
+                let result = m.try_into()?;
+
+                let Self::GroupMemberAddedUpdate {
+                    updaterAci: _,
+                    newMemberAci: _,
+                    inviterAci,
+                    hadOpenInvitation,
+                } = result
+                else {
+                    unreachable!("wrong case constructed for GroupChatUpdate");
+                };
+
+                if inviterAci.is_some() && !hadOpenInvitation.0 {
+                    return Err(GroupUpdateError {
+                        message: "GroupMemberAddedUpdate",
+                        field_name: "inviterAci",
+                        field_error: GroupUpdateFieldError::InviterMismatch,
+                    });
+                }
+
+                Ok(result)
+            }
             Update::GroupSelfInvitationRevokedUpdate(m) => m.try_into(),
             Update::GroupInvitationRevokedUpdate(m) => m.try_into(),
             Update::GroupJoinRequestUpdate(m) => m.try_into(),
@@ -427,9 +494,8 @@ impl<T: Debug> Debug for NoValidation<T> {
 mod test {
     use test_case::test_case;
 
-    use crate::proto::backup::{group_change_chat_update, group_invitation_revoked_update};
-
     use super::*;
+    use crate::proto::backup::{group_change_chat_update, group_invitation_revoked_update};
 
     const ACI_BYTES: [u8; 16] = [0xaa; 16];
     const ACI: Aci = Aci::from_uuid_bytes(ACI_BYTES);
@@ -448,7 +514,7 @@ mod test {
         ]
     }
 
-    fn validated_invitees() -> Vec<Invitee> {
+    fn validated_invitees() -> UnorderedList<Invitee> {
         vec![
             Invitee {
                 inviter: None,
@@ -461,6 +527,7 @@ mod test {
                 invitee_aci: None,
             },
         ]
+        .into()
     }
 
     fn invitee_invalid_aci() -> Vec<group_invitation_revoked_update::Invitee> {
@@ -490,11 +557,11 @@ mod test {
     #[test_case(ACI.service_id_binary(), Ok(ServiceId::Aci(ACI)))]
     #[test_case(vec![], Err::<ServiceId, _>(InvalidServiceId))]
     #[test_case(valid_invitees(), Ok(validated_invitees()))]
-    #[test_case(vec![], Ok(vec![]))]
-    #[test_case(invitee_invalid_aci(), Err::<Vec<Invitee>,_>(InvalidInvitee(InviteeError::InviteeAci)))]
+    #[test_case(vec![], Ok(UnorderedList::from(vec![])))]
+    #[test_case(invitee_invalid_aci(), Err::<UnorderedList<Invitee>,_>(InvalidInvitee(InviteeError::InviteeAci)))]
     #[test_case(
         invitee_pni_service_id_binary(),
-        Err::<Vec<Invitee>, _>(InvalidInvitee(InviteeError::InviteePni))
+        Err::<UnorderedList<Invitee>, _>(InvalidInvitee(InviteeError::InviteePni))
     )]
     #[test_case(
         EnumOrUnknown::default(),
@@ -529,5 +596,29 @@ mod test {
             err.to_string(),
             "group update: GroupInvitationRevokedUpdate.invitees: invitee has invalid inviter ACI"
         );
+    }
+
+    #[test_case(None, false, Ok(()))]
+    #[test_case(None, true, Ok(()))]
+    #[test_case(Some(ACI), true, Ok(()))]
+    #[test_case(Some(ACI), false, Err(GroupUpdateFieldError::InviterMismatch))]
+    fn group_member_added_inviter_table(
+        inviter: Option<Aci>,
+        had_invitation: bool,
+        expected: Result<(), GroupUpdateFieldError>,
+    ) {
+        let update = group_change_chat_update::update::Update::GroupMemberAddedUpdate(
+            GroupMemberAddedUpdate {
+                newMemberAci: ACI_BYTES.to_vec(),
+                hadOpenInvitation: had_invitation,
+                inviterAci: inviter.map(|aci| aci.service_id_binary()),
+                ..Default::default()
+            },
+        );
+
+        let result = GroupChatUpdate::try_from(update)
+            .map(|_| ())
+            .map_err(|e| e.field_error);
+        assert_eq!(result, expected);
     }
 }

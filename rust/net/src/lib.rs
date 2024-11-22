@@ -5,12 +5,15 @@
 
 pub mod auth;
 pub mod cdsi;
+pub mod certs;
 pub mod chat;
 pub mod enclave;
 pub mod env;
-pub mod infra;
+pub mod keytrans;
 pub mod proto;
 pub mod svr;
 pub mod svr3;
-pub mod timeouts;
-pub mod utils;
+pub mod ws;
+
+// Re-export from `libsignal_net_infra`.
+pub use libsignal_net_infra as infra;

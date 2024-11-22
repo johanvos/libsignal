@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use boring::ec::EcKey;
-use boring::pkey::Public;
-use boring::stack::{Stack, Stackable};
-use boring::x509::crl::X509CRLRef;
-use boring::x509::store::X509StoreRef;
-use boring::x509::{X509StoreContext, X509};
-
 use std::time::SystemTime;
+
+use boring_signal::ec::EcKey;
+use boring_signal::pkey::Public;
+use boring_signal::stack::{Stack, Stackable};
+use boring_signal::x509::crl::X509CRLRef;
+use boring_signal::x509::store::X509StoreRef;
+use boring_signal::x509::{X509StoreContext, X509};
 
 use crate::error::ContextError;
 use crate::expireable::Expireable;
@@ -93,7 +93,7 @@ impl CertChain {
     }
 
     /// Converts the iterator into a stack, preserving the iterator's original order
-    fn stack<T, I>(ts: I) -> std::result::Result<Stack<T>, boring::error::ErrorStack>
+    fn stack<T, I>(ts: I) -> std::result::Result<Stack<T>, boring_signal::error::ErrorStack>
     where
         T: Stackable,
         I: IntoIterator<Item = T>,
@@ -162,18 +162,19 @@ impl Expireable for CertChain {
 #[cfg(test)]
 /// Utilities for creating test certificates / crls
 pub mod testutil {
-    use super::CertChain;
-
-    use boring::asn1::{Asn1Integer, Asn1IntegerRef, Asn1Time};
-    use boring::bn::{BigNum, MsbOption};
-    use boring::ec::{EcGroup, EcKey};
-    use boring::hash::MessageDigest;
-    use boring::nid::Nid;
-    use boring::pkey::{PKey, Private};
-    use boring::x509::crl::{X509CRLBuilder, X509Revoked, X509CRL};
-    use boring::x509::extension::BasicConstraints;
-    use boring::x509::{X509Name, X509};
     use std::borrow::Borrow;
+
+    use boring_signal::asn1::{Asn1Integer, Asn1IntegerRef, Asn1Time};
+    use boring_signal::bn::{BigNum, MsbOption};
+    use boring_signal::ec::{EcGroup, EcKey};
+    use boring_signal::hash::MessageDigest;
+    use boring_signal::nid::Nid;
+    use boring_signal::pkey::{PKey, Private};
+    use boring_signal::x509::crl::{X509CRLBuilder, X509Revoked, X509CRL};
+    use boring_signal::x509::extension::BasicConstraints;
+    use boring_signal::x509::{X509Name, X509};
+
+    use super::CertChain;
 
     /// generate EC private key
     fn pkey() -> PKey<Private> {
@@ -309,14 +310,14 @@ pub mod testutil {
 
 #[cfg(test)]
 mod test {
+    use assert_matches::assert_matches;
+    use boring_signal::nid::Nid;
+    use boring_signal::x509::store::{X509Store, X509StoreBuilder};
+    use boring_signal::x509::verify::X509VerifyFlags;
+    use boring_signal::x509::X509Ref;
+
     use super::testutil::*;
     use super::*;
-
-    use assert_matches::assert_matches;
-    use boring::nid::Nid;
-    use boring::x509::store::{X509Store, X509StoreBuilder};
-    use boring::x509::verify::X509VerifyFlags;
-    use boring::x509::X509Ref;
 
     fn names(certs: &[X509]) -> Vec<String> {
         certs

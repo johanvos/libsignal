@@ -221,20 +221,17 @@ async fn hmac_sha256(
 #[cfg(test)]
 mod test {
     use aes::cipher::crypto_common::rand_core::{OsRng, RngCore as _};
-    use futures::io::ErrorKind;
-
     use array_concat::concat_arrays;
     use assert_matches::assert_matches;
     use async_compression::futures::write::GzipEncoder;
     use futures::executor::block_on;
-    use futures::io::Cursor;
+    use futures::io::{Cursor, ErrorKind};
     use futures::AsyncWriteExt;
     use hex_literal::hex;
     use test_case::test_case;
 
-    use crate::key::test::FAKE_MESSAGE_BACKUP_KEY;
-
     use super::*;
+    use crate::key::test::FAKE_MESSAGE_BACKUP_KEY;
 
     #[test]
     fn frame_from_raw_too_short() {
@@ -267,7 +264,7 @@ mod test {
     fn frame_failed_decrypt() {
         const BYTES: [u8; 26] = *b"abcdefghijklmnopqrstuvwxyz";
         const VALID_HMAC: [u8; HMAC_LEN] =
-            hex!("bb6f4845da4d7538006dbc639cd06a56768eec45eeecefb65058de79247f4393");
+            hex!("80f52dcaf00614eb27d19b6a71d3596754b176da14cbe2e9e12f75ad5dc39fc1");
         // Garbage, but with a valid HMAC appended.
         let frame_bytes: [u8; 58] = concat_arrays!(BYTES, VALID_HMAC);
 

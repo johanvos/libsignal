@@ -4,19 +4,18 @@
 //
 use std::time::SystemTime;
 
-use boring::pkey::{PKey, Public};
-use boring::rsa::Rsa;
-use boring::x509::store::X509StoreBuilder;
-use boring::x509::X509;
+use boring_signal::pkey::{PKey, Public};
+use boring_signal::rsa::Rsa;
+use boring_signal::x509::store::X509StoreBuilder;
+use boring_signal::x509::X509;
 use prost::Message;
 
 use crate::cert_chain::{self, CertChain};
-use crate::enclave::{Claims, Error, Handshake, Result, UnvalidatedHandshake};
+use crate::constants::TPM2SNP_EXPECTED_PCRS;
+use crate::enclave::{Claims, Error, Handshake, HandshakeType, Result, UnvalidatedHandshake};
 use crate::expireable::Expireable as _;
 use crate::proto::{svr, svr3};
 use crate::svr2::RaftConfig;
-
-use crate::constants::TPM2SNP_EXPECTED_PCRS;
 
 mod snp;
 mod tpm2;
@@ -52,7 +51,7 @@ impl Handshake {
         let endorsements = svr3::AsnpEndorsements::decode(endorsements)?;
         let attestation_data = attest(enclave, &evidence, &endorsements, now)?;
         let claims = Claims::from_attestation_data(attestation_data)?;
-        Handshake::with_claims(claims)
+        Handshake::with_claims(claims, HandshakeType::PostQuantum)
     }
 }
 
@@ -178,8 +177,8 @@ fn verify_vcek_cert(
     }
 }
 
-impl From<boring::error::ErrorStack> for Error {
-    fn from(_err: boring::error::ErrorStack) -> Error {
+impl From<boring_signal::error::ErrorStack> for Error {
+    fn from(_err: boring_signal::error::ErrorStack) -> Error {
         Error::AttestationDataError {
             reason: "Invalid certificate".to_string(),
         }
@@ -224,9 +223,11 @@ fn verify_tpm2_quote<'a>(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use hex_literal::hex;
     use std::time::Duration;
+
+    use hex_literal::hex;
+
+    use super::*;
 
     #[test]
     fn full_tpm2snp_attestation() {

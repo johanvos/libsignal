@@ -58,14 +58,30 @@ public enum SignalError: Error {
     case rateLimitedError(retryAfter: TimeInterval, message: String)
     case svrDataMissing(String)
     case svrRestoreFailed(triesRemaining: UInt32, message: String)
+    case svrRotationMachineTooManySteps(String)
     case chatServiceInactive(String)
+    case chatServiceIntentionallyDisconnected(String)
     case appExpired(String)
     case deviceDeregistered(String)
+    case backupValidation(unknownFields: [String], message: String)
 
     case unknown(UInt32, String)
 }
 
 internal typealias SignalFfiErrorRef = OpaquePointer
+
+internal func convertError(_ error: SignalFfiErrorRef?) -> Error? {
+    // It would be *slightly* more efficient for checkError to call convertError,
+    // instead of the other way around. However, then it would be harder to implement
+    // checkError, since some of the conversion operations can themselves throw.
+    // So this is more maintainable.
+    do {
+        try checkError(error)
+        return nil
+    } catch let thrownError {
+        return thrownError
+    }
+}
 
 internal func checkError(_ error: SignalFfiErrorRef?) throws {
     guard let error = error else { return }
@@ -195,12 +211,21 @@ internal func checkError(_ error: SignalFfiErrorRef?) throws {
             signal_error_get_tries_remaining(error, $0)
         }
         throw SignalError.svrRestoreFailed(triesRemaining: triesRemaining, message: errStr)
+    case SignalErrorCodeSvrRotationMachineTooManySteps:
+        throw SignalError.svrRotationMachineTooManySteps(errStr)
     case SignalErrorCodeChatServiceInactive:
         throw SignalError.chatServiceInactive(errStr)
+    case SignalErrorCodeChatServiceIntentionallyDisconnected:
+        throw SignalError.chatServiceIntentionallyDisconnected(errStr)
     case SignalErrorCodeAppExpired:
         throw SignalError.appExpired(errStr)
     case SignalErrorCodeDeviceDeregistered:
         throw SignalError.deviceDeregistered(errStr)
+    case SignalErrorCodeBackupValidation:
+        let unknownFields = try invokeFnReturningStringArray {
+            signal_error_get_unknown_fields(error, $0)
+        }
+        throw SignalError.backupValidation(unknownFields: unknownFields, message: errStr)
     default:
         throw SignalError.unknown(errType, errStr)
     }

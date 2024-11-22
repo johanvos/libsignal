@@ -10,6 +10,7 @@
  */
 
 import * as Native from '../Native';
+import { BackupKey } from './AccountKeys';
 import { Aci } from './Address';
 import { InputStream } from './io';
 
@@ -46,22 +47,82 @@ export class ValidationOutcome {
   }
 }
 
+export type MessageBackupKeyInput = Readonly<
+  | {
+      accountEntropy: string;
+      aci: Aci;
+    }
+  | {
+      backupKey: BackupKey | Buffer;
+      backupId: Buffer;
+    }
+>;
+
 /**
  * Key used to encrypt and decrypt a message backup bundle.
+ *
+ * @see {@link BackupKey}
  */
 export class MessageBackupKey {
   readonly _nativeHandle: Native.MessageBackupKey;
 
   /**
-   * Create a public key from the given master key and ACI.
+   * Create a backup bundle key from the given master key and ACI.
    *
    * `masterKeyBytes` should contain exactly 32 bytes.
+   *
+   * @deprecated Use AccountEntropyPool instead.
    */
-  public constructor(masterKeyBytes: Buffer, aci: Aci) {
-    this._nativeHandle = Native.MessageBackupKey_New(
-      masterKeyBytes,
-      aci.getServiceIdFixedWidthBinary()
-    );
+  public constructor(masterKeyBytes: Buffer, aci: Aci);
+  /**
+   * Create a backup bundle key from an account entropy pool and ACI.
+   *
+   * ...or from a backup key and ID, used when reading from a local backup, which may have been
+   * created with a different ACI. This still uses AccountEntropyPool-based key derivation rules; it
+   * cannot be used to read a backup created from a master key.
+   *
+   * The account entropy pool must be **validated**; passing an arbitrary string here is considered
+   * a programmer error. Similarly, passing a backup key or ID of the wrong length is also an error.
+   */
+  public constructor(input: MessageBackupKeyInput);
+
+  public constructor(
+    inputOrMasterKeyBytes: Buffer | MessageBackupKeyInput,
+    maybeAci?: Aci
+  ) {
+    if (inputOrMasterKeyBytes instanceof Buffer) {
+      if (maybeAci === undefined) throw new Error('missing ACI parameter');
+      this._nativeHandle = Native.MessageBackupKey_FromMasterKey(
+        inputOrMasterKeyBytes,
+        maybeAci.getServiceIdFixedWidthBinary()
+      );
+    } else if ('accountEntropy' in inputOrMasterKeyBytes) {
+      const { accountEntropy, aci } = inputOrMasterKeyBytes;
+      this._nativeHandle = Native.MessageBackupKey_FromAccountEntropyPool(
+        accountEntropy,
+        aci.getServiceIdFixedWidthBinary()
+      );
+    } else {
+      const { backupId } = inputOrMasterKeyBytes;
+      let { backupKey } = inputOrMasterKeyBytes;
+      if (backupKey instanceof BackupKey) {
+        backupKey = backupKey.contents;
+      }
+      this._nativeHandle = Native.MessageBackupKey_FromBackupKeyAndBackupId(
+        backupKey,
+        backupId
+      );
+    }
+  }
+
+  /** An HMAC key used to sign a backup file. */
+  public get hmacKey(): Buffer {
+    return Native.MessageBackupKey_GetHmacKey(this);
+  }
+
+  /** An AES-256-CBC key used to encrypt a backup file. */
+  public get aesKey(): Buffer {
+    return Native.MessageBackupKey_GetAesKey(this);
   }
 }
 
@@ -98,4 +159,69 @@ export async function validate(
       purpose
     )
   );
+}
+
+/**
+ * An in-memory representation of a backup file used to compare contents.
+ *
+ * When comparing the contents of two backups:
+ *   1. Create a `ComparableBackup` instance for each of the inputs.
+ *   2. Check the `unknownFields()` value; if it's not empty, some parts of the
+ *      backup weren't parsed and won't be compared.
+ *   3. Produce a canonical string for each backup with `comparableString()`.
+ *   4. Compare the canonical string representations.
+ *
+ * The diff of the canonical strings (which may be rather large) will show the
+ * differences between the logical content of the input backup files.
+ */
+export class ComparableBackup {
+  readonly _nativeHandle: Native.ComparableBackup;
+  constructor(handle: Native.ComparableBackup) {
+    this._nativeHandle = handle;
+  }
+
+  /**
+   * Read an unencrypted backup file into memory for comparison.
+   *
+   * @param purpose Whether the backup is intended for device-to-device transfer or remote storage.
+   * @param input An input stream that reads the backup contents.
+   * @param length The exact length of the input stream.
+   * @returns The in-memory representation.
+   * @throws BackupValidationError If an IO error occurs or the input is invalid.
+   */
+  public static async fromUnencrypted(
+    purpose: Purpose,
+    input: InputStream,
+    length: bigint
+  ): Promise<ComparableBackup> {
+    const handle = await Native.ComparableBackup_ReadUnencrypted(
+      input,
+      length,
+      purpose
+    );
+    return new ComparableBackup(handle);
+  }
+
+  /**
+   * Produces a string representation of the contents.
+   *
+   * The returned strings for two backups will be equal if the backups contain
+   * the same logical content. If two backups' strings are not equal, the diff
+   * will show what is different between them.
+   *
+   * @returns a canonical string representation of the backup
+   */
+  public comparableString(): string {
+    return Native.ComparableBackup_GetComparableString(this);
+  }
+
+  /**
+   * Unrecognized protobuf fields present in the backup.
+   *
+   * If this is not empty, some parts of the backup were not recognized and
+   * won't be present in the string representation.
+   */
+  public get unknownFields(): Array<string> {
+    return Native.ComparableBackup_GetUnknownFields(this);
+  }
 }

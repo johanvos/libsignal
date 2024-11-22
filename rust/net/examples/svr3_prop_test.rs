@@ -8,20 +8,16 @@ use std::time::Duration;
 
 use assert_matches::assert_matches;
 use async_trait::async_trait;
+use libsignal_net::auth::Auth;
+use libsignal_net::enclave::PpssSetup;
+use libsignal_net::env::Svr3Env;
+use libsignal_net::svr3::traits::*;
+use libsignal_net::svr3::{Error, OpaqueMaskedShareSet};
+use libsignal_svr3::EvaluationResult;
 use proptest::prelude::*;
 use proptest::test_runner::Config;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 use rand_core::OsRng;
-
-use libsignal_net::auth::Auth;
-use libsignal_net::enclave::{self, PpssSetup};
-use libsignal_net::env::Svr3Env;
-use libsignal_net::infra::ws::DefaultStream;
-use libsignal_net::svr3::{
-    simple_svr3_connect, Error, OpaqueMaskedShareSet, Svr3Client, Svr3Connect,
-};
-use libsignal_svr3::EvaluationResult;
-
 use support::*;
 
 const MAX_TRIES_LIMIT: u32 = 10;
@@ -77,6 +73,7 @@ impl Svr3Cell {
 pub enum Transition {
     SetUid(Uid),
     Backup(Secret, u32),
+    Rotate,
     Restore,
     RestoreWithBadPassword,
 }
@@ -152,6 +149,7 @@ impl ReferenceStateMachine for InMemoryStorage {
             2 => backup_pair().prop_map(|(secret, max_tries)| Transition::Backup(secret, max_tries)),
             3 => Just(Transition::Restore),
             1 => Just(Transition::RestoreWithBadPassword),
+            3 => Just(Transition::Rotate),
         ]
         .boxed()
     }
@@ -170,6 +168,10 @@ impl ReferenceStateMachine for InMemoryStorage {
                     .data
                     .insert(state.uid.unwrap(), Svr3Cell::new(*secret, *tries_left));
                 state.last_transition_outcome = TransitionOutcome::Nothing;
+            }
+            Transition::Rotate => {
+                // Nothing to do in the model for rotation
+                log::info!("MODEL: rotate");
             }
             Transition::Restore | Transition::RestoreWithBadPassword => {
                 let expect_bad_commitment =
@@ -230,6 +232,19 @@ impl StateMachineTest for Svr3Storage {
                 let uid = state.current_uid.expect("uid must be set");
                 let share_set = state.backup(uid, secret, tries_left);
                 let _ = state.share_sets.insert(uid, share_set);
+            }
+            Transition::Rotate => {
+                log::info!("SUT: rotate ->");
+                let uid = state.current_uid.expect("uid must be set");
+                match state.share_sets.get(&uid) {
+                    Some(share_set) => match state.rotate(uid, share_set.clone()) {
+                        Ok(()) => log::info!("\tsuccess"),
+                        Err(err) => log::info!("\terror: {}", err),
+                    },
+                    None => {
+                        log::info!("\tNothing to rotate.");
+                    }
+                }
             }
             Transition::Restore | Transition::RestoreWithBadPassword => {
                 let expect_bad_commitment =
@@ -316,17 +331,14 @@ impl<'a> Client<'a> {
 
 #[async_trait]
 impl Svr3Connect for Client<'_> {
-    type Stream = DefaultStream;
     type Env = Svr3Env<'static>;
 
-    async fn connect(
-        &self,
-    ) -> Result<<Self::Env as PpssSetup<Self::Stream>>::Connections, enclave::Error> {
+    async fn connect(&self) -> <Self::Env as PpssSetup>::ConnectionResults {
         if let Some(duration) = self.config.sleep {
             log::info!("💤 to avoid throttling...");
             tokio::time::sleep(duration).await;
         }
-        simple_svr3_connect(self.env, &self.auth).await
+        self.env.connect_directly(&self.auth).await
     }
 }
 
@@ -345,7 +357,7 @@ impl Svr3Storage {
             .expect("can build runtime");
         Self {
             runtime,
-            env: libsignal_net::env::STAGING.svr3,
+            env: libsignal_net::env::PROD.svr3,
             current_uid: None,
             enclave_secret,
             share_sets: HashMap::default(),
@@ -374,6 +386,14 @@ impl Svr3Storage {
             let mut rng = OsRng;
             let client = Client::new(uid, self);
             client.restore(password, share_set, &mut rng).await
+        })
+    }
+
+    fn rotate(&mut self, uid: Uid, share_set: OpaqueMaskedShareSet) -> Result<(), Error> {
+        self.runtime.block_on(async {
+            let mut rng = OsRng;
+            let client = Client::new(uid, self);
+            client.rotate(share_set, &mut rng).await
         })
     }
 }

@@ -3,15 +3,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::backup::frame::{RecipientId, RingerRecipientId};
-use crate::backup::method::{Contains, Lookup};
+use std::fmt::Debug;
+
+use crate::backup::frame::RecipientId;
+use crate::backup::method::LookupPair;
 use crate::backup::recipient::DestinationKind;
-use crate::backup::time::Timestamp;
-use crate::backup::TryFromWith;
+use crate::backup::time::{ReportUnusualTimestamp, Timestamp};
+use crate::backup::{serialize, TryFromWith};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::AdHocCall`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct AdHocCall<Recipient> {
     pub id: CallId,
@@ -20,7 +22,7 @@ pub struct AdHocCall<Recipient> {
 }
 
 /// Validated version of [`proto::IndividualCall`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct IndividualCall {
     pub id: Option<CallId>,
@@ -28,24 +30,27 @@ pub struct IndividualCall {
     pub state: IndividualCallState,
     pub outgoing: bool,
     pub started_at: Timestamp,
+    pub read: bool,
 }
 
 /// Validated version of [`proto::GroupCall`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct GroupCall<Recipient> {
     pub id: Option<CallId>,
     pub state: GroupCallState,
     pub started_call_recipient: Option<Recipient>,
+    pub ringer_recipient: Option<Recipient>,
     pub started_at: Timestamp,
-    pub ended_at: Timestamp,
+    pub ended_at: Option<Timestamp>,
+    pub read: bool,
 }
 
 /// An identifier for a call.
 ///
 /// This is not referenced as a foreign key from elsewhere in a backup, but
 /// corresponds to shared state across conversation members for a given call.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, serde::Serialize)]
 pub struct CallId(u64);
 
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
@@ -53,8 +58,12 @@ pub struct CallId(u64);
 pub enum CallError {
     /// call starter {0:?} not found,
     UnknownCallStarter(RecipientId),
+    /// call starter {0:?} is a {1:?}, not a contact or self
+    InvalidCallStarter(RecipientId, DestinationKind),
     /// no record for ringer {0:?}
-    NoRingerRecipient(RingerRecipientId),
+    NoRingerRecipient(RecipientId),
+    /// ringer {0:?} is a {1:?}, not a contact or self
+    InvalidRingerRecipient(RecipientId, DestinationKind),
     /// no record for ad-hoc {0:?}
     NoAdHocRecipient(RecipientId),
     /// ad-hoc recipient {0:?} is not a call link
@@ -70,22 +79,20 @@ pub enum CallError {
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum CallLinkError {
-    /// call link restrictions is UNKNOWN
-    UnknownRestrictions,
-    /// expected {CALL_LINK_ADMIN_KEY_LEN:?}-byte admin key, found {0} bytes
-    InvalidAdminKey(usize),
     /// expected {CALL_LINK_ROOT_KEY_LEN:?}-byte root key, found {0} bytes
     InvalidRootKey(usize),
+    /// admin key was present but empty
+    InvalidAdminKey,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum CallType {
     Audio,
     Video,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum IndividualCallState {
     Accepted,
@@ -94,7 +101,7 @@ pub enum IndividualCallState {
     Missed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum GroupCallState {
     /// No ring
@@ -115,33 +122,34 @@ pub enum GroupCallState {
     OutgoingRing,
 }
 
-const CALL_LINK_ADMIN_KEY_LEN: usize = 32;
-type CallLinkAdminKey = [u8; CALL_LINK_ADMIN_KEY_LEN];
-
 const CALL_LINK_ROOT_KEY_LEN: usize = 16;
 type CallLinkRootKey = [u8; CALL_LINK_ROOT_KEY_LEN];
 
 /// Validated version of [`proto::CallLink`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CallLink {
-    pub admin_approval: bool,
+    #[serde(serialize_with = "serialize::enum_as_string")]
+    pub restrictions: proto::call_link::Restrictions,
+    #[serde(with = "hex")]
     pub root_key: CallLinkRootKey,
-    pub admin_key: Option<CallLinkAdminKey>,
+    #[serde(serialize_with = "serialize::optional_hex")]
+    pub admin_key: Option<Vec<u8>>,
     pub expiration: Timestamp,
     pub name: String,
 }
 
-impl TryFrom<proto::IndividualCall> for IndividualCall {
+impl<C: ReportUnusualTimestamp> TryFromWith<proto::IndividualCall, C> for IndividualCall {
     type Error = CallError;
 
-    fn try_from(call: proto::IndividualCall) -> Result<Self, Self::Error> {
+    fn try_from_with(call: proto::IndividualCall, context: &C) -> Result<Self, Self::Error> {
         let proto::IndividualCall {
             callId,
             type_,
             state,
             direction,
             startedCallTimestamp,
+            read,
             special_fields: _,
         } = call;
 
@@ -176,7 +184,7 @@ impl TryFrom<proto::IndividualCall> for IndividualCall {
             }
         };
 
-        let started_at = Timestamp::from_millis(startedCallTimestamp, "Call.timestamp");
+        let started_at = Timestamp::from_millis(startedCallTimestamp, "Call.timestamp", context);
         let id = callId.map(CallId);
 
         Ok(Self {
@@ -185,12 +193,13 @@ impl TryFrom<proto::IndividualCall> for IndividualCall {
             state,
             started_at,
             outgoing,
+            read,
         })
     }
 }
 
-impl<C: Contains<RecipientId> + Lookup<RecipientId, R>, R: Clone> TryFromWith<proto::GroupCall, C>
-    for GroupCall<R>
+impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R: Clone>
+    TryFromWith<proto::GroupCall, C> for GroupCall<R>
 {
     type Error = CallError;
 
@@ -202,26 +211,35 @@ impl<C: Contains<RecipientId> + Lookup<RecipientId, R>, R: Clone> TryFromWith<pr
             ringerRecipientId,
             startedCallRecipientId,
             endedCallTimestamp,
+            read,
             special_fields: _,
         } = call;
 
         let started_call_recipient = startedCallRecipientId
             .map(|id| {
                 let id = RecipientId(id);
-                context
-                    .lookup(&id)
-                    .ok_or(CallError::UnknownCallStarter(id))
-                    .cloned()
+                let (&starter_kind, starter) = context
+                    .lookup_pair(&id)
+                    .ok_or(CallError::UnknownCallStarter(id))?;
+                if !starter_kind.is_individual() {
+                    return Err(CallError::InvalidCallStarter(id, starter_kind));
+                }
+                Ok(starter.clone())
             })
             .transpose()?;
 
-        let ringer_recipient_id = ringerRecipientId.map(|r| RingerRecipientId(RecipientId(r)));
-
-        if let Some(ringer_recipient_id) = ringer_recipient_id {
-            if !context.contains(&ringer_recipient_id.0) {
-                return Err(CallError::NoRingerRecipient(ringer_recipient_id));
-            }
-        }
+        let ringer_recipient = ringerRecipientId
+            .map(|id| {
+                let id = RecipientId(id);
+                let (&ringer_kind, ringer) = context
+                    .lookup_pair(&id)
+                    .ok_or(CallError::NoRingerRecipient(id))?;
+                if !ringer_kind.is_individual() {
+                    return Err(CallError::InvalidRingerRecipient(id, ringer_kind));
+                }
+                Ok(ringer.clone())
+            })
+            .transpose()?;
 
         let state = {
             use proto::group_call::State;
@@ -238,23 +256,30 @@ impl<C: Contains<RecipientId> + Lookup<RecipientId, R>, R: Clone> TryFromWith<pr
             }
         };
 
-        let started_at =
-            Timestamp::from_millis(startedCallTimestamp, "GroupCall.startedCallTimestamp");
-        let ended_at = Timestamp::from_millis(endedCallTimestamp, "GroupCall.endedCallTimestamp");
+        let started_at = Timestamp::from_millis(
+            startedCallTimestamp,
+            "GroupCall.startedCallTimestamp",
+            context,
+        );
+        let ended_at = endedCallTimestamp.map(|ended_at| {
+            Timestamp::from_millis(ended_at, "GroupCall.endedCallTimestamp", context)
+        });
         let id = callId.map(CallId);
 
         Ok(Self {
             id,
             state,
             started_call_recipient,
+            ringer_recipient,
             started_at,
             ended_at,
+            read,
         })
     }
 }
 
-impl<C: Lookup<RecipientId, DestinationKind>> TryFromWith<proto::AdHocCall, C>
-    for AdHocCall<RecipientId>
+impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R: Clone + Debug>
+    TryFromWith<proto::AdHocCall, C> for AdHocCall<R>
 {
     type Error = CallError;
 
@@ -271,17 +296,17 @@ impl<C: Lookup<RecipientId, DestinationKind>> TryFromWith<proto::AdHocCall, C>
 
         let recipient = RecipientId(recipientId);
 
-        match context.lookup(&recipient) {
-            None => return Err(CallError::NoAdHocRecipient(recipient)),
-            Some(DestinationKind::CallLink) => (),
-            Some(
-                DestinationKind::Contact
-                | DestinationKind::DistributionList
-                | DestinationKind::Group
-                | DestinationKind::ReleaseNotes
-                | DestinationKind::Self_,
-            ) => return Err(CallError::InvalidAdHocRecipient(recipient)),
-        }
+        let (kind, reference) = context
+            .lookup_pair(&recipient)
+            .ok_or(CallError::NoAdHocRecipient(recipient))?;
+        let recipient = match kind {
+            DestinationKind::CallLink => reference.clone(),
+            DestinationKind::Contact
+            | DestinationKind::DistributionList
+            | DestinationKind::Group
+            | DestinationKind::ReleaseNotes
+            | DestinationKind::Self_ => return Err(CallError::InvalidAdHocRecipient(recipient)),
+        };
 
         {
             use proto::ad_hoc_call::State;
@@ -291,7 +316,8 @@ impl<C: Lookup<RecipientId, DestinationKind>> TryFromWith<proto::AdHocCall, C>
             }
         };
 
-        let timestamp = Timestamp::from_millis(callTimestamp, "AdHocCall.startedCallTimestamp");
+        let timestamp =
+            Timestamp::from_millis(callTimestamp, "AdHocCall.startedCallTimestamp", context);
 
         Ok(Self {
             id,
@@ -301,10 +327,10 @@ impl<C: Lookup<RecipientId, DestinationKind>> TryFromWith<proto::AdHocCall, C>
     }
 }
 
-impl TryFrom<proto::CallLink> for CallLink {
+impl<C: ReportUnusualTimestamp> TryFromWith<proto::CallLink, C> for CallLink {
     type Error = CallLinkError;
 
-    fn try_from(value: proto::CallLink) -> Result<Self, Self::Error> {
+    fn try_from_with(value: proto::CallLink, context: &C) -> Result<Self, Self::Error> {
         let proto::CallLink {
             rootKey,
             adminKey,
@@ -318,26 +344,20 @@ impl TryFrom<proto::CallLink> for CallLink {
             .try_into()
             .map_err(|key: Vec<u8>| CallLinkError::InvalidRootKey(key.len()))?;
 
-        let admin_key = adminKey
-            .map(|key| {
-                key.try_into()
-                    .map_err(|key: Vec<u8>| CallLinkError::InvalidAdminKey(key.len()))
-            })
-            .transpose()?;
-
-        let admin_approval = {
-            use proto::call_link::Restrictions;
-            match restrictions.enum_value_or_default() {
-                Restrictions::UNKNOWN => return Err(CallLinkError::UnknownRestrictions),
-                Restrictions::NONE => false,
-                Restrictions::ADMIN_APPROVAL => true,
+        let admin_key = {
+            if adminKey.as_deref() == Some(&[]) {
+                return Err(CallLinkError::InvalidAdminKey);
             }
+            adminKey
         };
-        let expiration = Timestamp::from_millis(expirationMs, "CallLink.expirationMs");
+
+        // Any unknown values will be warned about elsewhere.
+        let restrictions = restrictions.enum_value_or(proto::call_link::Restrictions::UNKNOWN);
+        let expiration = Timestamp::from_millis(expirationMs, "CallLink.expirationMs", context);
 
         Ok(Self {
             root_key,
-            admin_approval,
+            restrictions,
             admin_key,
             expiration,
             name,
@@ -350,11 +370,10 @@ pub(crate) mod test {
     use protobuf::EnumOrUnknown;
     use test_case::test_case;
 
-    use crate::backup::method::Contains;
-    use crate::backup::time::testutil::MillisecondsSinceEpoch;
-    use crate::backup::TryIntoWith as _;
-
     use super::*;
+    use crate::backup::time::testutil::MillisecondsSinceEpoch;
+    use crate::backup::time::{Duration, ReportUnusualTimestamp};
+    use crate::backup::TryIntoWith as _;
 
     impl proto::IndividualCall {
         const TEST_ID: CallId = CallId(33333);
@@ -366,6 +385,7 @@ pub(crate) mod test {
                 type_: proto::individual_call::Type::VIDEO_CALL.into(),
                 direction: proto::individual_call::Direction::OUTGOING.into(),
                 startedCallTimestamp: MillisecondsSinceEpoch::TEST_VALUE.0,
+                read: true,
                 ..Default::default()
             }
         }
@@ -378,7 +398,8 @@ pub(crate) mod test {
                 ringerRecipientId: Some(proto::Recipient::TEST_ID),
                 state: proto::group_call::State::ACCEPTED.into(),
                 startedCallTimestamp: MillisecondsSinceEpoch::TEST_VALUE.0,
-                endedCallTimestamp: MillisecondsSinceEpoch::TEST_VALUE.0 + 1000,
+                endedCallTimestamp: Some(MillisecondsSinceEpoch::TEST_VALUE.0 + 1000),
+                read: true,
                 ..Default::default()
             }
         }
@@ -402,7 +423,7 @@ pub(crate) mod test {
     }
 
     const TEST_CALL_LINK_ROOT_KEY: CallLinkRootKey = [b'R'; 16];
-    const TEST_CALL_LINK_ADMIN_KEY: CallLinkAdminKey = [b'A'; 32];
+    const TEST_CALL_LINK_ADMIN_KEY: &[u8] = b"A";
     impl proto::CallLink {
         fn test_data() -> Self {
             Self {
@@ -415,117 +436,106 @@ pub(crate) mod test {
         }
     }
 
-    struct TestContext;
-
-    impl Contains<RecipientId> for TestContext {
-        fn contains(&self, key: &RecipientId) -> bool {
-            matches!(
-                key,
-                &RecipientId(proto::Recipient::TEST_ID) | &TEST_CALL_LINK_RECIPIENT_ID
-            )
+    impl CallLink {
+        pub(crate) fn from_proto_test_data() -> Self {
+            Self {
+                restrictions: proto::call_link::Restrictions::NONE,
+                root_key: TEST_CALL_LINK_ROOT_KEY,
+                admin_key: Some(TEST_CALL_LINK_ADMIN_KEY.to_vec()),
+                expiration: Timestamp::test_value(),
+                name: "".to_string(),
+            }
         }
     }
 
-    impl Lookup<RecipientId, DestinationKind> for TestContext {
-        fn lookup(&self, key: &RecipientId) -> Option<&DestinationKind> {
+    struct TestContext;
+
+    impl LookupPair<RecipientId, DestinationKind, RecipientId> for TestContext {
+        fn lookup_pair<'a>(
+            &'a self,
+            key: &'a RecipientId,
+        ) -> Option<(&'a DestinationKind, &'a RecipientId)> {
             match key {
-                RecipientId(proto::Recipient::TEST_ID) => Some(&DestinationKind::Contact),
-                &TEST_CALL_LINK_RECIPIENT_ID => Some(&DestinationKind::CallLink),
+                RecipientId(proto::Recipient::TEST_ID) => Some((&DestinationKind::Contact, key)),
+                &TEST_CALL_LINK_RECIPIENT_ID => Some((&DestinationKind::CallLink, key)),
                 _ => None,
             }
         }
     }
 
-    trait InvalidCallType {
-        fn unknown_type(call: &mut Self);
-    }
-
-    trait InvalidCallState {
-        fn unknown_state(call: &mut Self);
-    }
-
-    impl InvalidCallType for proto::IndividualCall {
-        fn unknown_type(call: &mut Self) {
-            call.type_ = EnumOrUnknown::default();
+    impl ReportUnusualTimestamp for TestContext {
+        fn report(
+            &self,
+            _since_epoch: u64,
+            _context: &'static str,
+            _issue: crate::backup::time::TimestampIssue,
+        ) {
+            // Do nothing when not specifically testing timestamps.
         }
-    }
-
-    impl InvalidCallState for proto::IndividualCall {
-        fn unknown_state(call: &mut Self) {
-            call.state = EnumOrUnknown::default();
-        }
-    }
-
-    fn unknown_direction(call: &mut proto::IndividualCall) {
-        call.direction = EnumOrUnknown::default();
     }
 
     #[test]
     fn valid_individual_call() {
         assert_eq!(
-            proto::IndividualCall::test_data().try_into(),
+            proto::IndividualCall::test_data().try_into_with(&TestContext),
             Ok(IndividualCall {
                 id: Some(proto::IndividualCall::TEST_ID),
                 call_type: CallType::Video,
                 state: IndividualCallState::Accepted,
                 outgoing: true,
                 started_at: Timestamp::test_value(),
+                read: true,
             })
         );
     }
 
-    #[test_case(InvalidCallType::unknown_type, Err(CallError::UnknownType))]
-    #[test_case(InvalidCallState::unknown_state, Err(CallError::UnknownState))]
-    #[test_case(unknown_direction, Err(CallError::UnknownDirection))]
-    fn individual_call(
-        modifier: impl FnOnce(&mut proto::IndividualCall),
-        expected: Result<(), CallError>,
-    ) {
+    #[test_case(|x| x.type_ = EnumOrUnknown::default() => Err(CallError::UnknownType); "unknown type")]
+    #[test_case(|x| x.state = EnumOrUnknown::default() => Err(CallError::UnknownState); "unknown state")]
+    #[test_case(|x| x.direction = EnumOrUnknown::default() => Err(CallError::UnknownDirection); "unknown_direction")]
+    fn individual_call(modifier: fn(&mut proto::IndividualCall)) -> Result<(), CallError> {
         let mut call = proto::IndividualCall::test_data();
         modifier(&mut call);
-        assert_eq!(call.try_into().map(|_: IndividualCall| ()), expected);
+        call.try_into_with(&TestContext).map(|_: IndividualCall| ())
     }
 
-    fn no_ringer_id(call: &mut proto::GroupCall) {
-        call.ringerRecipientId = None;
-    }
-    fn wrong_wringer_id(call: &mut proto::GroupCall) {
-        call.ringerRecipientId = Some(NONEXISTENT_RECIPIENT.0);
-    }
-
-    impl InvalidCallState for proto::GroupCall {
-        fn unknown_state(call: &mut Self) {
-            call.state = EnumOrUnknown::default();
-        }
-    }
-
-    #[test_case(no_ringer_id, Ok(()))]
-    #[test_case(
-        wrong_wringer_id,
-        Err(CallError::NoRingerRecipient(RingerRecipientId(NONEXISTENT_RECIPIENT)))
-    )]
-    #[test_case(InvalidCallState::unknown_state, Err(CallError::UnknownState))]
-    fn group_call(modifier: impl FnOnce(&mut proto::GroupCall), expected: Result<(), CallError>) {
-        let mut call = proto::GroupCall::test_data();
-        modifier(&mut call);
+    #[test]
+    fn valid_group_call() {
         assert_eq!(
-            call.try_into_with(&TestContext).map(|_: GroupCall<_>| ()),
-            expected
+            proto::GroupCall::test_data().try_into_with(&TestContext),
+            Ok(GroupCall {
+                id: None,
+                state: GroupCallState::Accepted,
+                started_call_recipient: None,
+                ringer_recipient: Some(RecipientId(proto::Recipient::TEST_ID)),
+                started_at: Timestamp::test_value(),
+                ended_at: Some(Timestamp::test_value() + Duration::from_millis(1000)),
+                read: true,
+            })
         );
     }
 
-    impl InvalidCallState for proto::AdHocCall {
-        fn unknown_state(call: &mut Self) {
-            call.state = EnumOrUnknown::default();
-        }
-    }
-
-    fn invalid_ad_hoc_recipient(call: &mut proto::AdHocCall) {
-        call.recipientId = NONEXISTENT_RECIPIENT.0;
-    }
-
-    fn ad_hoc_recipient_not_call(call: &mut proto::AdHocCall) {
-        call.recipientId = proto::Recipient::TEST_ID;
+    #[test_case(|x| x.ringerRecipientId = None => Ok(()); "no ringer")]
+    #[test_case(|x| {
+        x.ringerRecipientId = Some(NONEXISTENT_RECIPIENT.0)
+    } => Err(CallError::NoRingerRecipient(NONEXISTENT_RECIPIENT)); "nonexistent ringer")]
+    #[test_case(|x| {
+        x.ringerRecipientId = Some(TEST_CALL_LINK_RECIPIENT_ID.0)
+    } => Err(CallError::InvalidRingerRecipient(TEST_CALL_LINK_RECIPIENT_ID, DestinationKind::CallLink)); "invalid ringer")]
+    #[test_case(|x| {
+        x.startedCallRecipientId = Some(proto::Recipient::TEST_ID)
+    } => Ok(()); "has call starter")]
+    #[test_case(|x| {
+        x.startedCallRecipientId = Some(NONEXISTENT_RECIPIENT.0)
+    } => Err(CallError::UnknownCallStarter(NONEXISTENT_RECIPIENT)); "nonexistent call starter")]
+    #[test_case(|x| {
+        x.startedCallRecipientId = Some(TEST_CALL_LINK_RECIPIENT_ID.0)
+    } => Err(CallError::InvalidCallStarter(TEST_CALL_LINK_RECIPIENT_ID, DestinationKind::CallLink)); "invalid call starter")]
+    #[test_case(|x| x.state = EnumOrUnknown::default() => Err(CallError::UnknownState); "unknown_state")]
+    #[test_case(|x| x.endedCallTimestamp = None => Ok(()); "no end timestamp")]
+    fn group_call(modifier: fn(&mut proto::GroupCall)) -> Result<(), CallError> {
+        let mut call = proto::GroupCall::test_data();
+        modifier(&mut call);
+        call.try_into_with(&TestContext).map(|_: GroupCall<_>| ())
     }
 
     #[test]
@@ -540,58 +550,37 @@ pub(crate) mod test {
         );
     }
 
-    #[test_case(InvalidCallState::unknown_state, Err(CallError::UnknownState))]
+    #[test_case(|x| x.state = EnumOrUnknown::default() => Err(CallError::UnknownState); "unknown state")]
     #[test_case(
-        invalid_ad_hoc_recipient,
-        Err(CallError::NoAdHocRecipient(NONEXISTENT_RECIPIENT))
+        |x| x.recipientId = NONEXISTENT_RECIPIENT.0 => Err(CallError::NoAdHocRecipient(NONEXISTENT_RECIPIENT));
+        "invalid_ad_hoc_recipient"
     )]
     #[test_case(
-        ad_hoc_recipient_not_call,
-        Err(CallError::InvalidAdHocRecipient(RecipientId(proto::Recipient::TEST_ID)))
+        |x| x.recipientId = proto::Recipient::TEST_ID => Err(CallError::InvalidAdHocRecipient(RecipientId(proto::Recipient::TEST_ID)));
+        "ad_hoc_recipient_not_call"
     )]
-    fn ad_hoc_call(modifier: impl FnOnce(&mut proto::AdHocCall), expected: Result<(), CallError>) {
+    fn ad_hoc_call(modifier: impl FnOnce(&mut proto::AdHocCall)) -> Result<(), CallError> {
         let mut call = proto::AdHocCall::test_data();
         modifier(&mut call);
-        assert_eq!(
-            call.try_into_with(&TestContext).map(|_: AdHocCall<_>| ()),
-            expected
-        );
+        call.try_into_with(&TestContext).map(|_: AdHocCall<_>| ())
     }
 
     #[test]
     fn valid_call_link() {
         assert_eq!(
-            proto::CallLink::test_data().try_into(),
-            Ok(CallLink {
-                admin_approval: false,
-                root_key: TEST_CALL_LINK_ROOT_KEY,
-                admin_key: Some(TEST_CALL_LINK_ADMIN_KEY),
-                expiration: Timestamp::test_value(),
-                name: "".to_string(),
-            })
+            proto::CallLink::test_data().try_into_with(&TestContext),
+            Ok(CallLink::from_proto_test_data())
         );
     }
 
-    fn invalid_root_key(call: &mut proto::CallLink) {
-        call.rootKey = vec![123];
-    }
-    fn invalid_admin_key(call: &mut proto::CallLink) {
-        call.adminKey = Some(vec![123])
-    }
-    fn no_admin_key(call: &mut proto::CallLink) {
-        call.adminKey = None;
-    }
-    fn unknown_restrictions(call: &mut proto::CallLink) {
-        call.restrictions = EnumOrUnknown::default();
-    }
-
-    #[test_case(invalid_root_key, Err(CallLinkError::InvalidRootKey(1)))]
-    #[test_case(invalid_admin_key, Err(CallLinkError::InvalidAdminKey(1)))]
-    #[test_case(no_admin_key, Ok(()))]
-    #[test_case(unknown_restrictions, Err(CallLinkError::UnknownRestrictions))]
-    fn call_link(modifier: impl FnOnce(&mut proto::CallLink), expected: Result<(), CallLinkError>) {
+    #[test_case(|x| x.rootKey = vec![123] => Err(CallLinkError::InvalidRootKey(1)); "invalid_root_key")]
+    #[test_case(|x| x.adminKey = Some(vec![]) => Err(CallLinkError::InvalidAdminKey); "invalid_admin_key")]
+    #[test_case(|x| x.adminKey = None => Ok(()); "no_admin_key")]
+    #[test_case(|x| x.restrictions = proto::call_link::Restrictions::UNKNOWN.into() => Ok(()); "unknown_restrictions")]
+    #[test_case(|x| x.restrictions = EnumOrUnknown::from_i32(1000) => Ok(()); "unknown_restrictions_value")]
+    fn call_link(modifier: fn(&mut proto::CallLink)) -> Result<(), CallLinkError> {
         let mut link = proto::CallLink::test_data();
         modifier(&mut link);
-        assert_eq!(link.try_into().map(|_: CallLink| ()), expected);
+        link.try_into_with(&TestContext).map(|_: CallLink| ())
     }
 }

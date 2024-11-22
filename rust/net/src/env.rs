@@ -7,25 +7,36 @@ use std::collections::HashMap;
 use std::iter;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 use const_str::ip_addr;
+use hex_literal::hex;
+use http::HeaderValue;
+use libsignal_keytrans::{DeploymentMode, PublicConfig, VerifyingKey, VrfPublicKey};
+use libsignal_net_infra::certs::RootCertificates;
+use libsignal_net_infra::dns::lookup_result::LookupResult;
+use libsignal_net_infra::host::Host;
+use libsignal_net_infra::route::{
+    DirectTcpRouteProvider, DomainFrontConfig, DomainFrontRouteProvider, HttpVersion,
+    HttpsProvider, TlsRouteProvider,
+};
+use libsignal_net_infra::{
+    AsHttpHeader, ConnectionParams, DnsSource, HttpRequestDecorator, HttpRequestDecoratorSeq,
+    RouteType, TransportConnectionParams,
+};
 use nonzero_ext::nonzero;
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
-use crate::enclave::{Cdsi, EnclaveEndpoint, EndpointParams, MrEnclave, Nitro, Sgx, Tpm2Snp};
-use crate::infra::certs::RootCertificates;
-use crate::infra::dns::lookup_result::LookupResult;
-use crate::infra::{
-    ConnectionParams, DnsSource, HttpRequestDecorator, HttpRequestDecoratorSeq, RouteType,
+use crate::certs::{PROXY_G_ROOT_CERTIFICATES, SIGNAL_ROOT_CERTIFICATES};
+use crate::enclave::{
+    Cdsi, EnclaveEndpoint, EndpointParams, MrEnclave, Nitro, Sgx, SgxPreQuantum, Tpm2Snp,
 };
 
 const DEFAULT_HTTPS_PORT: NonZeroU16 = nonzero!(443_u16);
 pub const TIMESTAMP_HEADER_NAME: &str = "x-signal-timestamp";
 
 const DOMAIN_CONFIG_CHAT: DomainConfig = DomainConfig {
-    hostname: "chat.signal.org",
-    port: DEFAULT_HTTPS_PORT,
     ip_v4: &[
         ip_addr!(v4, "76.223.92.165"),
         ip_addr!(v4, "13.248.212.111"),
@@ -34,16 +45,19 @@ const DOMAIN_CONFIG_CHAT: DomainConfig = DomainConfig {
         ip_addr!(v6, "2600:9000:a507:ab6d:4ce3:2f58:25d7:9cbf"),
         ip_addr!(v6, "2600:9000:a61f:527c:d5eb:a431:5239:3232"),
     ],
-    cert: RootCertificates::Signal,
-    proxy_path: "/service",
-    confirmation_header_name: Some(TIMESTAMP_HEADER_NAME),
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
+    connect: ConnectionConfig {
+        hostname: "chat.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: Some(TIMESTAMP_HEADER_NAME),
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/service",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
 };
 
 const DOMAIN_CONFIG_CHAT_STAGING: DomainConfig = DomainConfig {
-    hostname: "chat.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
     ip_v4: &[
         ip_addr!(v4, "76.223.72.142"),
         ip_addr!(v4, "13.248.206.115"),
@@ -52,156 +66,193 @@ const DOMAIN_CONFIG_CHAT_STAGING: DomainConfig = DomainConfig {
         ip_addr!(v6, "2600:9000:a507:ab6d:7b25:2580:8bd6:3b93"),
         ip_addr!(v6, "2600:9000:a61f:527c:2215:cd9:bac6:a2f8"),
     ],
-    cert: RootCertificates::Signal,
-    proxy_path: "/service-staging",
-    confirmation_header_name: Some(TIMESTAMP_HEADER_NAME),
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
+    connect: ConnectionConfig {
+        hostname: "chat.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: Some(TIMESTAMP_HEADER_NAME),
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/service-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
 };
 
 const DOMAIN_CONFIG_CDSI: DomainConfig = DomainConfig {
-    hostname: "cdsi.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "cdsi.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/cdsi",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "40.122.45.194")],
     ip_v6: &[ip_addr!(v6, "2603:1030:7::1")],
-    cert: RootCertificates::Signal,
-    proxy_path: "/cdsi",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_CDSI_STAGING: DomainConfig = DomainConfig {
-    hostname: "cdsi.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "cdsi.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/cdsi-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "104.43.162.137")],
     ip_v6: &[ip_addr!(v6, "2603:1030:7::732")],
-    cert: RootCertificates::Signal,
-    proxy_path: "/cdsi-staging",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR2: DomainConfig = DomainConfig {
-    hostname: "svr2.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "svr2.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr2",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "20.66.40.69")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr2",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR2_STAGING: DomainConfig = DomainConfig {
-    hostname: "svr2.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "svr2.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr2-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "20.253.229.239")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr2-staging",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR3_SGX: DomainConfig = DomainConfig {
-    hostname: "backend1.svr3.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend1.svr3.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-sgx",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "40.112.138.96")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-sgx",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR3_SGX_STAGING: DomainConfig = DomainConfig {
-    hostname: "backend1.svr3.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend1.svr3.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-sgx-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "13.88.63.29")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-sgx-staging",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR3_NITRO: DomainConfig = DomainConfig {
-    hostname: "backend2.svr3.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend2.svr3.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-nitro",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "75.2.91.98")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-nitro",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 const DOMAIN_CONFIG_SVR3_NITRO_STAGING: DomainConfig = DomainConfig {
-    hostname: "backend2.svr3.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend2.svr3.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-nitro-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "75.2.86.85"), ip_addr!(v4, "99.83.239.137")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-nitro-staging",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 pub const DOMAIN_CONFIG_SVR3_TPM2SNP: DomainConfig = DomainConfig {
-    hostname: "backend3.svr3.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend3.svr3.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-tpm2snp",
+            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "34.144.241.251")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-tpm2snp",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_PROD,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 pub const DOMAIN_CONFIG_SVR3_TPM2SNP_STAGING: DomainConfig = DomainConfig {
-    hostname: "backend3.svr3.staging.signal.org",
-    port: DEFAULT_HTTPS_PORT,
+    connect: ConnectionConfig {
+        hostname: "backend3.svr3.staging.signal.org",
+        port: DEFAULT_HTTPS_PORT,
+        cert: SIGNAL_ROOT_CERTIFICATES,
+        confirmation_header_name: None,
+        proxy: Some(ConnectionProxyConfig {
+            path_prefix: "/svr3-tpm2snp-staging",
+            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
+        }),
+    },
     ip_v4: &[ip_addr!(v4, "13.88.30.76")],
     ip_v6: &[],
-    cert: RootCertificates::Signal,
-    proxy_path: "/svr3-tpm2snp-staging",
-    confirmation_header_name: None,
-    proxy_config_f: PROXY_CONFIG_F_STAGING,
-    proxy_config_g: PROXY_CONFIG_G,
 };
 
 pub const PROXY_CONFIG_F_PROD: ProxyConfig = ProxyConfig {
     route_type: RouteType::ProxyF,
-    hostname: "reflector-signal.global.ssl.fastly.net",
+    http_host: "reflector-signal.global.ssl.fastly.net",
     sni_list: &[
         "github.githubassets.com",
         "pinterest.com",
         "www.redditstatic.com",
     ],
+    certs: RootCertificates::Native,
 };
 
 pub const PROXY_CONFIG_F_STAGING: ProxyConfig = ProxyConfig {
     route_type: RouteType::ProxyF,
-    hostname: "reflector-staging-signal.global.ssl.fastly.net",
+    http_host: "reflector-staging-signal.global.ssl.fastly.net",
     sni_list: &[
         "github.githubassets.com",
         "pinterest.com",
         "www.redditstatic.com",
     ],
+    certs: RootCertificates::Native,
 };
 
 pub const PROXY_CONFIG_G: ProxyConfig = ProxyConfig {
     route_type: RouteType::ProxyG,
-    hostname: "reflector-nrgwuv7kwq-uc.a.run.app",
+    http_host: "reflector-nrgwuv7kwq-uc.a.run.app",
     sni_list: &[
         "www.google.com",
         "android.clients.google.com",
@@ -209,6 +260,7 @@ pub const PROXY_CONFIG_G: ProxyConfig = ProxyConfig {
         "clients4.google.com",
         "inbox.google.com",
     ],
+    certs: PROXY_G_ROOT_CERTIFICATES,
 };
 
 pub(crate) const ENDPOINT_PARAMS_CDSI_STAGING: EndpointParams<'static, Cdsi> = EndpointParams {
@@ -216,10 +268,11 @@ pub(crate) const ENDPOINT_PARAMS_CDSI_STAGING: EndpointParams<'static, Cdsi> = E
     raft_config: (),
 };
 
-pub(crate) const ENDPOINT_PARAMS_SVR2_STAGING: EndpointParams<'static, Sgx> = EndpointParams {
-    mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_STAGING),
-    raft_config: attest::constants::RAFT_CONFIG_SVR2_STAGING,
-};
+pub(crate) const ENDPOINT_PARAMS_SVR2_STAGING: EndpointParams<'static, SgxPreQuantum> =
+    EndpointParams {
+        mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_STAGING),
+        raft_config: attest::constants::RAFT_CONFIG_SVR2_STAGING,
+    };
 pub(crate) const ENDPOINT_PARAMS_SVR3_SGX_STAGING: EndpointParams<'static, Sgx> = EndpointParams {
     mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_SGX_STAGING),
     raft_config: attest::constants::RAFT_CONFIG_SVR3_SGX_STAGING,
@@ -239,10 +292,11 @@ pub(crate) const ENDPOINT_PARAMS_CDSI_PROD: EndpointParams<'static, Cdsi> = Endp
     mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_CDSI_STAGING_AND_PROD),
     raft_config: (),
 };
-pub(crate) const ENDPOINT_PARAMS_SVR2_PROD: EndpointParams<'static, Sgx> = EndpointParams {
-    mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_PROD),
-    raft_config: attest::constants::RAFT_CONFIG_SVR2_PROD,
-};
+pub(crate) const ENDPOINT_PARAMS_SVR2_PROD: EndpointParams<'static, SgxPreQuantum> =
+    EndpointParams {
+        mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_PROD),
+        raft_config: attest::constants::RAFT_CONFIG_SVR2_PROD,
+    };
 pub(crate) const ENDPOINT_PARAMS_SVR3_SGX_PROD: EndpointParams<'static, Sgx> = EndpointParams {
     mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_SGX_PROD),
     raft_config: attest::constants::RAFT_CONFIG_SVR3_SGX_PROD,
@@ -257,36 +311,84 @@ pub(crate) const ENDPOINT_PARAMS_SVR3_TPM2SNP_PROD: EndpointParams<'static, Tpm2
         raft_config: attest::constants::RAFT_CONFIG_SVR3_TPM2SNP_PROD,
     };
 
+const KEYTRANS_SIGNING_KEY_MATERIAL_STAGING: &[u8; 32] =
+    &hex!("12a21ad60d5a3978e19a3b0baa8c35c55a20e10d45f39e5cb34bf6e1b3cce432");
+const KEYTRANS_VRF_KEY_MATERIAL_STAGING: &[u8; 32] =
+    &hex!("1e71563470c1b8a6e0aadf280b6aa96f8ad064674e69b80292ee46d1ab655fcf");
+const KEYTRANS_AUDITOR_KEY_MATERIAL_STAGING: &[u8; 32] =
+    &hex!("1123b13ee32479ae6af5739e5d687b51559abf7684120511f68cde7a21a0e755");
+
+/// Configuration for a target network resource, like `chat.signal.org`.
 #[derive(Clone)]
 pub struct DomainConfig {
-    pub hostname: &'static str,
-    pub port: NonZeroU16,
-    pub proxy_path: &'static str,
+    /// The portions of the config used during connection attempts.
+    pub connect: ConnectionConfig,
+    /// Static IPv4 addresses to try if domain name resolution fails.
     pub ip_v4: &'static [Ipv4Addr],
+    /// Static IPv6 addresses to try if domain name resolution fails.
     pub ip_v6: &'static [Ipv6Addr],
+}
+
+#[derive(Clone)]
+pub struct ConnectionConfig {
+    /// The domain name of the resource.
+    pub hostname: &'static str,
+    /// The port for the resource.
+    pub port: NonZeroU16,
+    /// Which certificates to use when connecting to the resource.
     pub cert: RootCertificates,
+    /// A header to look for that indicates that the resource was reached.
+    ///
+    /// If this is `Some()`, then the presence of the header in an HTTP response
+    /// indicates that the response came from the resource, not from a proxy or
+    /// load balancer.
     pub confirmation_header_name: Option<&'static str>,
-    pub proxy_config_f: ProxyConfig,
-    pub proxy_config_g: ProxyConfig,
+
+    /// Additional configuration for connecting to the resource through a proxy
+    /// if a direct connection fails.
+    pub proxy: Option<ConnectionProxyConfig>,
+}
+
+#[derive(Clone)]
+pub struct ConnectionProxyConfig {
+    /// A path prefix to prepend to any requests sent through the proxy.
+    pub path_prefix: &'static str,
+    /// The addresses for the proxies.
+    pub configs: [ProxyConfig; 2],
+}
+
+pub struct KeyTransConfig {
+    pub signing_key_material: &'static [u8; 32],
+    pub vrf_key_material: &'static [u8; 32],
+    pub auditor_key_material: &'static [u8; 32],
 }
 
 impl DomainConfig {
     pub fn static_fallback(&self) -> (&'static str, LookupResult) {
         (
-            self.hostname,
+            self.connect.hostname,
             LookupResult::new(DnsSource::Static, self.ip_v4.into(), self.ip_v6.into()),
         )
     }
+}
 
-    pub fn connection_params(&self) -> ConnectionParams {
-        let result = ConnectionParams::new(
-            RouteType::Direct,
-            self.hostname,
-            self.hostname,
-            self.port,
-            HttpRequestDecoratorSeq::default(),
-            self.cert.clone(),
-        );
+impl ConnectionConfig {
+    pub fn direct_connection_params(&self) -> ConnectionParams {
+        let result = {
+            let hostname = self.hostname.into();
+            ConnectionParams {
+                route_type: RouteType::Direct,
+                transport: TransportConnectionParams {
+                    sni: Arc::clone(&hostname),
+                    tcp_host: Host::Domain(Arc::clone(&hostname)),
+                    port: self.port,
+                    certs: self.cert.clone(),
+                },
+                http_host: hostname,
+                http_request_decorator: HttpRequestDecoratorSeq::default(),
+                connection_confirmation_header: None,
+            }
+        };
         if let Some(header) = &self.confirmation_header_name {
             return result.with_confirmation_header(http::HeaderName::from_static(header));
         }
@@ -294,33 +396,105 @@ impl DomainConfig {
     }
 
     pub fn connection_params_with_fallback(&self) -> Vec<ConnectionParams> {
-        let direct = self.connection_params();
-        let rng = thread_rng();
-        let shuffled_g_params = self.proxy_config_g.shuffled_connection_params(
-            self.proxy_path,
-            self.confirmation_header_name,
-            rng.clone(),
-        );
-        let shuffled_f_params = self.proxy_config_f.shuffled_connection_params(
-            self.proxy_path,
-            self.confirmation_header_name,
-            rng,
-        );
-        let proxy_params = itertools::interleave(shuffled_g_params, shuffled_f_params);
-        iter::once(direct).chain(proxy_params).collect()
+        let direct = self.direct_connection_params();
+        if let Some(proxy) = &self.proxy {
+            let mut rng = thread_rng();
+            // TODO use array::each_ref() once MSRV >= 1.77
+            let [params_a, params_b] = &proxy.configs;
+            let [params_a, params_b] = [params_a, params_b].map(|config| {
+                config.shuffled_connection_params(
+                    proxy.path_prefix,
+                    self.confirmation_header_name,
+                    &mut rng,
+                )
+            });
+
+            let proxy_params = itertools::interleave(params_a, params_b);
+            iter::once(direct).chain(proxy_params).collect()
+        } else {
+            iter::once(direct).collect()
+        }
+    }
+
+    pub fn route_provider(
+        &self,
+    ) -> HttpsProvider<DomainFrontRouteProvider, TlsRouteProvider<DirectTcpRouteProvider>> {
+        let Self {
+            hostname,
+            port,
+            cert,
+            confirmation_header_name: _,
+            proxy,
+        } = self;
+        let domain_front_configs = proxy
+            .as_ref()
+            .map(
+                |ConnectionProxyConfig {
+                     path_prefix,
+                     configs,
+                 }| {
+                    let fronting_path_prefix = Arc::from(*path_prefix);
+                    let make_proxy_config = move |config: &ProxyConfig| {
+                        let ProxyConfig {
+                            route_type: _,
+                            http_host,
+                            sni_list,
+                            certs,
+                        } = config;
+                        DomainFrontConfig {
+                            root_certs: certs.clone(),
+                            http_host: (*http_host).into(),
+                            sni_list: sni_list.iter().map(|sni| (*sni).into()).collect(),
+                            path_prefix: Arc::clone(&fronting_path_prefix),
+                        }
+                    };
+                    configs.iter().map(make_proxy_config)
+                },
+            )
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let hostname = Arc::<str>::from(*hostname);
+
+        HttpsProvider::new(
+            Arc::clone(&hostname),
+            HttpVersion::Http1_1,
+            DomainFrontRouteProvider::new(HttpVersion::Http1_1, domain_front_configs),
+            TlsRouteProvider::new(
+                cert.clone(),
+                Host::Domain(Arc::clone(&hostname)),
+                DirectTcpRouteProvider::new(hostname, *port),
+            ),
+        )
+    }
+}
+
+pub struct UserAgent(HeaderValue);
+
+impl UserAgent {
+    pub fn with_libsignal_version(user_agent: &str) -> Self {
+        let with_lib_version = format!("{} libsignal/{}", user_agent, libsignal_core::VERSION);
+        Self(HeaderValue::try_from(&with_lib_version).expect("valid header string"))
+    }
+}
+
+impl AsHttpHeader for UserAgent {
+    const HEADER_NAME: http::HeaderName = http::header::USER_AGENT;
+
+    fn header_value(&self) -> HeaderValue {
+        self.0.clone()
     }
 }
 
 pub fn add_user_agent_header(
     mut connection_params_list: Vec<ConnectionParams>,
-    user_agent: &str,
+    agent: &UserAgent,
 ) -> Vec<ConnectionParams> {
-    let with_lib_version = format!("{} libsignal/{}", user_agent, libsignal_core::VERSION);
+    let (name, value) = agent.as_header();
     connection_params_list.iter_mut().for_each(|cp| {
-        cp.http_request_decorator.add(HttpRequestDecorator::Header(
-            http::header::USER_AGENT,
-            http::header::HeaderValue::try_from(&with_lib_version).expect("valid header string"),
-        ));
+        cp.http_request_decorator
+            .add(HttpRequestDecorator::header(name.clone(), value.clone()));
     });
     connection_params_list
 }
@@ -328,41 +502,78 @@ pub fn add_user_agent_header(
 #[derive(Clone)]
 pub struct ProxyConfig {
     route_type: RouteType,
-    hostname: &'static str,
+    /// The value of the HTTP Host header
+    http_host: &'static str,
+    /// Domain names to use for DNS resolution and TLS SNI.
     sni_list: &'static [&'static str],
+    /// TLS root certificates to use.
+    certs: RootCertificates,
 }
 
 impl ProxyConfig {
-    pub fn shuffled_connection_params<'a>(
-        &'a self,
+    pub fn shuffled_connection_params(
+        &self,
         proxy_path: &'static str,
         confirmation_header_name: Option<&'static str>,
-        mut rng: impl Rng,
-    ) -> impl Iterator<Item = ConnectionParams> + 'a {
+        rng: &mut impl Rng,
+    ) -> impl Iterator<Item = ConnectionParams> {
+        let route_type = self.route_type;
+        let http_host = Arc::from(self.http_host);
+        let certs = self.certs.clone();
+
         let mut sni_list = self.sni_list.to_vec();
-        sni_list.shuffle(&mut rng);
+        sni_list.shuffle(rng);
+
         sni_list.into_iter().map(move |sni| {
-            let mut result = ConnectionParams::new(
-                self.route_type,
-                sni,
-                self.hostname,
-                nonzero!(443u16),
-                HttpRequestDecorator::PathPrefix(proxy_path).into(),
-                RootCertificates::Native,
-            );
-            if let Some(header) = confirmation_header_name {
-                result = result.with_confirmation_header(http::HeaderName::from_static(header));
+            // We want to use the SNI name as the hostname for DNS lookup and
+            // for the TLS connection. Then, once an encrypted connection is
+            // established, the actual hostname should be used for the HTTP
+            // header.
+            let sni_and_dns_host = (*sni).into();
+            ConnectionParams {
+                route_type,
+                transport: TransportConnectionParams {
+                    sni: Arc::clone(&sni_and_dns_host),
+                    tcp_host: Host::Domain(sni_and_dns_host),
+                    port: nonzero!(443u16),
+                    certs: certs.clone(),
+                },
+                http_host: Arc::clone(&http_host),
+                http_request_decorator: HttpRequestDecorator::PathPrefix(proxy_path).into(),
+                connection_confirmation_header: confirmation_header_name
+                    .map(http::HeaderName::from_static),
             }
-            result
         })
+    }
+}
+
+impl From<KeyTransConfig> for PublicConfig {
+    fn from(src: KeyTransConfig) -> Self {
+        let KeyTransConfig {
+            signing_key_material,
+            vrf_key_material,
+            auditor_key_material,
+        } = src;
+        let signature_key =
+            VerifyingKey::from_bytes(signing_key_material).expect("valid signing key material");
+        let auditor_key =
+            VerifyingKey::from_bytes(auditor_key_material).expect("valid auditor key material");
+        let vrf_key = VrfPublicKey::try_from(*vrf_key_material).expect("valid VRF key material");
+        Self {
+            mode: DeploymentMode::ThirdPartyAuditing(auditor_key),
+            signature_key,
+            vrf_key,
+        }
     }
 }
 
 pub struct Env<'a, Svr3> {
     pub cdsi: EnclaveEndpoint<'a, Cdsi>,
-    pub svr2: EnclaveEndpoint<'a, Sgx>,
+    pub svr2: EnclaveEndpoint<'a, SgxPreQuantum>,
     pub svr3: Svr3,
     pub chat_domain_config: DomainConfig,
+    // TODO: make non-optional when the public endpoints are up
+    pub keytrans_config: Option<KeyTransConfig>,
 }
 
 impl<'a> Env<'a, Svr3Env<'a>> {
@@ -373,6 +584,7 @@ impl<'a> Env<'a, Svr3Env<'a>> {
             svr2,
             svr3,
             chat_domain_config,
+            ..
         } = self;
         HashMap::from([
             cdsi.domain_config.static_fallback(),
@@ -392,18 +604,26 @@ pub struct Svr3Env<'a>(
 );
 
 impl<'a> Svr3Env<'a> {
+    pub const fn new(
+        sgx: EnclaveEndpoint<'a, Sgx>,
+        nitro: EnclaveEndpoint<'a, Nitro>,
+        tpm2snp: EnclaveEndpoint<'a, Tpm2Snp>,
+    ) -> Self {
+        Self(sgx, nitro, tpm2snp)
+    }
+
     #[inline]
-    pub fn sgx(&self) -> &EnclaveEndpoint<'a, Sgx> {
+    pub const fn sgx(&self) -> &EnclaveEndpoint<'a, Sgx> {
         &self.0
     }
 
     #[inline]
-    pub fn nitro(&self) -> &EnclaveEndpoint<'a, Nitro> {
+    pub const fn nitro(&self) -> &EnclaveEndpoint<'a, Nitro> {
         &self.1
     }
 
     #[inline]
-    pub fn tpm2snp(&self) -> &EnclaveEndpoint<'a, Tpm2Snp> {
+    pub const fn tpm2snp(&self) -> &EnclaveEndpoint<'a, Tpm2Snp> {
         &self.2
     }
 }
@@ -432,6 +652,11 @@ pub const STAGING: Env<'static, Svr3Env> = Env {
             params: ENDPOINT_PARAMS_SVR3_TPM2SNP_STAGING,
         },
     ),
+    keytrans_config: Some(KeyTransConfig {
+        signing_key_material: KEYTRANS_SIGNING_KEY_MATERIAL_STAGING,
+        vrf_key_material: KEYTRANS_VRF_KEY_MATERIAL_STAGING,
+        auditor_key_material: KEYTRANS_AUDITOR_KEY_MATERIAL_STAGING,
+    }),
 };
 
 pub const PROD: Env<'static, Svr3Env> = Env {
@@ -458,6 +683,7 @@ pub const PROD: Env<'static, Svr3Env> = Env {
             params: ENDPOINT_PARAMS_SVR3_TPM2SNP_PROD,
         },
     ),
+    keytrans_config: None,
 };
 
 pub mod constants {
@@ -475,12 +701,13 @@ mod test {
         assert_eq!(
             Some(TIMESTAMP_HEADER_NAME),
             config
-                .connection_params()
+                .connect
+                .direct_connection_params()
                 .connection_confirmation_header
                 .as_ref()
                 .map(|header| header.as_str())
         );
-        for params in config.connection_params_with_fallback() {
+        for params in config.connect.connection_params_with_fallback() {
             assert_eq!(
                 Some(TIMESTAMP_HEADER_NAME),
                 params
@@ -488,7 +715,7 @@ mod test {
                     .as_ref()
                     .map(|header| header.as_str()),
                 "{}",
-                params.sni,
+                params.transport.sni,
             );
         }
     }
@@ -498,12 +725,13 @@ mod test {
         assert_eq!(
             None,
             config
-                .connection_params()
+                .connect
+                .direct_connection_params()
                 .connection_confirmation_header
                 .as_ref()
                 .map(|header| header.as_str())
         );
-        for params in config.connection_params_with_fallback() {
+        for params in config.connect.connection_params_with_fallback() {
             assert_eq!(
                 None,
                 params
@@ -511,7 +739,7 @@ mod test {
                     .as_ref()
                     .map(|header| header.as_str()),
                 "{}",
-                params.sni,
+                params.transport.sni,
             );
         }
     }

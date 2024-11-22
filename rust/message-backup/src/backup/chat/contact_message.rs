@@ -2,25 +2,32 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+#[cfg(test)]
+use derive_where::derive_where;
 use protobuf::EnumOrUnknown;
 
-use crate::backup::chat::{ChatItemError, Reaction};
+use crate::backup::chat::{ChatItemError, ReactionSet};
+use crate::backup::file::{FilePointer, FilePointerError};
 use crate::backup::frame::RecipientId;
-use crate::backup::method::Contains;
+use crate::backup::method::LookupPair;
+use crate::backup::recipient::DestinationKind;
+use crate::backup::serialize::SerializeOrder;
+use crate::backup::time::ReportUnusualTimestamp;
 use crate::backup::{TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::ContactMessage`].
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
-pub struct ContactMessage {
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(test, derive_where(PartialEq; Recipient: PartialEq + SerializeOrder))]
+pub struct ContactMessage<Recipient> {
     pub contacts: Vec<ContactAttachment>,
-    pub reactions: Vec<Reaction>,
+    #[serde(bound(serialize = "Recipient: serde::Serialize + SerializeOrder"))]
+    pub reactions: ReactionSet<Recipient>,
     _limit_construction_to_module: (),
 }
 
 /// Validated version of [`proto::ContactAttachment`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct ContactAttachment {
     pub name: Option<proto::contact_attachment::Name>,
@@ -28,6 +35,8 @@ pub struct ContactAttachment {
     pub email: Vec<proto::contact_attachment::Email>,
     pub address: Vec<proto::contact_attachment::PostalAddress>,
     pub organization: Option<String>,
+    pub avatar: Option<FilePointer>,
+    #[serde(skip)]
     _limit_construction_to_module: (),
 }
 
@@ -36,26 +45,27 @@ pub struct ContactAttachment {
 pub enum ContactAttachmentError {
     /// {0} type is unknown                                                                                                                                                                                                                                                                                                                                                                                                
     UnknownType(&'static str),
+    /// avatar: {0}
+    Avatar(FilePointerError),
 }
 
-impl<R: Contains<RecipientId>> TryFromWith<proto::ContactMessage, R> for ContactMessage {
+impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+    TryFromWith<proto::ContactMessage, C> for ContactMessage<R>
+{
     type Error = ChatItemError;
 
-    fn try_from_with(item: proto::ContactMessage, context: &R) -> Result<Self, Self::Error> {
+    fn try_from_with(item: proto::ContactMessage, context: &C) -> Result<Self, Self::Error> {
         let proto::ContactMessage {
             reactions,
             contact,
             special_fields: _,
         } = item;
 
-        let reactions = reactions
-            .into_iter()
-            .map(|r| r.try_into_with(context))
-            .collect::<Result<_, _>>()?;
+        let reactions = reactions.try_into_with(context)?;
 
         let contacts = contact
             .into_iter()
-            .map(|c| c.try_into())
+            .map(|c| c.try_into_with(context))
             .collect::<Result<_, _>>()?;
 
         Ok(Self {
@@ -66,19 +76,18 @@ impl<R: Contains<RecipientId>> TryFromWith<proto::ContactMessage, R> for Contact
     }
 }
 
-impl TryFrom<proto::ContactAttachment> for ContactAttachment {
+impl<C: ReportUnusualTimestamp> TryFromWith<proto::ContactAttachment, C> for ContactAttachment {
     type Error = ContactAttachmentError;
 
-    fn try_from(value: proto::ContactAttachment) -> Result<Self, Self::Error> {
+    fn try_from_with(value: proto::ContactAttachment, context: &C) -> Result<Self, Self::Error> {
         let proto::ContactAttachment {
             name,
             number,
             email,
             address,
             organization,
+            avatar,
             special_fields: _,
-            // TODO validate this field
-            avatar: _,
         } = value;
 
         if let Some(proto::contact_attachment::Name {
@@ -89,7 +98,7 @@ impl TryFrom<proto::ContactAttachment> for ContactAttachment {
             prefix: _,
             suffix: _,
             middleName: _,
-            displayName: _,
+            nickname: _,
             special_fields: _,
         }) = name.as_ref()
         {}
@@ -142,12 +151,19 @@ impl TryFrom<proto::ContactAttachment> for ContactAttachment {
             }
         }
 
+        let avatar = avatar
+            .into_option()
+            .map(|file| FilePointer::try_from_with(file, context))
+            .transpose()
+            .map_err(ContactAttachmentError::Avatar)?;
+
         Ok(ContactAttachment {
             name: name.into_option(),
             number,
             email,
             address,
             organization,
+            avatar,
             _limit_construction_to_module: (),
         })
     }
@@ -157,12 +173,10 @@ impl TryFrom<proto::ContactAttachment> for ContactAttachment {
 mod test {
     use test_case::test_case;
 
-    use crate::backup::chat::testutil::{
-        invalid_reaction, no_reactions, ProtoHasField, TestContext,
-    };
-    use crate::backup::chat::ReactionError;
-
     use super::*;
+    use crate::backup::chat::{Reaction, ReactionError};
+    use crate::backup::recipient::FullRecipientData;
+    use crate::backup::testutil::TestContext;
 
     impl proto::ContactMessage {
         fn test_data() -> Self {
@@ -182,12 +196,6 @@ mod test {
         }
     }
 
-    impl ProtoHasField<Vec<proto::Reaction>> for proto::ContactMessage {
-        fn get_field_mut(&mut self) -> &mut Vec<proto::Reaction> {
-            &mut self.reactions
-        }
-    }
-
     impl ContactAttachment {
         fn from_proto_test_data() -> Self {
             Self {
@@ -196,6 +204,7 @@ mod test {
                 email: vec![],
                 address: vec![],
                 organization: None,
+                avatar: None,
                 _limit_construction_to_module: (),
             }
         }
@@ -207,27 +216,35 @@ mod test {
             proto::ContactMessage::test_data().try_into_with(&TestContext::default()),
             Ok(ContactMessage {
                 contacts: vec![ContactAttachment::from_proto_test_data()],
-                reactions: vec![Reaction::from_proto_test_data()],
+                reactions: ReactionSet::from_iter([(
+                    TestContext::SELF_ID,
+                    Reaction::from_proto_test_data(),
+                )]),
                 _limit_construction_to_module: ()
             })
         )
     }
 
-    #[test_case(no_reactions, Ok(()))]
+    #[test_case(|x| x.reactions.clear() => Ok(()); "no reactions")]
     #[test_case(
-        invalid_reaction,
-        Err(ChatItemError::Reaction(ReactionError::EmptyEmoji))
+        |x| x.reactions.push(proto::Reaction::default()) =>
+        Err(ChatItemError::Reaction(ReactionError::EmptyEmoji));
+        "invalid reaction"
     )]
-    fn contact_message(
-        modifier: fn(&mut proto::ContactMessage),
-        expected: Result<(), ChatItemError>,
-    ) {
+    #[test_case(|x| x.contact[0].avatar = Some(proto::FilePointer::test_data()).into() => Ok(()); "with avatar")]
+    #[test_case(
+        |x| x.contact[0].avatar = Some(proto::FilePointer::default()).into() =>
+        Err(ChatItemError::ContactAttachment(ContactAttachmentError::Avatar(
+            FilePointerError::NoLocator
+        )));
+        "with invalid avatar"
+    )]
+    fn contact_message(modifier: fn(&mut proto::ContactMessage)) -> Result<(), ChatItemError> {
         let mut message = proto::ContactMessage::test_data();
         modifier(&mut message);
 
-        let result = message
+        message
             .try_into_with(&TestContext::default())
-            .map(|_: ContactMessage| ());
-        assert_eq!(result, expected);
+            .map(|_: ContactMessage<FullRecipientData>| ())
     }
 }

@@ -37,9 +37,9 @@ pub mod zkgroup;
 // Desktop does not use SVR
 #[cfg(any(feature = "jni", feature = "ffi"))]
 mod pin {
-    use crate::*;
+    use ::libsignal_account_keys::PinHash;
 
-    use ::signal_pin::PinHash;
+    use crate::*;
 
     bridge_as_handle!(PinHash, node = false);
 }
@@ -48,10 +48,13 @@ pub mod incremental_mac;
 pub mod message_backup;
 
 pub mod io;
+pub mod keytrans;
 
 #[cfg(feature = "signal-media")]
-mod media {
-    use signal_media::sanitize::mp4::SanitizedMetadata;
+pub mod media {
+    // Wrapper struct for cbindgen
+    #[derive(Clone, Debug)]
+    pub struct SanitizedMetadata(pub signal_media::sanitize::mp4::SanitizedMetadata);
 
     use crate::*;
 

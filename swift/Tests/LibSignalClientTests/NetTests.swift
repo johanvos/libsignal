@@ -49,7 +49,12 @@ final class NetTests: XCTestCase {
         do {
             try failWithError("Protocol")
         } catch SignalError.networkProtocolError(let message) {
-            XCTAssertEqual(message, "Protocol error: protocol error after establishing a connection")
+            XCTAssertEqual(message, "Protocol error: protocol error after establishing a connection: failed to decode frame as protobuf")
+        }
+        do {
+            try failWithError("CdsiProtocol")
+        } catch SignalError.networkProtocolError(let message) {
+            XCTAssertEqual(message, "Protocol error: CDS protocol: no token found in response")
         }
         do {
             try failWithError("AttestationDataError")
@@ -124,6 +129,12 @@ final class NetTests: XCTestCase {
             _ = entry.e164
         }
     }
+
+    func testNetworkChangeEvent() throws {
+        // There's no feedback from this, we're just making sure it doesn't normally crash or throw.
+        let net = Net(env: .staging, userAgent: userAgent)
+        try net.networkDidChange()
+    }
 }
 
 final class Svr3Tests: TestCaseBase {
@@ -145,7 +156,7 @@ final class Svr3Tests: TestCaseBase {
 
     override func setUpWithError() throws {
         let username = randomBytes(16).hexString
-        let net = Net(env: .staging, userAgent: userAgent)
+        let net = Net(env: .production, userAgent: userAgent)
         let auth = try Auth(username: username, enclaveSecret: self.getEnclaveSecret())
         self.state = State(auth: auth, net: net)
     }
@@ -382,6 +393,27 @@ final class Svr3Tests: TestCaseBase {
             maxTries: tries,
             auth: self.state!.auth
         )
+
+        let restoredSecret = try await state!.net.svr3.restore(
+            password: "password",
+            shareSet: shareSet,
+            auth: self.state!.auth
+        )
+        XCTAssertEqual(restoredSecret.value, self.storedSecret)
+        XCTAssertEqual(restoredSecret.triesRemaining, tries - 1)
+    }
+
+    func testRestoreAfterRotate() async throws {
+        let tries = UInt32(10)
+
+        let shareSet = try await state!.net.svr3.backup(
+            self.storedSecret,
+            password: "password",
+            maxTries: tries,
+            auth: self.state!.auth
+        )
+
+        _ = try await self.state!.net.svr3.rotate(shareSet: shareSet, auth: self.state!.auth)
 
         let restoredSecret = try await state!.net.svr3.restore(
             password: "password",

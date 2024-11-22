@@ -10,16 +10,18 @@ use assert_matches::assert_matches;
 use dir_test::{dir_test, Fixture};
 use futures::io::Cursor;
 use futures::AsyncRead;
+use libsignal_account_keys::BackupKey;
+use libsignal_core::Aci;
 use libsignal_message_backup::backup::Purpose;
 use libsignal_message_backup::frame::{FileReaderFactory, VerifyHmac};
-use libsignal_message_backup::key::{BackupKey, MessageBackupKey};
+use libsignal_message_backup::key::MessageBackupKey;
 use libsignal_message_backup::{BackupReader, ReadResult};
-use libsignal_protocol::Aci;
 
 const BACKUP_PURPOSE: Purpose = Purpose::RemoteBackup;
 
 const ACI: Aci = Aci::from_uuid_bytes([0x11; 16]);
-const MASTER_KEY: [u8; 32] = [b'M'; 32];
+const RAW_ACCOUNT_ENTROPY_POOL: &str =
+    "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
 const IV: [u8; 16] = [b'I'; 16];
 
 #[dir_test(
@@ -38,12 +40,41 @@ fn is_valid_json_proto(input: Fixture<&str>) {
 
 #[dir_test(
         dir: "$CARGO_MANIFEST_DIR/tests/res/test-cases",
-        glob: "valid/*.binproto",
-        postfix: "binproto"
-        loader: read_file
+        glob: "valid/*.jsonproto",
+        postfix: "serialize"
     )]
-fn is_valid_binary_proto(input: Fixture<Vec<u8>>) {
-    validate_proto(input.content())
+fn can_serialize_json_proto(input: Fixture<&str>) {
+    let json_contents = input.into_content();
+    let json_contents = json5::from_str(json_contents).expect("invalid JSON");
+    let json_array = assert_matches!(json_contents, serde_json::Value::Array(contents) => contents);
+    let binproto =
+        libsignal_message_backup::backup::convert_from_json(json_array).expect("failed to convert");
+
+    let input = Cursor::new(&binproto);
+    let reader = BackupReader::new_unencrypted(input, BACKUP_PURPOSE);
+    let result = futures::executor::block_on(reader.read_all())
+        .result
+        .expect("valid backup");
+    // This should not crash.
+    println!(
+        "{}",
+        libsignal_message_backup::backup::serialize::Backup::from(result).to_string_pretty()
+    )
+}
+
+#[test]
+fn serialized_account_settings_is_valid() {
+    let binproto = include_bytes!("res/canonical-backup.binproto");
+    let expected_canonical_str = include_str!("res/canonical-backup.expected.json");
+
+    let input = Cursor::new(binproto);
+    let reader = BackupReader::new_unencrypted(input, BACKUP_PURPOSE);
+    let result = futures::executor::block_on(reader.read_all())
+        .result
+        .expect("valid backup");
+    let canonical_repr =
+        libsignal_message_backup::backup::serialize::Backup::from(result).to_string_pretty();
+    pretty_assertions::assert_str_eq!(canonical_repr, expected_canonical_str)
 }
 
 const ENCRYPTED_SOURCE_SUFFIX: &str = ".source.jsonproto";
@@ -57,7 +88,9 @@ fn encrypted_proto_matches_source(input: Fixture<PathBuf>) {
     let path = input.into_content();
     let expected_source_path = format!("{}{ENCRYPTED_SOURCE_SUFFIX}", path.to_str().unwrap());
 
-    let backup_key = BackupKey::derive_from_master_key(&MASTER_KEY);
+    let backup_key = BackupKey::derive_from_account_entropy_pool(
+        &RAW_ACCOUNT_ENTROPY_POOL.parse().expect("valid"),
+    );
     let key = MessageBackupKey::derive(&backup_key, &backup_key.derive_backup_id(&ACI));
     println!("hmac key: {}", hex::encode(key.hmac_key));
     println!("aes key: {}", hex::encode(key.aes_key));
@@ -74,8 +107,8 @@ fn encrypted_proto_matches_source(input: Fixture<PathBuf>) {
         .args([
             "--aci",
             &ACI.service_id_string(),
-            "--master-key",
-            &hex::encode(MASTER_KEY),
+            "--account-entropy",
+            RAW_ACCOUNT_ENTROPY_POOL,
             "--iv",
             &hex::encode(IV),
             "-",
@@ -108,7 +141,9 @@ fn encrypted_proto_matches_source(input: Fixture<PathBuf>) {
 fn is_valid_encrypted_proto(input: Fixture<PathBuf>) {
     let path = input.content();
 
-    let backup_key = BackupKey::derive_from_master_key(&MASTER_KEY);
+    let backup_key = BackupKey::derive_from_account_entropy_pool(
+        &RAW_ACCOUNT_ENTROPY_POOL.parse().expect("valid"),
+    );
     let key = MessageBackupKey::derive(&backup_key, &backup_key.derive_backup_id(&ACI));
     println!("hmac key: {}", hex::encode(key.hmac_key));
     println!("aes key: {}", hex::encode(key.aes_key));
@@ -128,8 +163,8 @@ fn is_valid_encrypted_proto(input: Fixture<PathBuf>) {
         .args([
             "--aci",
             &ACI.service_id_string(),
-            "--master-key",
-            &hex::encode(MASTER_KEY),
+            "--account-entropy",
+            RAW_ACCOUNT_ENTROPY_POOL,
             "--purpose",
             BACKUP_PURPOSE.into(),
             path.to_str().unwrap(),
@@ -174,10 +209,6 @@ fn invalid_jsonproto(input: Fixture<PathBuf>) {
         std::fs::read_to_string(&expected_path).expect("can't load expected contents");
 
     assert_eq!(text, expected_text);
-}
-
-fn read_file(path: &str) -> Vec<u8> {
-    std::fs::read(path).expect("can read")
 }
 
 fn write_expected_output() -> bool {

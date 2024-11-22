@@ -15,7 +15,9 @@ use http::status::InvalidStatusCode;
 use http::uri::{InvalidUri, PathAndQuery};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use libsignal_net::auth::Auth;
-use libsignal_net::chat::{self, DebugInfo as ChatServiceDebugInfo, Response as ChatResponse};
+use libsignal_net::chat::{
+    self, ChatServiceError, DebugInfo as ChatServiceDebugInfo, Response as ChatResponse,
+};
 use libsignal_protocol::Timestamp;
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,12 +26,12 @@ use crate::support::*;
 use crate::*;
 
 enum ChatListenerState {
-    Inactive(BoxStream<'static, chat::server_requests::ServerMessage>),
+    Inactive(BoxStream<'static, chat::server_requests::ServerEvent>),
     Active {
-        handle: tokio::task::JoinHandle<BoxStream<'static, chat::server_requests::ServerMessage>>,
+        handle: tokio::task::JoinHandle<BoxStream<'static, chat::server_requests::ServerEvent>>,
         cancel: oneshot::Sender<()>,
     },
-    Cancelled(tokio::task::JoinHandle<BoxStream<'static, chat::server_requests::ServerMessage>>),
+    Cancelled(tokio::task::JoinHandle<BoxStream<'static, chat::server_requests::ServerEvent>>),
     CurrentlyBeingMutated,
 }
 
@@ -52,38 +54,42 @@ impl ChatListenerState {
     }
 }
 
-pub struct Chat {
-    pub service: chat::Chat<
-        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
-        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
-    >,
+pub struct Chat<T> {
+    pub service: T,
     listener: std::sync::Mutex<ChatListenerState>,
     pub synthetic_request_tx:
         mpsc::Sender<chat::ws::ServerEvent<libsignal_net::infra::tcp_ssl::TcpSslConnectorStream>>,
 }
 
-impl RefUnwindSafe for Chat {}
+type MpscPair<T> = (mpsc::Sender<T>, mpsc::Receiver<T>);
+type ServerEventStreamPair =
+    MpscPair<chat::ws::ServerEvent<libsignal_net::infra::tcp_ssl::TcpSslConnectorStream>>;
 
-impl Chat {
-    pub fn new(connection_manager: &ConnectionManager, auth: Auth) -> Self {
-        let (incoming_tx, incoming_rx) = mpsc::channel(1);
+// These two types are the same for now, but might not be in the future.
+pub struct AuthChatService(
+    pub  chat::Chat<
+        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
+        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
+    >,
+);
+pub struct UnauthChatService(
+    pub  chat::Chat<
+        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
+        Arc<dyn chat::ChatServiceWithDebugInfo + Send + Sync>,
+    >,
+);
+
+impl RefUnwindSafe for AuthChatService {}
+impl RefUnwindSafe for UnauthChatService {}
+
+impl<T> Chat<T> {
+    fn new(service: T, (incoming_tx, incoming_rx): ServerEventStreamPair) -> Self {
         let incoming_stream = chat::server_requests::stream_incoming_messages(incoming_rx);
-        let synthetic_request_tx = incoming_tx.clone();
 
-        Chat {
-            service: chat::chat_service(
-                &connection_manager.chat,
-                connection_manager
-                    .transport_connector
-                    .lock()
-                    .expect("not poisoned")
-                    .clone(),
-                incoming_tx,
-                auth,
-            )
-            .into_dyn(),
+        Self {
+            service,
             listener: std::sync::Mutex::new(ChatListenerState::Inactive(Box::pin(incoming_stream))),
-            synthetic_request_tx,
+            synthetic_request_tx: incoming_tx,
         }
     }
 
@@ -129,6 +135,84 @@ impl Chat {
     }
 }
 
+impl Chat<AuthChatService> {
+    pub fn new_auth(
+        connection_manager: &ConnectionManager,
+        auth: Auth,
+        receive_stories: bool,
+    ) -> Self {
+        let (incoming_auth_tx, incoming_auth_rx) = mpsc::channel(1);
+        let synthetic_request_tx = incoming_auth_tx.clone();
+
+        let (incoming_unauth_tx, _incoming_unauth_rx) = mpsc::channel(1);
+
+        let endpoints = connection_manager
+            .endpoints
+            .lock()
+            .expect("not poisoned")
+            .clone();
+
+        let service = chat::chat_service(
+            &endpoints.chat,
+            connection_manager
+                .transport_connector
+                .lock()
+                .expect("not poisoned")
+                .clone(),
+            incoming_auth_tx,
+            incoming_unauth_tx,
+            auth,
+            receive_stories,
+        )
+        .into_dyn();
+
+        Self::new(
+            AuthChatService(service),
+            (synthetic_request_tx, incoming_auth_rx),
+        )
+    }
+}
+
+impl Chat<UnauthChatService> {
+    pub fn new_unauth(connection_manager: &ConnectionManager) -> Self {
+        let (incoming_auth_tx, _incoming_auth_rx) = mpsc::channel(1);
+        let (incoming_unauth_tx, incoming_unauth_rx) = mpsc::channel(1);
+        let synthetic_request_tx = incoming_unauth_tx.clone();
+
+        let endpoints = connection_manager
+            .endpoints
+            .lock()
+            .expect("not poisoned")
+            .clone();
+
+        let service = chat::chat_service(
+            &endpoints.chat,
+            connection_manager
+                .transport_connector
+                .lock()
+                .expect("not poisoned")
+                .clone(),
+            incoming_auth_tx,
+            incoming_unauth_tx,
+            // These will be unused because the auth service won't ever be connected.
+            Auth {
+                username: String::new(),
+                password: String::new(),
+            },
+            false,
+        )
+        .into_dyn();
+
+        Self::new(
+            UnauthChatService(service),
+            (synthetic_request_tx, incoming_unauth_rx),
+        )
+    }
+}
+
+pub type UnauthChat = Chat<UnauthChatService>;
+pub type AuthChat = Chat<AuthChatService>;
+
 pub struct HttpRequest {
     pub method: http::Method,
     pub path: PathAndQuery,
@@ -141,7 +225,8 @@ pub struct ResponseAndDebugInfo {
     pub debug_info: ChatServiceDebugInfo,
 }
 
-bridge_as_handle!(Chat);
+bridge_as_handle!(UnauthChat);
+bridge_as_handle!(AuthChat);
 bridge_as_handle!(HttpRequest);
 
 /// Newtype wrapper for implementing [`TryFrom`]`
@@ -203,15 +288,15 @@ pub trait ChatListener: Send {
         ack: ServerMessageAck,
     );
     fn received_queue_empty(&mut self);
-    fn connection_interrupted(&mut self);
+    fn connection_interrupted(&mut self, disconnect_cause: ChatServiceError);
 }
 
 impl dyn ChatListener {
     /// A helper to translate from the libsignal-net enum to the separate callback methods in this
     /// trait.
-    fn received_server_request(&mut self, request: chat::server_requests::ServerMessage) {
+    fn received_server_request(&mut self, request: chat::server_requests::ServerEvent) {
         match request {
-            chat::server_requests::ServerMessage::IncomingMessage {
+            chat::server_requests::ServerEvent::IncomingMessage {
                 request_id: _,
                 envelope,
                 server_delivery_timestamp,
@@ -221,8 +306,10 @@ impl dyn ChatListener {
                 server_delivery_timestamp,
                 ServerMessageAck::new(send_ack),
             ),
-            chat::server_requests::ServerMessage::QueueEmpty => self.received_queue_empty(),
-            chat::server_requests::ServerMessage::Stopped => self.connection_interrupted(),
+            chat::server_requests::ServerEvent::QueueEmpty => self.received_queue_empty(),
+            chat::server_requests::ServerEvent::Stopped(error) => {
+                self.connection_interrupted(error)
+            }
         }
     }
 
@@ -237,12 +324,12 @@ impl dyn ChatListener {
         self: Box<dyn ChatListener>,
         request_stream_future: impl Future<
             Output = Result<
-                BoxStream<'static, chat::server_requests::ServerMessage>,
+                BoxStream<'static, chat::server_requests::ServerEvent>,
                 ::tokio::task::JoinError,
             >,
         >,
         mut cancel_rx: oneshot::Receiver<()>,
-    ) -> BoxStream<'static, chat::server_requests::ServerMessage> {
+    ) -> BoxStream<'static, chat::server_requests::ServerEvent> {
         // This is normally done implicitly inside tokio::task::spawn[_blocking], but we do it
         // explicitly here to get a panic right away rather than only when the first request comes
         // in.
@@ -291,13 +378,6 @@ impl dyn ChatListener {
         // Pass the stream along to the next listener, if there is one.
         request_stream
     }
-}
-
-/// Separated from [`ChatListener`] to make the allocation explicit.
-///
-/// This simplifies the handling in `bridge_fn` signatures.
-pub trait MakeChatListener {
-    fn make_listener(&self) -> Box<dyn ChatListener>;
 }
 
 /// Wraps a named type and a single-use guard around [`chat::server_requests::AckEnvelopeFuture`].

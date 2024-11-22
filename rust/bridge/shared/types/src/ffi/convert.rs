@@ -12,11 +12,10 @@ use libsignal_protocol::*;
 use paste::paste;
 use uuid::Uuid;
 
-use crate::io::{InputStream, SyncInputStream};
-use crate::net::chat::MakeChatListener;
-use crate::support::{extend_lifetime, AsType, FixedLengthBincodeSerializable, Serialized};
-
 use super::*;
+use crate::io::{InputStream, SyncInputStream};
+use crate::net::chat::ChatListener;
+use crate::support::{extend_lifetime, AsType, FixedLengthBincodeSerializable, Serialized};
 
 /// Converts arguments from their FFI form to their Rust form.
 ///
@@ -310,7 +309,7 @@ impl SimpleArgTypeInfo for libsignal_protocol::Pni {
     }
 }
 
-impl SimpleArgTypeInfo for libsignal_net::cdsi::E164 {
+impl SimpleArgTypeInfo for libsignal_core::E164 {
     type ArgType = <String as SimpleArgTypeInfo>::ArgType;
     fn convert_from(e164: Self::ArgType) -> SignalFfiResult<Self> {
         let e164 = String::convert_from(e164)?;
@@ -386,7 +385,18 @@ bridge_trait!(SignedPreKeyStore);
 bridge_trait!(KyberPreKeyStore);
 bridge_trait!(InputStream);
 bridge_trait!(SyncInputStream);
-bridge_trait!(MakeChatListener);
+
+impl<'a> ArgTypeInfo<'a> for Option<Box<dyn ChatListener>> {
+    type ArgType = *const FfiChatListenerStruct;
+    type StoredType = Option<Box<dyn ChatListener>>;
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn borrow(foreign: Self::ArgType) -> SignalFfiResult<Self::StoredType> {
+        Ok(unsafe { foreign.as_ref().map(|f| f.make_listener()) })
+    }
+    fn load_from(stored: &'a mut Self::StoredType) -> Self {
+        stored.take()
+    }
+}
 
 impl<T: ResultTypeInfo, E> ResultTypeInfo for Result<T, E>
 where
@@ -702,14 +712,12 @@ impl ResultTypeInfo for libsignal_net::chat::DebugInfo {
 
     fn convert_into(self) -> SignalFfiResult<Self::ResultType> {
         let Self {
-            reconnect_count,
             ip_type,
             duration,
             connection_info,
         } = self;
 
         Ok(FfiChatServiceDebugInfo {
-            reconnect_count,
             raw_ip_type: ip_type as u8,
             duration_secs: duration.as_secs_f64(),
             connection_info: connection_info.convert_into()?,
@@ -854,6 +862,7 @@ macro_rules! ffi_arg_type {
     (&mut $typ:ty) => (*mut $typ);
     (Option<& $typ:ty>) => (*const $typ);
     (Box<[u8]>) => (ffi::BorrowedSliceOf<std::ffi::c_uchar>);
+    (Option<Box<dyn $typ:ty> >) => (*const ::paste::paste!(ffi::[<Ffi $typ Struct>]));
 
     (Ignored<$typ:ty>) => (*const std::ffi::c_void);
     (AsType<$typ:ident, $bridged:ident>) => (ffi_arg_type!($bridged));

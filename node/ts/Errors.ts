@@ -51,6 +51,8 @@ export enum ErrorCode {
   AppExpired,
   DeviceDelinked,
 
+  BackupValidation,
+
   Cancelled,
 }
 
@@ -97,6 +99,29 @@ export class LibSignalErrorBase extends Error {
       default:
         throw new TypeError(`cannot get address from this error (${this})`);
     }
+  }
+
+  public toString(): string {
+    return `${this.name} - ${this.operation}: ${this.message}`;
+  }
+
+  /// Like `error.code === code`, but also providing access to any additional properties.
+  public is<E extends ErrorCode>(
+    code: E
+  ): this is Extract<LibSignalError, { code: E }> {
+    return this.code === code;
+  }
+
+  /// Like `error instanceof LibSignalErrorBase && error.code === code`, but all in one expression,
+  /// and providing access to any additional properties.
+  public static is<E extends ErrorCode>(
+    error: unknown,
+    code: E
+  ): error is Extract<LibSignalError, { code: E }> {
+    if (error instanceof LibSignalErrorBase) {
+      return error.is(code);
+    }
+    return false;
   }
 }
 
@@ -240,6 +265,11 @@ export type SvrRestoreFailedError = LibSignalErrorCommon & {
   readonly triesRemaining: number;
 };
 
+export type BackupValidationError = LibSignalErrorCommon & {
+  code: ErrorCode.BackupValidation;
+  readonly unknownFields: ReadonlyArray<string>;
+};
+
 export type CancellationError = LibSignalErrorCommon & {
   code: ErrorCode.Cancelled;
 };
@@ -279,4 +309,6 @@ export type LibSignalError =
   | ChatServiceInactive
   | AppExpiredError
   | DeviceDelinkedError
+  | RateLimitedError
+  | BackupValidationError
   | CancellationError;

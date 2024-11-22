@@ -29,7 +29,6 @@ interface ChatResponse {
 }
 
 interface ChatServiceDebugInfo {
-  reconnectCount: number;
   ipType: number;
   durationMillis: number;
   connectionInfo: string;
@@ -121,10 +120,11 @@ export abstract class ChatListener {
     ack: ServerMessageAck
   ): void;
   _queue_empty(): void;
-  _connection_interrupted(): void;
+  _connection_interrupted(
+    // A LibSignalError or null, but not naming the type to avoid circular import dependencies.
+    reason: Error | null
+  ): void;
 }
-
-export abstract class MakeChatListener extends ChatListener {}
 
 type Wrapper<T> = Readonly<{
   _nativeHandle: T;

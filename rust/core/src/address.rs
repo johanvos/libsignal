@@ -7,9 +7,9 @@
 
 //! Types for identifying an individual Signal client instance.
 
-use uuid::Uuid;
-
 use std::fmt;
+
+use uuid::Uuid;
 
 /// Known types of [ServiceId].
 #[derive(Clone, Copy, Hash, PartialEq, Eq, num_enum::IntoPrimitive, num_enum::TryFromPrimitive)]
@@ -36,9 +36,13 @@ impl fmt::Debug for ServiceIdKind {
     }
 }
 
+/// The error returned for a failed "downcast" conversion from a [`ServiceId`] to a specific kind of
+/// service ID (e.g. [`PNI`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrongKindOfServiceIdError {
+    /// The kind of service ID being converted to.
     pub expected: ServiceIdKind,
+    /// The actual kind of the service ID being converted.
     pub actual: ServiceIdKind,
 }
 
@@ -267,6 +271,11 @@ impl ServiceId {
             ServiceId::Pni(pni) => pni.into(),
         }
     }
+
+    /// Constructs a [ProtocolAddress] from this service ID and a device ID.
+    pub fn to_protocol_address(&self, device_id: DeviceId) -> ProtocolAddress {
+        ProtocolAddress::new(self.service_id_string(), device_id)
+    }
 }
 
 impl fmt::Debug for ServiceId {
@@ -327,11 +336,11 @@ where
 
 #[cfg(test)]
 mod service_id_tests {
+    use std::borrow::Borrow;
+
     use proptest::prelude::*;
     use rand::seq::SliceRandom;
     use rand::thread_rng;
-
-    use std::borrow::Borrow;
 
     use super::*;
 

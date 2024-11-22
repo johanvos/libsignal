@@ -6,14 +6,15 @@
 #![allow(clippy::missing_safety_doc)]
 #![warn(clippy::unwrap_used)]
 
+use std::ffi::{c_char, c_uchar, c_uint, CString};
+use std::panic::AssertUnwindSafe;
+
 use futures_util::FutureExt;
 use libsignal_bridge::ffi::*;
+#[cfg(feature = "libsignal-bridge-testing")]
 #[allow(unused_imports)]
 use libsignal_bridge_testing::*;
 use libsignal_protocol::*;
-
-use std::ffi::{c_char, c_uchar, c_uint, CString};
-use std::panic::AssertUnwindSafe;
 
 pub mod logging;
 
@@ -148,6 +149,27 @@ pub unsafe extern "C" fn signal_error_get_tries_remaining(
                 err
             ))
         })?;
+        write_result_to(out, value)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn signal_error_get_unknown_fields(
+    err: *const SignalFfiError,
+    out: *mut StringArray,
+) -> *mut SignalFfiError {
+    let err = AssertUnwindSafe(err);
+    run_ffi_safe(|| {
+        let err = err.as_ref().ok_or(NullPointerError)?;
+        let value = err
+            .provide_unknown_fields()
+            .map_err(|_| {
+                SignalProtocolError::InvalidArgument(format!(
+                    "cannot get unknown_fields from error ({})",
+                    err
+                ))
+            })?
+            .into_boxed_slice();
         write_result_to(out, value)
     })
 }

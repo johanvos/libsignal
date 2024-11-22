@@ -12,7 +12,7 @@ as a Java, Swift, or TypeScript library. The underlying implementations are writ
 - zkgroup: Functionality for [zero-knowledge groups][] and related features available in Signal.
 - zkcredential: An abstraction for the sort of zero-knowledge credentials used by zkgroup, based on the paper "[The Signal Private Group System][]" by Chase, Perrin, and Zaverucha.
 - poksho: Utilities for implementing zero-knowledge proofs (such as those used by zkgroup); stands for "proof-of-knowledge, stateful-hash-object".
-- pin: Functionality for consistently using [PINs][] as passwords in Signal's Secure Value Recovery system.
+- account-keys: Functionality for consistently using [PINs][] as passwords in Signal's Secure Value Recovery system, as well as other account-wide key operations.
 - usernames: Functionality for username generation, hashing, and proofs.
 - media: Utilities for manipulating media.
 
@@ -41,13 +41,30 @@ increases to the minimum supported tools versions.
 
 # Building
 
+### Toolchain Installation
+
 To build anything in this repository you must have [Rust](https://rust-lang.org) installed,
 as well as Clang, libclang, [CMake](https://cmake.org), Make, protoc, and git.
+
+#### Linux/Debian
+
 On a Debian-like system, you can get these extra dependencies through `apt`:
 
 ```shell
 $ apt-get install clang libclang-dev cmake make protobuf-compiler git
 ```
+
+#### macOS
+
+On macOS, we have a best-effort maintained script to set up the Rust toolchain you can run by:
+
+```shell
+$ bin/mac_setup.sh
+```
+
+## Rust
+
+### First Build and Test
 
 The build currently uses a specific version of the Rust nightly compiler, which
 will be downloaded automatically by cargo. To build and test the basic protocol
@@ -58,6 +75,25 @@ $ cargo build
 ...
 $ cargo test
 ...
+```
+
+### Additional Rust Tools
+
+The basic tools above should get you set up for most libsignal Rust development. 
+
+Eventually, you may find that you need some additional Rust tools like `cbindgen` to modify the bridges to the 
+client libraries or `taplo` for code formatting. 
+
+You should always install any Rust tools you need that may affect the build from cargo rather than from your system
+package manager (e.g. `apt` or `brew`). Package managers sometimes contain outdated versions of these tools that can break
+the build with incompatibility issues (especially cbindgen).
+
+To install the main Rust extra dependencies matching the versions we use, you can run the following commands: 
+
+```shell
+$ cargo +stable install cbindgen cargo-fuzz
+$ cargo +stable install --version "$(cat ../acknowledgments/cargo-about-version)" --locked cargo-about
+$ cargo +stable install --version "$(cat ../.taplo-cli-version)" --locked taplo-cli
 ```
 
 ## Java/Android
@@ -86,7 +122,7 @@ $ make
 ```
 
 When exposing new APIs to Java, you will need to run `rust/bridge/jni/bin/gen_java_decl.py` in
-addition to rebuilding.
+addition to rebuilding. This requires installing the `cbindgen` Rust tool, as detailed above. 
 
 ### Maven Central
 
@@ -105,13 +141,15 @@ android {
   // ...
   packagingOptions {
     resources {
-      exclude "libsignal_jni.dylib"
-      exclude "signal_jni.dll"
+      excludes += setOf("libsignal_jni*.dylib", "signal_jni*.dll")
     }
   }
   // ...
 }
 ```
+
+You can additionally exclude `libsignal_jni_testing.so` if you do not plan to use any of the APIs
+intended for client testing.
 
 
 ## Swift
@@ -124,18 +162,18 @@ To learn about the Swift build process see [``swift/README.md``](swift/)
 You'll need Node installed to build. If you have [nvm][], you can run `nvm use` to select an
 appropriate version automatically.
 
-We use [`yarn`](https://classic.yarnpkg.com/) as our package manager, and `node-gyp` to control building the Rust library.
+We use `npm` as our package manager, and `node-gyp` to control building the Rust library.
 
 ```shell
 $ cd node
 $ nvm use
-$ yarn install
-$ yarn node-gyp rebuild  # clean->configure->build
-$ yarn tsc
-$ yarn test
+$ npm install
+$ npx node-gyp rebuild  # clean->configure->build
+$ npm run tsc
+$ npm run test
 ```
 
-When testing changes locally, you can use `yarn build` to do an incremental rebuild of the Rust library. Alternately, `yarn build-with-debug-level-logs` will rebuild without filtering out debug- and verbose-level logs.
+When testing changes locally, you can use `npm run build` to do an incremental rebuild of the Rust library. Alternately, `npm run build-with-debug-level-logs` will rebuild without filtering out debug- and verbose-level logs.
 
 When exposing new APIs to Node, you will need to run `rust/bridge/node/bin/gen_ts_decl.py` in
 addition to rebuilding.
@@ -162,6 +200,22 @@ considered, but only if they do not pose an undue maintenance burden or conflict
 the project.
 
 Signing a [CLA (Contributor License Agreement)](https://signal.org/cla/) is required for all contributions.
+
+## Code Formatting and Acknowledgments
+
+You can run the styler on the entire project by running:
+
+```shell
+just format-all
+```
+
+You can run more extensive tests as well as linters and clippy by running:
+
+```shell
+just check-pre-commit
+```
+
+When making a PR that adjusts dependencies, you'll need to regenerate our acknowledgments files. See [``acknowledgments/README.md``](acknowledgments/).
 
 # Legal things
 ## Cryptography Notice

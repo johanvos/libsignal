@@ -10,11 +10,15 @@ authors = ["Signal Messenger LLC"]
 edition = "2021"
 license = "AGPL-3.0-only"
 
+[lints]
+workspace = true
+
 [dependencies]
-num_enum = "0.6.1"
-uuid = "1.1.2"
+num_enum = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-hex-literal = "0.4.1"
-proptest = "1.0"
-rand = "0.8"
+assert_matches = { workspace = true }
+hex-literal = { workspace = true }
+proptest = { workspace = true }
+rand = { workspace = true }

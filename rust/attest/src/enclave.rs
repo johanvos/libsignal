@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 
 use displaydoc::Display;
+use prost::Message;
 
 use crate::client_connection::ClientConnection;
 use crate::svr2::RaftConfig;
 use crate::tpm2snp::Tpm2Error;
 use crate::{client_connection, dcap, nitro, proto, snow_resolver};
-use prost::Message;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -81,6 +81,11 @@ impl From<Tpm2Error> for Error {
     }
 }
 
+pub enum HandshakeType {
+    PreQuantum,
+    PostQuantum,
+}
+
 /// A noise handshaker that can be used to build a [client_connection::ClientConnection]
 ///
 /// Callers provide an attestation that must contain the remote enclave's public key. If the
@@ -115,14 +120,22 @@ impl Handshake {
     /// Completes client connection initiation, returns a valid client connection.
     pub fn complete(mut self, initial_received: &[u8]) -> Result<ClientConnection> {
         self.handshake.read_message(initial_received, &mut [])?;
+        let handshake_hash = self.handshake.get_handshake_hash().to_vec();
         let transport = self.handshake.into_transport_mode()?;
         log::info!("Successfully completed attested connection");
-        Ok(ClientConnection { transport })
+        Ok(ClientConnection {
+            handshake_hash,
+            transport,
+        })
     }
 
-    pub(crate) fn with_claims(claims: Claims) -> Result<UnvalidatedHandshake> {
+    pub(crate) fn with_claims(claims: Claims, typ: HandshakeType) -> Result<UnvalidatedHandshake> {
+        let pattern = match typ {
+            HandshakeType::PreQuantum => client_connection::NOISE_PATTERN,
+            HandshakeType::PostQuantum => client_connection::NOISE_PATTERN_HFS,
+        };
         let mut handshake = snow::Builder::with_resolver(
-            client_connection::NOISE_PATTERN.parse().expect("valid"),
+            pattern.parse().expect("valid"),
             Box::new(snow_resolver::Resolver),
         )
         .remote_public_key(&claims.public_key)

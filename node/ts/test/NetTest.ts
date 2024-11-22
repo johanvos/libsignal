@@ -12,8 +12,8 @@ import { Aci, Pni } from '../Address';
 import * as Native from '../../Native';
 import { ErrorCode, LibSignalErrorBase } from '../Errors';
 import {
+  buildHttpRequest,
   ChatServerMessageAck,
-  ChatService,
   ChatServiceListener,
   Environment,
   Net,
@@ -23,6 +23,7 @@ import {
 import { randomBytes } from 'crypto';
 import { ChatResponse } from '../../Native';
 import { CompletablePromise } from './util';
+import { fail } from 'assert';
 
 use(chaiAsPromised);
 use(sinonChai);
@@ -32,9 +33,20 @@ config.truncateThreshold = 0;
 
 const userAgent = 'test';
 
+describe('Net class', () => {
+  it('handles network change events', () => {
+    // There's no feedback from this, we're just making sure it doesn't normally crash or throw.
+    const net = new Net({
+      env: Environment.Production,
+      userAgent: userAgent,
+    });
+    net.onNetworkChange();
+  });
+});
+
 describe('chat service api', () => {
   it('converts errors to native', () => {
-    const cases: Array<[string, ErrorCode]> = [
+    const cases: Array<[string, ErrorCode | object]> = [
       ['AppExpired', ErrorCode.AppExpired],
       ['DeviceDeregistered', ErrorCode.DeviceDelinked],
       ['ServiceInactive', ErrorCode.ChatServiceInactive],
@@ -45,18 +57,25 @@ describe('chat service api', () => {
       ['IncomingDataInvalid', ErrorCode.IoError],
       ['Timeout', ErrorCode.IoError],
       ['TimeoutEstablishingConnection', ErrorCode.IoError],
+      [
+        'RetryAfter42Seconds',
+        {
+          code: ErrorCode.RateLimitedError,
+          retryAfterSecs: 42,
+        },
+      ],
 
       // These two are more of internal errors, but they should never happen anyway.
       ['FailedToPassMessageToIncomingChannel', ErrorCode.IoError],
       ['RequestHasInvalidHeader', ErrorCode.IoError],
     ];
     cases.forEach((testCase) => {
-      const [name, expectedCode] = testCase;
+      const [name, expectation] = testCase;
       expect(() => Native.TESTING_ChatServiceErrorConvert(name))
         .throws(LibSignalErrorBase)
-        .to.include({
-          code: expectedCode,
-        });
+        .to.include(
+          expectation instanceof Object ? expectation : { code: expectation }
+        );
     });
   });
 
@@ -88,7 +107,6 @@ describe('chat service api', () => {
 
   it('converts DebugInfo object to native', () => {
     const expected = {
-      reconnectCount: 2,
       ipType: 1,
       durationMillis: 200,
       connectionInfo: 'connection_info',
@@ -107,7 +125,7 @@ describe('chat service api', () => {
   ];
 
   it('constructs request object correctly', () => {
-    const request = ChatService.buildHttpRequest({
+    const request = buildHttpRequest({
       verb: verb,
       path: path,
       headers: headers,
@@ -133,7 +151,7 @@ describe('chat service api', () => {
     };
 
     const requestWith = (params: object) =>
-      ChatService.buildHttpRequest({ ...goodRequest, ...params });
+      buildHttpRequest({ ...goodRequest, ...params });
 
     expect(() => requestWith({ verb: '\x00abc' })).throws(TypeError, 'method');
     expect(() => requestWith({ path: '/bad\x00path' }))
@@ -151,7 +169,10 @@ describe('chat service api', () => {
 
   it('invalid proxies are rejected', () => {
     // The default TLS proxy config doesn't support staging, so we connect to production.
-    const net = new Net(Environment.Production, userAgent);
+    const net = new Net({
+      env: Environment.Production,
+      userAgent: userAgent,
+    });
     expect(() => net.setProxy('signalfoundation.org', 0)).throws(Error);
     expect(() => net.setProxy('signalfoundation.org', 100_000)).throws(Error);
     expect(() => net.setProxy('signalfoundation.org', -1)).throws(Error);
@@ -166,11 +187,25 @@ describe('chat service api', () => {
       }
     });
 
-    it('can connect unauthenticated', async () => {
-      const net = new Net(Environment.Staging, userAgent);
-      const chatService = net.newChatService();
-      await chatService.connectUnauthenticated();
+    const connectChatUnauthenticated = async (net: Net) => {
+      const onInterrupted = sinon.promise();
+      const listener = {
+        onConnectionInterrupted: (...args: [unknown]) =>
+          onInterrupted.resolve(args),
+      };
+      const chatService = net.newUnauthenticatedChatService(listener);
+      await chatService.connect();
       await chatService.disconnect();
+      await onInterrupted;
+      expect(onInterrupted.resolvedValue).to.eql([null]);
+    };
+
+    it('can connect unauthenticated', async () => {
+      const net = new Net({
+        env: Environment.Production,
+        userAgent: userAgent,
+      });
+      await connectChatUnauthenticated(net);
     }).timeout(10000);
 
     it('can connect through a proxy server', async () => {
@@ -178,13 +213,13 @@ describe('chat service api', () => {
       assert(PROXY_SERVER, 'checked above');
 
       // The default TLS proxy config doesn't support staging, so we connect to production.
-      const net = new Net(Environment.Production, userAgent);
+      const net = new Net({
+        env: Environment.Production,
+        userAgent: userAgent,
+      });
       const [host = PROXY_SERVER, port = '443'] = PROXY_SERVER.split(':', 2);
       net.setProxy(host, parseInt(port, 10));
-
-      const chatService = net.newChatService();
-      await chatService.connectUnauthenticated();
-      await chatService.disconnect();
+      await connectChatUnauthenticated(net);
     }).timeout(10000);
   });
 
@@ -226,14 +261,16 @@ describe('chat service api', () => {
   const INVALID_MESSAGE = Buffer.from('CgNQVVQSCC9pbnZhbGlkIAo=', 'base64');
 
   it('messages from the server are passed to the listener', async () => {
-    const net = new Net(Environment.Staging, userAgent);
-    const chat = net.newChatService();
+    const net = new Net({
+      env: Environment.Production,
+      userAgent: userAgent,
+    });
     const listener = {
       onIncomingMessage: sinon.stub(),
       onQueueEmpty: sinon.stub(),
       onConnectionInterrupted: sinon.stub(),
     };
-    chat.setListener(listener);
+    const chat = net.newAuthenticatedChatService('', '', false, listener);
 
     // a helper function to check that the message has been passed to the listener
     async function check(
@@ -268,8 +305,10 @@ describe('chat service api', () => {
   });
 
   it('messages arrive in order', async () => {
-    const net = new Net(Environment.Staging, userAgent);
-    const chat = net.newChatService();
+    const net = new Net({
+      env: Environment.Production,
+      userAgent: userAgent,
+    });
     const completable = new CompletablePromise();
     const callsToMake: Buffer[] = [
       INCOMING_MESSAGE_1,
@@ -277,15 +316,23 @@ describe('chat service api', () => {
       INVALID_MESSAGE,
       INCOMING_MESSAGE_2,
     ];
-    const callsReceived: string[] = [];
-    const callsExpected: string[] = [
-      '_incoming_message',
-      '_queue_empty',
-      '_incoming_message',
-      '_connection_interrupted',
+    const callsReceived: [string, (object | null)[]][] = [];
+    const callsExpected: [string, ((value: object | null) => void)[]][] = [
+      ['_incoming_message', []],
+      ['_queue_empty', []],
+      ['_incoming_message', []],
+      [
+        '_connection_interrupted',
+        [
+          (error: object | null) =>
+            expect(error)
+              .instanceOf(LibSignalErrorBase)
+              .property('code', ErrorCode.IoError),
+        ],
+      ],
     ];
-    const recordCall = function (name: string) {
-      callsReceived.push(name);
+    const recordCall = function (name: string, ...args: (object | null)[]) {
+      callsReceived.push([name, args]);
       if (callsReceived.length == callsExpected.length) {
         completable.complete();
       }
@@ -301,11 +348,11 @@ describe('chat service api', () => {
       onQueueEmpty(): void {
         recordCall('_queue_empty');
       },
-      onConnectionInterrupted(): void {
-        recordCall('_connection_interrupted');
+      onConnectionInterrupted(cause: object | null): void {
+        recordCall('_connection_interrupted', cause);
       },
     };
-    chat.setListener(listener);
+    const chat = net.newAuthenticatedChatService('', '', false, listener);
     callsToMake.forEach((message) =>
       Native.TESTING_ChatService_InjectRawServerRequest(
         chat.chatService,
@@ -314,72 +361,46 @@ describe('chat service api', () => {
     );
     Native.TESTING_ChatService_InjectConnectionInterrupted(chat.chatService);
     await completable.done();
-    expect(callsReceived).to.eql(callsExpected);
+
+    expect(callsReceived).to.have.lengthOf(callsExpected.length);
+    callsReceived.forEach((element, index) => {
+      const [call, args] = element;
+      const [expectedCall, expectedArgs] = callsExpected[index];
+      expect(call).to.eql(expectedCall);
+      expect(args.length).to.eql(expectedArgs.length);
+      args.map((arg, i) => {
+        expectedArgs[i](arg);
+      });
+    });
   });
 
-  it('listener can be replaced', async () => {
-    const net = new Net(Environment.Staging, userAgent);
-    const chat = net.newChatService();
-    const listener1 = {
-      onIncomingMessage: sinon.stub(),
-      onQueueEmpty: sinon.stub(),
-      onConnectionInterrupted: sinon.stub(),
-    };
-    const listener2 = {
-      onIncomingMessage: sinon.stub(),
-      onQueueEmpty: sinon.stub(),
-      onConnectionInterrupted: sinon.stub(),
-    };
-
-    async function check(
-      serverRequest: Buffer,
-      expectedCalled: sinon.SinonStub,
-      expectedNotCalled: sinon.SinonStub
-    ) {
-      expectedCalled.reset();
-      expectedNotCalled.reset();
-      const completable = new CompletablePromise();
-      expectedCalled.callsFake(completable.resolve);
-      Native.TESTING_ChatService_InjectRawServerRequest(
-        chat.chatService,
-        serverRequest
-      );
-      await completable.done();
-      expect(expectedCalled).to.have.been.calledOnce;
-      expect(expectedNotCalled).to.not.have.been.called;
-    }
-
-    chat.setListener(listener1);
-    await check(
-      INCOMING_MESSAGE_1,
-      listener1.onIncomingMessage,
-      listener2.onIncomingMessage
-    );
-    chat.setListener(listener2);
-    await check(
-      INCOMING_MESSAGE_2,
-      listener2.onIncomingMessage,
-      listener1.onIncomingMessage
-    );
-  });
-
-  it('messages from the server are not lost if the listener is not set', async () => {
-    const net = new Net(Environment.Staging, userAgent);
-    const chat = net.newChatService();
-    const listener = {
-      onIncomingMessage: sinon.stub(),
-      onQueueEmpty: sinon.stub(),
-      onConnectionInterrupted: sinon.stub(),
-    };
-    Native.TESTING_ChatService_InjectRawServerRequest(
-      chat.chatService,
-      INCOMING_MESSAGE_1
-    );
-    chat.setListener(listener);
+  it('listener gets null cause for intentional disconnect', async () => {
+    const net = new Net({
+      env: Environment.Production,
+      userAgent: userAgent,
+    });
     const completable = new CompletablePromise();
-    listener.onIncomingMessage.callsFake(completable.resolve);
+    const connectionInterruptedReasons: (object | null)[] = [];
+    const listener: ChatServiceListener = {
+      onIncomingMessage(
+        _envelope: Buffer,
+        _timestamp: number,
+        _ack: ChatServerMessageAck
+      ): void {
+        fail('unexpected call');
+      },
+      onQueueEmpty(): void {
+        fail('unexpected call');
+      },
+      onConnectionInterrupted(cause: object | null): void {
+        connectionInterruptedReasons.push(cause);
+        completable.complete();
+      },
+    };
+    const chat = net.newAuthenticatedChatService('', '', false, listener);
+    Native.TESTING_ChatService_InjectIntentionalDisconnect(chat.chatService);
     await completable.done();
-    expect(listener.onIncomingMessage).to.have.been.calledOnce;
+    expect(connectionInterruptedReasons).to.eql([null]);
   });
 
   it('client can respond with http status code to a server message', () => {
@@ -456,7 +477,12 @@ describe('cdsi lookup', () => {
         [
           'Protocol',
           ErrorCode.IoError,
-          'protocol error after establishing a connection',
+          'protocol error after establishing a connection: failed to decode frame as protobuf',
+        ],
+        [
+          'CdsiProtocol',
+          ErrorCode.IoError,
+          'CDS protocol: no token found in response',
         ],
         [
           'AttestationDataError',
@@ -529,7 +555,13 @@ describe('SVR3', () => {
   }
 
   beforeEach(() => {
-    state = { auth: make_auth(), net: new Net(Environment.Staging, userAgent) };
+    state = {
+      auth: make_auth(),
+      net: new Net({
+        env: Environment.Production,
+        userAgent: userAgent,
+      }),
+    };
   });
 
   afterEach(() => {

@@ -15,8 +15,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import org.junit.Test;
 import org.signal.libsignal.attest.AttestationDataException;
-import org.signal.libsignal.internal.Native;
 import org.signal.libsignal.internal.NativeHandleGuard;
+import org.signal.libsignal.internal.NativeTesting;
 import org.signal.libsignal.protocol.ServiceId;
 
 public class CdsiLookupResponseTest {
@@ -45,7 +45,7 @@ public class CdsiLookupResponseTest {
     Future<Object> response;
 
     try (NativeHandleGuard guard = new NativeHandleGuard(context)) {
-      response = Native.TESTING_CdsiLookupResponseConvert(guard.nativeHandle());
+      response = NativeTesting.TESTING_CdsiLookupResponseConvert(guard.nativeHandle());
     }
 
     CdsiLookupResponse actual = (CdsiLookupResponse) response.get();
@@ -56,6 +56,7 @@ public class CdsiLookupResponseTest {
   public void cdsiLookupErrorConvert() {
     assertLookupErrorIs(
         "Protocol", CdsiProtocolException.class, "Protocol error after establishing a connection");
+    assertLookupErrorIs("CdsiProtocol", CdsiProtocolException.class, "Response token was missing");
     assertLookupErrorIs(
         "AttestationDataError",
         AttestationDataException.class,
@@ -90,7 +91,7 @@ public class CdsiLookupResponseTest {
         assertThrows(
             "for " + errorDescription,
             expectedErrorType,
-            () -> Native.TESTING_CdsiLookupErrorConvert(errorDescription));
+            () -> NativeTesting.TESTING_CdsiLookupErrorConvert(errorDescription));
     assertEquals(e.getMessage(), expectedMessage);
     return e;
   }

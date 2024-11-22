@@ -22,19 +22,18 @@
 // Curve signing key, using the NIST p-256 curve.
 
 use std::collections::HashMap;
-
 use std::time::SystemTime;
 
-use boring::asn1::{Asn1Time, Asn1TimeRef};
-use boring::bn::BigNumContext;
-use boring::ec::*;
-use boring::error::ErrorStack;
-use boring::nid::Nid;
-use boring::pkey::{PKey, PKeyRef, Public};
-use boring::x509::crl::X509CRLRef;
-use boring::x509::store::{X509Store, X509StoreBuilder};
-use boring::x509::verify::X509VerifyFlags;
-use boring::x509::{X509Ref, X509};
+use boring_signal::asn1::{Asn1Time, Asn1TimeRef};
+use boring_signal::bn::BigNumContext;
+use boring_signal::ec::*;
+use boring_signal::error::ErrorStack;
+use boring_signal::nid::Nid;
+use boring_signal::pkey::{PKey, PKeyRef, Public};
+use boring_signal::x509::crl::X509CRLRef;
+use boring_signal::x509::store::{X509Store, X509StoreBuilder};
+use boring_signal::x509::verify::X509VerifyFlags;
+use boring_signal::x509::{X509Ref, X509};
 use hex::ToHex;
 use lazy_static::lazy_static;
 use uuid::Uuid;
@@ -651,12 +650,12 @@ mod test {
 
     use std::time::{Duration, SystemTime};
 
-    use crate::dcap::endorsements::{QeTcbLevel, TcbInfoVersion};
-    use crate::dcap::fakes::FakeAttestation;
-    use boring::bn::BigNum;
+    use boring_signal::bn::BigNum;
     use hex_literal::hex;
 
     use super::*;
+    use crate::dcap::endorsements::{QeTcbLevel, TcbInfoVersion};
+    use crate::dcap::fakes::FakeAttestation;
 
     const EXPECTED_MRENCLAVE: MREnclave =
         hex!("337ac97ce088a132daeb1308ea3159f807de4a827e875b2c90ce21bf4751196f");

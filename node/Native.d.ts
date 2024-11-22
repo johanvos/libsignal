@@ -29,7 +29,6 @@ interface ChatResponse {
 }
 
 interface ChatServiceDebugInfo {
-  reconnectCount: number;
   ipType: number;
   durationMillis: number;
   connectionInfo: string;
@@ -121,10 +120,11 @@ export abstract class ChatListener {
     ack: ServerMessageAck
   ): void;
   _queue_empty(): void;
-  _connection_interrupted(): void;
+  _connection_interrupted(
+    // A LibSignalError or null, but not naming the type to avoid circular import dependencies.
+    reason: Error | null
+  ): void;
 }
-
-export abstract class MakeChatListener extends ChatListener {}
 
 type Wrapper<T> = Readonly<{
   _nativeHandle: T;
@@ -141,6 +141,9 @@ type Serialized<T> = Buffer;
 export function registerErrors(errorsModule: Record<string, unknown>): void;
 
 export const enum LogLevel { Error = 1, Warn, Info, Debug, Trace }
+export function AccountEntropyPool_DeriveBackupKey(accountEntropy: string): Buffer;
+export function AccountEntropyPool_DeriveSvrKey(accountEntropy: string): Buffer;
+export function AccountEntropyPool_Generate(): string;
 export function Aes256GcmSiv_Decrypt(aesGcmSiv: Wrapper<Aes256GcmSiv>, ctext: Buffer, nonce: Buffer, associatedData: Buffer): Buffer;
 export function Aes256GcmSiv_Encrypt(aesGcmSivObj: Wrapper<Aes256GcmSiv>, ptext: Buffer, nonce: Buffer, associatedData: Buffer): Buffer;
 export function Aes256GcmSiv_New(key: Buffer): Aes256GcmSiv;
@@ -151,18 +154,28 @@ export function AuthCredentialPresentation_GetUuidCiphertext(presentationBytes: 
 export function AuthCredentialWithPniResponse_CheckValidContents(bytes: Buffer): void;
 export function AuthCredentialWithPni_CheckValidContents(bytes: Buffer): void;
 export function BackupAuthCredentialPresentation_CheckValidContents(presentationBytes: Buffer): void;
+export function BackupAuthCredentialPresentation_GetBackupId(presentationBytes: Buffer): Buffer;
+export function BackupAuthCredentialPresentation_GetBackupLevel(presentationBytes: Buffer): number;
+export function BackupAuthCredentialPresentation_GetType(presentationBytes: Buffer): number;
 export function BackupAuthCredentialPresentation_Verify(presentationBytes: Buffer, now: Timestamp, serverParamsBytes: Buffer): void;
 export function BackupAuthCredentialRequestContext_CheckValidContents(contextBytes: Buffer): void;
 export function BackupAuthCredentialRequestContext_GetRequest(contextBytes: Buffer): Buffer;
 export function BackupAuthCredentialRequestContext_New(backupKey: Buffer, uuid: Uuid): Buffer;
 export function BackupAuthCredentialRequestContext_ReceiveResponse(contextBytes: Buffer, responseBytes: Buffer, expectedRedemptionTime: Timestamp, paramsBytes: Buffer): Buffer;
 export function BackupAuthCredentialRequest_CheckValidContents(requestBytes: Buffer): void;
-export function BackupAuthCredentialRequest_IssueDeterministic(requestBytes: Buffer, redemptionTime: Timestamp, backupLevel: number, paramsBytes: Buffer, randomness: Buffer): Buffer;
+export function BackupAuthCredentialRequest_IssueDeterministic(requestBytes: Buffer, redemptionTime: Timestamp, backupLevel: number, credentialType: number, paramsBytes: Buffer, randomness: Buffer): Buffer;
 export function BackupAuthCredentialResponse_CheckValidContents(responseBytes: Buffer): void;
 export function BackupAuthCredential_CheckValidContents(paramsBytes: Buffer): void;
 export function BackupAuthCredential_GetBackupId(credentialBytes: Buffer): Buffer;
 export function BackupAuthCredential_GetBackupLevel(credentialBytes: Buffer): number;
+export function BackupAuthCredential_GetType(credentialBytes: Buffer): number;
 export function BackupAuthCredential_PresentDeterministic(credentialBytes: Buffer, serverParamsBytes: Buffer, randomness: Buffer): Buffer;
+export function BackupKey_DeriveBackupId(backupKey: Buffer, aci: Buffer): Buffer;
+export function BackupKey_DeriveEcKey(backupKey: Buffer, aci: Buffer): PrivateKey;
+export function BackupKey_DeriveLocalBackupMetadataKey(backupKey: Buffer): Buffer;
+export function BackupKey_DeriveMediaEncryptionKey(backupKey: Buffer, mediaId: Buffer): Buffer;
+export function BackupKey_DeriveMediaId(backupKey: Buffer, mediaName: string): Buffer;
+export function BackupKey_DeriveThumbnailTransitEncryptionKey(backupKey: Buffer, mediaId: Buffer): Buffer;
 export function CallLinkAuthCredentialPresentation_CheckValidContents(presentationBytes: Buffer): void;
 export function CallLinkAuthCredentialPresentation_GetUserId(presentationBytes: Buffer): Serialized<UuidCiphertext>;
 export function CallLinkAuthCredentialPresentation_Verify(presentationBytes: Buffer, now: Timestamp, serverParamsBytes: Buffer, callLinkParamsBytes: Buffer): void;
@@ -180,20 +193,28 @@ export function Cds2ClientState_New(mrenclave: Buffer, attestationMsg: Buffer, c
 export function CdsiLookup_complete(asyncRuntime: Wrapper<TokioAsyncContext>, lookup: Wrapper<CdsiLookup>): Promise<LookupResponse>;
 export function CdsiLookup_new(asyncRuntime: Wrapper<TokioAsyncContext>, connectionManager: Wrapper<ConnectionManager>, username: string, password: string, request: Wrapper<LookupRequest>): Promise<CdsiLookup>;
 export function CdsiLookup_token(lookup: Wrapper<CdsiLookup>): Buffer;
-export function ChatServer_SetListener(runtime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>, makeListener: MakeChatListener | null): void;
-export function ChatService_auth_send(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ChatResponse>;
-export function ChatService_auth_send_and_debug(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ResponseAndDebugInfo>;
-export function ChatService_connect_auth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>): Promise<ChatServiceDebugInfo>;
-export function ChatService_connect_unauth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>): Promise<ChatServiceDebugInfo>;
-export function ChatService_disconnect(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>): Promise<void>;
-export function ChatService_new(connectionManager: Wrapper<ConnectionManager>, username: string, password: string): Chat;
-export function ChatService_unauth_send(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ChatResponse>;
-export function ChatService_unauth_send_and_debug(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<Chat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ResponseAndDebugInfo>;
+export function ChatService_SetListenerAuth(runtime: Wrapper<TokioAsyncContext>, chat: Wrapper<AuthChat>, listener: ChatListener | null): void;
+export function ChatService_SetListenerUnauth(runtime: Wrapper<TokioAsyncContext>, chat: Wrapper<UnauthChat>, listener: ChatListener | null): void;
+export function ChatService_auth_send(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<AuthChat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ChatResponse>;
+export function ChatService_auth_send_and_debug(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<AuthChat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ResponseAndDebugInfo>;
+export function ChatService_connect_auth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<AuthChat>): Promise<ChatServiceDebugInfo>;
+export function ChatService_connect_unauth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<UnauthChat>): Promise<ChatServiceDebugInfo>;
+export function ChatService_disconnect_auth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<AuthChat>): Promise<void>;
+export function ChatService_disconnect_unauth(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<UnauthChat>): Promise<void>;
+export function ChatService_new_auth(connectionManager: Wrapper<ConnectionManager>, username: string, password: string, receiveStories: boolean): AuthChat;
+export function ChatService_new_unauth(connectionManager: Wrapper<ConnectionManager>): UnauthChat;
+export function ChatService_unauth_send(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<UnauthChat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ChatResponse>;
+export function ChatService_unauth_send_and_debug(asyncRuntime: Wrapper<TokioAsyncContext>, chat: Wrapper<UnauthChat>, httpRequest: Wrapper<HttpRequest>, timeoutMillis: number): Promise<ResponseAndDebugInfo>;
 export function CiphertextMessage_FromPlaintextContent(m: Wrapper<PlaintextContent>): CiphertextMessage;
 export function CiphertextMessage_Serialize(obj: Wrapper<CiphertextMessage>): Buffer;
 export function CiphertextMessage_Type(msg: Wrapper<CiphertextMessage>): number;
+export function ComparableBackup_GetComparableString(backup: Wrapper<ComparableBackup>): string;
+export function ComparableBackup_GetUnknownFields(backup: Wrapper<ComparableBackup>): string[];
+export function ComparableBackup_ReadUnencrypted(stream: InputStream, len: bigint, purpose: number): Promise<ComparableBackup>;
 export function ConnectionManager_clear_proxy(connectionManager: Wrapper<ConnectionManager>): void;
 export function ConnectionManager_new(environment: number, userAgent: string): ConnectionManager;
+export function ConnectionManager_on_network_change(connectionManager: Wrapper<ConnectionManager>): void;
+export function ConnectionManager_set_censorship_circumvention_enabled(connectionManager: Wrapper<ConnectionManager>, enabled: boolean): void;
 export function ConnectionManager_set_ipv6_enabled(connectionManager: Wrapper<ConnectionManager>, ipv6Enabled: boolean): void;
 export function ConnectionManager_set_proxy(connectionManager: Wrapper<ConnectionManager>, host: string, port: number): void;
 export function CreateCallLinkCredentialPresentation_CheckValidContents(presentationBytes: Buffer): void;
@@ -297,7 +318,11 @@ export function LookupRequest_addPreviousE164(request: Wrapper<LookupRequest>, e
 export function LookupRequest_new(): LookupRequest;
 export function LookupRequest_setReturnAcisWithoutUaks(request: Wrapper<LookupRequest>, returnAcisWithoutUaks: boolean): void;
 export function LookupRequest_setToken(request: Wrapper<LookupRequest>, token: Buffer): void;
-export function MessageBackupKey_New(masterKey: Buffer, aci: Buffer): MessageBackupKey;
+export function MessageBackupKey_FromAccountEntropyPool(accountEntropy: string, aci: Buffer): MessageBackupKey;
+export function MessageBackupKey_FromBackupKeyAndBackupId(backupKey: Buffer, backupId: Buffer): MessageBackupKey;
+export function MessageBackupKey_FromMasterKey(masterKey: Buffer, aci: Buffer): MessageBackupKey;
+export function MessageBackupKey_GetAesKey(key: Wrapper<MessageBackupKey>): Buffer;
+export function MessageBackupKey_GetHmacKey(key: Wrapper<MessageBackupKey>): Buffer;
 export function MessageBackupValidator_Validate(key: Wrapper<MessageBackupKey>, firstStream: InputStream, secondStream: InputStream, len: bigint, purpose: number): Promise<MessageBackupValidationOutcome>;
 export function MinidumpToJSONString(buffer: Buffer): string;
 export function Mp4Sanitizer_Sanitize(input: InputStream, len: bigint): Promise<SanitizedMetadata>;
@@ -493,8 +518,10 @@ export function TESTING_ChatServiceDebugInfoConvert(): ChatServiceDebugInfo;
 export function TESTING_ChatServiceErrorConvert(errorDescription: string): void;
 export function TESTING_ChatServiceResponseAndDebugInfoConvert(): ResponseAndDebugInfo;
 export function TESTING_ChatServiceResponseConvert(bodyPresent: boolean): ChatResponse;
-export function TESTING_ChatService_InjectConnectionInterrupted(chat: Wrapper<Chat>): void;
-export function TESTING_ChatService_InjectRawServerRequest(chat: Wrapper<Chat>, bytes: Buffer): void;
+export function TESTING_ChatService_InjectConnectionInterrupted(chat: Wrapper<AuthChat>): void;
+export function TESTING_ChatService_InjectIntentionalDisconnect(chat: Wrapper<AuthChat>): void;
+export function TESTING_ChatService_InjectRawServerRequest(chat: Wrapper<AuthChat>, bytes: Buffer): void;
+export function TESTING_ConnectionManager_newLocalOverride(userAgent: string, chatPort: number, cdsiPort: number, svr2Port: number, svr3SgxPort: number, svr3NitroPort: number, svr3Tpm2SnpPort: number, rootCertificateDer: Buffer): ConnectionManager;
 export function TESTING_ErrorOnBorrowAsync(_input: null): Promise<void>;
 export function TESTING_ErrorOnBorrowIo(asyncRuntime: Wrapper<NonSuspendingBackgroundThreadRuntime>, _input: null): Promise<void>;
 export function TESTING_ErrorOnBorrowSync(_input: null): void;
@@ -550,9 +577,11 @@ export function WebpSanitizer_Sanitize(input: SyncInputStream): void;
 export function initLogger(maxLevel: LogLevel, callback: (level: LogLevel, target: string, file: string | null, line: number | null, message: string) => void): void
 export function test_only_fn_returns_123(): number;
 interface Aes256GcmSiv { readonly __type: unique symbol; }
+interface AuthChat { readonly __type: unique symbol; }
 interface CdsiLookup { readonly __type: unique symbol; }
-interface Chat { readonly __type: unique symbol; }
 interface CiphertextMessage { readonly __type: unique symbol; }
+interface ComparableBackup { readonly __type: unique symbol; }
+interface ComparableBackup { readonly __type: unique symbol; }
 interface ConnectionManager { readonly __type: unique symbol; }
 interface DecryptionErrorMessage { readonly __type: unique symbol; }
 interface ExpiringProfileKeyCredential { readonly __type: unique symbol; }
@@ -605,6 +634,7 @@ interface SignalMessage { readonly __type: unique symbol; }
 interface SignedPreKeyRecord { readonly __type: unique symbol; }
 interface TestingHandleType { readonly __type: unique symbol; }
 interface TokioAsyncContext { readonly __type: unique symbol; }
+interface UnauthChat { readonly __type: unique symbol; }
 interface UnidentifiedSenderMessageContent { readonly __type: unique symbol; }
 interface UuidCiphertext { readonly __type: unique symbol; }
 interface ValidatingMac { readonly __type: unique symbol; }

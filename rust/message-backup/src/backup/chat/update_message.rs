@@ -6,28 +6,29 @@ use crate::backup::call::{GroupCall, IndividualCall};
 use crate::backup::chat::group::GroupChatUpdate;
 use crate::backup::chat::ChatItemError;
 use crate::backup::frame::RecipientId;
-use crate::backup::method::Lookup;
-use crate::backup::time::Duration;
+use crate::backup::method::LookupPair;
+use crate::backup::recipient::{DestinationKind, E164};
+use crate::backup::time::{Duration, ReportUnusualTimestamp};
 use crate::backup::{TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::chat_update_message::Update`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum UpdateMessage<Recipient> {
     Simple(SimpleChatUpdate),
     GroupChange { updates: Vec<GroupChatUpdate> },
     ExpirationTimerChange { expires_in: Duration },
     ProfileChange { previous: String, new: String },
-    ThreadMerge,
-    SessionSwitchover,
+    ThreadMerge { previous_e164: E164 },
+    SessionSwitchover { e164: E164 },
     IndividualCall(IndividualCall),
     GroupCall(GroupCall<Recipient>),
     LearnedProfileUpdate(proto::learned_profile_chat_update::PreviousName),
 }
 
 /// Validated version of [`proto::simple_chat_update::Type`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum SimpleChatUpdate {
     JoinedSignal,
@@ -43,10 +44,13 @@ pub enum SimpleChatUpdate {
     UnsupportedProtocolMessage,
     ReleaseChannelDonationRequest,
     ReportedSpam,
+    Blocked,
+    Unblocked,
+    MessageRequestAccepted,
 }
 
-impl<C: Lookup<RecipientId, R>, R: Clone> TryFromWith<proto::ChatUpdateMessage, C>
-    for UpdateMessage<R>
+impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R: Clone>
+    TryFromWith<proto::ChatUpdateMessage, C> for UpdateMessage<R>
 {
     type Error = ChatItemError;
 
@@ -84,6 +88,9 @@ impl<C: Lookup<RecipientId, R>, R: Clone> TryFromWith<proto::ChatUpdateMessage, 
                         SimpleChatUpdate::ReleaseChannelDonationRequest
                     }
                     Type::REPORTED_SPAM => SimpleChatUpdate::ReportedSpam,
+                    Type::BLOCKED => SimpleChatUpdate::Blocked,
+                    Type::UNBLOCKED => SimpleChatUpdate::Unblocked,
+                    Type::MESSAGE_REQUEST_ACCEPTED => SimpleChatUpdate::MessageRequestAccepted,
                 }
             }),
             Update::GroupChange(proto::GroupChangeChatUpdate {
@@ -117,7 +124,7 @@ impl<C: Lookup<RecipientId, R>, R: Clone> TryFromWith<proto::ChatUpdateMessage, 
                 expiresInMs,
                 special_fields: _,
             }) => UpdateMessage::ExpirationTimerChange {
-                expires_in: Duration::from_millis(expiresInMs.into()),
+                expires_in: Duration::from_millis(expiresInMs),
             },
             Update::ProfileChange(proto::ProfileChangeChatUpdate {
                 previousName,
@@ -128,16 +135,24 @@ impl<C: Lookup<RecipientId, R>, R: Clone> TryFromWith<proto::ChatUpdateMessage, 
                 new: newName,
             },
             Update::ThreadMerge(proto::ThreadMergeChatUpdate {
+                previousE164,
                 special_fields: _,
-                // TODO validate this field
-                previousE164: _,
-            }) => UpdateMessage::ThreadMerge,
+            }) => {
+                let previous_e164 = previousE164
+                    .try_into()
+                    .map_err(|_| ChatItemError::InvalidE164)?;
+                UpdateMessage::ThreadMerge { previous_e164 }
+            }
             Update::SessionSwitchover(proto::SessionSwitchoverChatUpdate {
+                e164,
                 special_fields: _,
-                // TODO validate this field
-                e164: _,
-            }) => UpdateMessage::SessionSwitchover,
-            Update::IndividualCall(call) => UpdateMessage::IndividualCall(call.try_into()?),
+            }) => {
+                let e164 = e164.try_into().map_err(|_| ChatItemError::InvalidE164)?;
+                UpdateMessage::SessionSwitchover { e164 }
+            }
+            Update::IndividualCall(call) => {
+                UpdateMessage::IndividualCall(call.try_into_with(context)?)
+            }
             Update::GroupCall(call) => UpdateMessage::GroupCall(call.try_into_with(context)?),
             Update::LearnedProfileChange(proto::LearnedProfileChatUpdate {
                 previousName,
@@ -154,11 +169,10 @@ mod test {
     use assert_matches::assert_matches;
     use test_case::test_case;
 
-    use crate::backup::call::CallError;
-    use crate::backup::chat::testutil::TestContext;
-    use crate::proto::backup::chat_update_message::Update as ChatUpdateProto;
-
     use super::*;
+    use crate::backup::call::CallError;
+    use crate::backup::testutil::TestContext;
+    use crate::proto::backup::chat_update_message::Update as ChatUpdateProto;
 
     impl proto::SimpleChatUpdate {
         pub(crate) fn test_data() -> Self {
@@ -223,8 +237,14 @@ mod test {
     #[test_case(proto::SimpleChatUpdate::test_data(), Ok(()))]
     #[test_case(proto::ExpirationTimerChatUpdate::default(), Ok(()))]
     #[test_case(proto::ProfileChangeChatUpdate::default(), Ok(()))]
-    #[test_case(proto::ThreadMergeChatUpdate::default(), Ok(()))]
-    #[test_case(proto::SessionSwitchoverChatUpdate::default(), Ok(()))]
+    #[test_case(
+        proto::ThreadMergeChatUpdate::default(),
+        Err(ChatItemError::InvalidE164)
+    )]
+    #[test_case(
+        proto::SessionSwitchoverChatUpdate::default(),
+        Err(ChatItemError::InvalidE164)
+    )]
     #[test_case(
         proto::LearnedProfileChatUpdate::default(),
         Err(ChatItemError::LearnedProfileIsEmpty)

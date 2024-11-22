@@ -19,7 +19,9 @@ public class Network {
     STAGING(0),
     PRODUCTION(1);
 
-    private final int value;
+    // Intentionally package-private to be used in KeyTransparencyClient, without exposing it to the
+    // whole world.
+    final int value;
 
     Environment(int value) {
       this.value = value;
@@ -49,6 +51,10 @@ public class Network {
    * <p>Sets a domain name and port to be used to proxy all new outgoing connections. The proxy can
    * be overridden by calling this method again or unset by calling {@link #clearProxy}.
    *
+   * <p>Existing connections and services will continue with the setting they were created with. (In
+   * particular, changing this setting will not affect any existing {@link ChatService
+   * ChatServices}.)
+   *
    * @throws IOException if the host or port are not (structurally) valid, such as a port that
    *     doesn't fit in u16.
    */
@@ -61,9 +67,36 @@ public class Network {
    *
    * <p>Clears any proxy configuration set via {@link #setProxy}. If none was set, calling this
    * method is a no-op.
+   *
+   * <p>Existing connections and services will continue with the setting they were created with. (In
+   * particular, changing this setting will not affect any existing {@link ChatService
+   * ChatServices}.)
    */
   public void clearProxy() {
     this.connectionManager.clearProxy();
+  }
+
+  /**
+   * Enables or disables censorship circumvention for all new connections (until changed).
+   *
+   * <p>If CC is enabled, <em>new</em> connections and services may try additional routes to the
+   * Signal servers. Existing connections and services will continue with the setting they were
+   * created with. (In particular, changing this setting will not affect any existing {@link
+   * ChatService ChatServices}.)
+   *
+   * <p>CC is off by default.
+   */
+  public void setCensorshipCircumventionEnabled(boolean enabled) {
+    this.connectionManager.setCensorshipCircumventionEnabled(enabled);
+  }
+
+  /**
+   * Notifies libsignal that the network has changed.
+   *
+   * <p>This will lead to, e.g. caches being cleared and cooldowns being reset.
+   */
+  public void onNetworkChange() {
+    connectionManager.guardedRun(Native::ConnectionManager_on_network_change);
   }
 
   public Svr3 svr3() {
@@ -116,13 +149,25 @@ public class Network {
     return this.connectionManager;
   }
 
-  public ChatService createChatService(final String username, final String password) {
-    return new ChatService(tokioAsyncContext, connectionManager, username, password);
+  public UnauthenticatedChatService createUnauthChatService(ChatListener listener) {
+    return new UnauthenticatedChatService(tokioAsyncContext, connectionManager, listener);
+  }
+
+  public AuthenticatedChatService createAuthChatService(
+      final String username,
+      final String password,
+      final boolean receiveStories,
+      ChatListener listener) {
+    return new AuthenticatedChatService(
+        tokioAsyncContext, connectionManager, username, password, receiveStories, listener);
   }
 
   static class ConnectionManager extends NativeHandleGuard.SimpleOwner {
+    private final Environment environment;
+
     private ConnectionManager(Environment env, String userAgent) {
       super(Native.ConnectionManager_new(env.value, userAgent));
+      this.environment = env;
     }
 
     private void setProxy(String host, int port) throws IOException {
@@ -133,6 +178,14 @@ public class Network {
 
     private void clearProxy() {
       guardedRun(Native::ConnectionManager_clear_proxy);
+    }
+
+    public Environment environment() {
+      return this.environment;
+    }
+
+    private void setCensorshipCircumventionEnabled(boolean enabled) {
+      guardedRun(h -> Native.ConnectionManager_set_censorship_circumvention_enabled(h, enabled));
     }
 
     @Override

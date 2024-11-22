@@ -14,11 +14,12 @@ use zkgroup::ProfileKeyBytes;
 
 use crate::backup::chat::chat_style::{ChatStyle, ChatStyleError, CustomColorMap};
 use crate::backup::method::Method;
-use crate::backup::time::Duration;
-use crate::backup::{ReferencedTypes, TryIntoWith as _};
+use crate::backup::time::{Duration, ReportUnusualTimestamp};
+use crate::backup::{serialize, ReferencedTypes, TryFromWith, TryIntoWith};
 use crate::proto::backup as proto;
 
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
     M::Value<ProfileKeyBytes>: PartialEq,
     M::Value<Option<UsernameData>>: PartialEq,
@@ -27,6 +28,10 @@ use crate::proto::backup as proto;
     AccountSettings<M>: PartialEq,
 ))]
 pub struct AccountData<M: Method + ReferencedTypes> {
+    #[serde(
+        with = "hex",
+        bound(serialize = "M::Value<ProfileKeyBytes>: AsRef<[u8]>")
+    )]
     pub profile_key: M::Value<ProfileKeyBytes>,
     pub username: M::Value<Option<UsernameData>>,
     pub given_name: M::Value<String>,
@@ -37,24 +42,29 @@ pub struct AccountData<M: Method + ReferencedTypes> {
     pub backup_subscription: M::Value<Option<Subscription>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct UsernameData {
+    #[serde(serialize_with = "serialize::to_string")]
     pub username: Username,
     pub link: Option<UsernameLink>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct UsernameLink {
+    #[serde(serialize_with = "serialize::enum_as_string")]
     pub color: crate::proto::backup::account_data::username_link::Color,
+    #[serde(serialize_with = "hex::serialize")]
     pub entropy: [u8; USERNAME_LINK_ENTROPY_SIZE],
+    #[serde(serialize_with = "serialize::to_string")]
     pub server_id: Uuid,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Subscription {
+    #[serde(with = "hex")]
     pub subscriber_id: SubscriberId,
     pub currency_code: String,
     pub manually_canceled: bool,
@@ -64,6 +74,7 @@ const SUBSCRIBER_ID_LENGTH: usize = 32;
 type SubscriberId = [u8; SUBSCRIBER_ID_LENGTH];
 
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
     M::Value<PhoneSharing>: PartialEq,
     M::Value<Option<bool>>: PartialEq,
@@ -95,7 +106,7 @@ pub struct AccountSettings<M: Method + ReferencedTypes> {
     pub custom_chat_colors: CustomColorMap<M>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, serde::Serialize)]
 pub enum PhoneSharing {
     WithEverybody,
     WithNobody,
@@ -137,9 +148,11 @@ pub enum SubscriptionError {
     EmptyCurrency,
 }
 
-impl<M: Method + ReferencedTypes> TryFrom<proto::AccountData> for AccountData<M> {
+impl<M: Method + ReferencedTypes, C: ReportUnusualTimestamp> TryFromWith<proto::AccountData, C>
+    for AccountData<M>
+{
     type Error = AccountDataError;
-    fn try_from(proto: proto::AccountData) -> Result<Self, Self::Error> {
+    fn try_from_with(proto: proto::AccountData, context: &C) -> Result<Self, Self::Error> {
         let proto::AccountData {
             profileKey,
             username,
@@ -169,7 +182,7 @@ impl<M: Method + ReferencedTypes> TryFrom<proto::AccountData> for AccountData<M>
         let account_settings = accountSettings
             .into_option()
             .ok_or(AccountDataError::MissingSettings)?
-            .try_into()?;
+            .try_into_with(context)?;
 
         let donation_subscription = donationSubscriberData
             .into_option()
@@ -261,12 +274,15 @@ impl TryFrom<proto::account_data::UsernameLink> for UsernameLink {
     }
 }
 
-impl<M: Method + ReferencedTypes> TryFrom<proto::account_data::AccountSettings>
-    for AccountSettings<M>
+impl<M: Method + ReferencedTypes, C: ReportUnusualTimestamp>
+    TryFromWith<proto::account_data::AccountSettings, C> for AccountSettings<M>
 {
     type Error = AccountDataError;
 
-    fn try_from(value: proto::account_data::AccountSettings) -> Result<Self, Self::Error> {
+    fn try_from_with(
+        value: proto::account_data::AccountSettings,
+        context: &C,
+    ) -> Result<Self, Self::Error> {
         let proto::account_data::AccountSettings {
             phoneNumberSharingMode,
             readReceipts,
@@ -283,7 +299,7 @@ impl<M: Method + ReferencedTypes> TryFrom<proto::account_data::AccountSettings>
             storyViewReceiptsEnabled,
             hasSeenGroupStoryEducationSheet,
             hasCompletedUsernameOnboarding,
-            universalExpireTimer,
+            universalExpireTimerSeconds,
             preferredReactionEmoji,
             defaultChatStyle,
             customChatColors,
@@ -303,11 +319,11 @@ impl<M: Method + ReferencedTypes> TryFrom<proto::account_data::AccountSettings>
 
         let default_chat_style = defaultChatStyle
             .into_option()
-            .map(|style| style.try_into_with(&custom_chat_colors))
+            .map(|style| ChatStyle::try_from_proto(style, &custom_chat_colors, context))
             .transpose()?;
 
-        let universal_expire_timer =
-            NonZeroU32::new(universalExpireTimer).map(|d| Duration::from_millis(d.get().into()));
+        let universal_expire_timer = NonZeroU32::new(universalExpireTimerSeconds)
+            .map(|seconds| Duration::from_millis(1000 * u64::from(seconds.get())));
 
         Ok(Self {
             phone_number_sharing: M::value(phone_number_sharing),
@@ -342,10 +358,10 @@ mod test {
     use test_case::test_case;
     use uuid::Uuid;
 
+    use super::*;
     use crate::backup::chat::chat_style::{BubbleColor, CustomChatColor, CustomColorId};
     use crate::backup::method::{Store, ValidateOnly};
-
-    use super::*;
+    use crate::backup::testutil::TestContext;
 
     impl proto::AccountData {
         pub(crate) fn test_data() -> Self {
@@ -382,6 +398,7 @@ mod test {
                         FAKE_CUSTOM_COLOR_ID.0,
                     )),
                     wallpaper: None,
+                    dimWallpaperInDarkMode: true,
                     special_fields: Default::default(),
                 })
                 .into(),
@@ -395,6 +412,8 @@ mod test {
     const FAKE_USERNAME_LINK_ENTROPY: [u8; USERNAME_LINK_ENTROPY_SIZE] = [12; 32];
     const FAKE_USERNAME_SERVER_ID: Uuid = Uuid::from_bytes([10; 16]);
     const FAKE_CUSTOM_COLOR_ID: CustomColorId = proto::chat_style::CustomChatColor::TEST_ID;
+    static FAKE_CUSTOM_COLOR: Lazy<Arc<CustomChatColor>> =
+        Lazy::new(|| Arc::new(CustomChatColor::from_proto_test_data()));
 
     #[test]
     fn account_data_custom_colors_ordering() {
@@ -412,28 +431,26 @@ mod test {
             data.customChatColors.reverse();
             data
         };
-        let with_new_id: AccountSettings<Store> = with_new_id.try_into().expect("valid settings");
-        let with_reversed_ids: AccountSettings<Store> =
-            with_reversed_ids.try_into().expect("valid settings");
+        let with_new_id: AccountSettings<Store> = with_new_id
+            .try_into_with(&TestContext::default())
+            .expect("valid settings");
+        let with_reversed_ids: AccountSettings<Store> = with_reversed_ids
+            .try_into_with(&TestContext::default())
+            .expect("valid settings");
         assert_ne!(with_new_id, with_reversed_ids);
     }
 
-    #[test]
-    fn valid_account_data() {
-        static FAKE_CUSTOM_COLOR: Lazy<Arc<CustomChatColor>> =
-            Lazy::new(|| Arc::new(CustomChatColor::from_proto_test_data()));
-
-        assert_eq!(
-            proto::AccountData::test_data().try_into(),
-            Ok(AccountData::<Store> {
+    impl AccountData<Store> {
+        pub(crate) fn from_proto_test_data() -> Self {
+            Self {
                 profile_key: FAKE_PROFILE_KEY,
                 username: Some(UsernameData {
                     username: Username::new("abc.123").unwrap(),
                     link: Some(UsernameLink {
                         color: proto::account_data::username_link::Color::BLUE,
                         entropy: FAKE_USERNAME_LINK_ENTROPY,
-                        server_id: FAKE_USERNAME_SERVER_ID
-                    })
+                        server_id: FAKE_USERNAME_SERVER_ID,
+                    }),
                 }),
                 given_name: "".to_string(),
                 family_name: "".to_string(),
@@ -441,7 +458,8 @@ mod test {
                     phone_number_sharing: PhoneSharing::WithEverybody,
                     default_chat_style: Some(ChatStyle {
                         wallpaper: None,
-                        bubble_color: BubbleColor::Custom(FAKE_CUSTOM_COLOR.clone())
+                        bubble_color: BubbleColor::Custom(FAKE_CUSTOM_COLOR.clone()),
+                        dim_wallpaper_in_dark_mode: true,
                     }),
                     read_receipts: false,
                     sealed_sender_indicators: false,
@@ -468,97 +486,59 @@ mod test {
                     manually_canceled: false,
                 }),
                 donation_subscription: None,
-            })
-        )
+            }
+        }
     }
 
-    fn invalid_profile_key(target: &mut proto::AccountData) {
-        target.profileKey.clear();
-    }
-    fn invalid_username(target: &mut proto::AccountData) {
-        target.username = Some("invalid".to_string());
-    }
-    fn no_username(target: &mut proto::AccountData) {
-        target.username = None;
-        target.usernameLink = None.into();
-    }
-    fn no_username_link(target: &mut proto::AccountData) {
-        target.usernameLink = None.into();
-    }
-    fn username_link_unknown_color(target: &mut proto::AccountData) {
-        target.usernameLink.as_mut().unwrap().color = EnumOrUnknown::default();
-    }
-    fn username_link_without_username(target: &mut proto::AccountData) {
-        target.username = None;
-        target.usernameLink = Some(target.usernameLink.take().unwrap()).into();
-    }
-    fn no_account_settings(target: &mut proto::AccountData) {
-        target.accountSettings = None.into();
-    }
-    fn invalid_subscriber_id(target: &mut proto::AccountData) {
-        target.backupsSubscriberData.as_mut().unwrap().subscriberId = vec![123];
-    }
-    fn empty_subscriber_id(target: &mut proto::AccountData) {
-        target.backupsSubscriberData.as_mut().unwrap().subscriberId = vec![];
-    }
-    fn empty_subscriber_currency(target: &mut proto::AccountData) {
-        target.backupsSubscriberData.as_mut().unwrap().currencyCode = "".to_owned();
-    }
-    fn no_subscriptions(target: &mut proto::AccountData) {
-        target.backupsSubscriberData = None.into();
-        target.donationSubscriberData = None.into();
-    }
-    fn account_data_default_style_invalid_custom_color(target: &mut proto::AccountData) {
-        target
-            .accountSettings
-            .as_mut()
-            .unwrap()
-            .customChatColors
-            .clear();
+    #[test]
+    fn valid_account_data() {
+        assert_eq!(
+            proto::AccountData::test_data().try_into_with(&TestContext::default()),
+            Ok(AccountData::from_proto_test_data())
+        );
     }
 
-    #[test_case(invalid_profile_key, Err(AccountDataError::InvalidProfileKey))]
+    #[test_case(|x| x.profileKey.clear() => Err(AccountDataError::InvalidProfileKey); "invalid_profile_key")]
     #[test_case(
-        invalid_username,
-        Err(AccountDataError::InvalidUsername(UsernameError::MissingSeparator))
+        |x| x.username = Some("invalid".to_string()) => Err(AccountDataError::InvalidUsername(UsernameError::MissingSeparator));
+        "invalid username"
     )]
-    #[test_case(no_username, Ok(()))]
-    #[test_case(no_username_link, Ok(()))]
-    #[test_case(username_link_unknown_color, Ok(()))]
+    #[test_case(|x| {
+            x.username = None;
+            x.usernameLink = None.into();
+        } => Ok(()); "no username")]
+    #[test_case(|x| x.usernameLink = None.into() => Ok(()); "no username link")]
+    #[test_case(|x| x.usernameLink.as_mut().unwrap().color = EnumOrUnknown::default() => Ok(()); "username_link_unknown_color")]
+    #[test_case( |x| {
+            x.username = None;
+            x.usernameLink = Some(x.usernameLink.take().unwrap()).into();
+        } => Err(AccountDataError::UsernameLinkWithoutUsername);
+        "username_link_without_username"
+    )]
+    #[test_case(|x| x.accountSettings = None.into() => Err(AccountDataError::MissingSettings); "no_account_settings")]
+    #[test_case(|x| x.backupsSubscriberData.as_mut().unwrap().subscriberId = vec![123] =>
+        Err(AccountDataError::BackupSubscription(SubscriptionError::InvalidSubscriberId(1)));
+        "invalid_subscriber_id")]
+    #[test_case(|x| x.backupsSubscriberData.as_mut().unwrap().subscriberId = vec![] =>
+        Err(AccountDataError::BackupSubscription(SubscriptionError::InvalidSubscriberId(0)));
+        "empty_subscriber_id")]
+    #[test_case(|x| x.backupsSubscriberData.as_mut().unwrap().currencyCode = "".to_owned() =>
+        Err(AccountDataError::BackupSubscription(SubscriptionError::EmptyCurrency));
+        "empty_subscriber_currency")]
+    #[test_case(|x| {
+            x.backupsSubscriberData = None.into();
+            x.donationSubscriberData = None.into();
+        } => Ok(()); "no_subscriptions"
+    )]
     #[test_case(
-        username_link_without_username,
-        Err(AccountDataError::UsernameLinkWithoutUsername)
+        |x| x.accountSettings.as_mut().unwrap().customChatColors.clear() =>
+        Err(AccountDataError::ChatStyle(ChatStyleError::UnknownCustomColorId(FAKE_CUSTOM_COLOR_ID.0)));
+        "account_data_default_style_invalid_custom_color"
     )]
-    #[test_case(no_account_settings, Err(AccountDataError::MissingSettings))]
-    #[test_case(
-        invalid_subscriber_id,
-        Err(AccountDataError::BackupSubscription(SubscriptionError::InvalidSubscriberId(1)))
-    )]
-    #[test_case(
-        empty_subscriber_id,
-        Err(AccountDataError::BackupSubscription(SubscriptionError::InvalidSubscriberId(0)))
-    )]
-    #[test_case(
-        empty_subscriber_currency,
-        Err(AccountDataError::BackupSubscription(SubscriptionError::EmptyCurrency))
-    )]
-    #[test_case(no_subscriptions, Ok(()))]
-    #[test_case(
-        account_data_default_style_invalid_custom_color,
-        Err(AccountDataError::ChatStyle(ChatStyleError::UnknownCustomColorId(
-            FAKE_CUSTOM_COLOR_ID.0
-        )))
-    )]
-    fn with(
-        modifier: impl FnOnce(&mut proto::AccountData),
-        expected: Result<(), AccountDataError>,
-    ) {
+    fn with(modifier: fn(&mut proto::AccountData)) -> Result<(), AccountDataError> {
         let mut data = proto::AccountData::test_data();
         modifier(&mut data);
 
-        assert_eq!(
-            AccountData::<ValidateOnly>::try_from(data).map(|_| ()),
-            expected
-        )
+        AccountData::<ValidateOnly>::try_from_with(data, &TestContext::default()).map(|_| ())
     }
 }

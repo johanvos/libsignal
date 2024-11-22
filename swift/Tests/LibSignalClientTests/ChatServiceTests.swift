@@ -8,7 +8,10 @@ import Foundation
 import SignalFfi
 import XCTest
 
-extension ChatService {
+// These testing endpoints aren't generated in device builds, to save on code size.
+#if !os(iOS) || targetEnvironment(simulator)
+
+extension AuthenticatedChatService {
     func injectServerRequest(base64: String) {
         self.injectServerRequest(Data(base64Encoded: base64)!)
     }
@@ -28,11 +31,14 @@ extension ChatService {
     }
 }
 
+#endif
+
 final class ChatServiceTests: TestCaseBase {
+    private static let userAgent = "test"
+
 // These testing endpoints aren't generated in device builds, to save on code size.
 #if !os(iOS) || targetEnvironment(simulator)
 
-    private static let userAgent = "test"
     private static let expectedStatus: UInt16 = 200
     private static let expectedMessage = "OK"
     private static let expectedContent = Data("content".utf8)
@@ -66,7 +72,6 @@ final class ChatServiceTests: TestCaseBase {
         var rawDebugInfo = SignalFfiChatServiceDebugInfo()
         try checkError(signal_testing_chat_service_debug_info_convert(&rawDebugInfo))
         let debugInfo = ChatService.DebugInfo(consuming: rawDebugInfo)
-        XCTAssertEqual(2, debugInfo.reconnectCount)
         XCTAssertEqual(.ipv4, debugInfo.ipType)
         XCTAssertEqual(0.2, debugInfo.duration)
         XCTAssertEqual("connection_info", debugInfo.connectionInfo)
@@ -83,7 +88,6 @@ final class ChatServiceTests: TestCaseBase {
         XCTAssertEqual(Self.expectedContent, response.body)
 
         let debugInfo = ChatService.DebugInfo(consuming: rawResponseAndDebugInfo.debug_info)
-        XCTAssertEqual(2, debugInfo.reconnectCount)
         XCTAssertEqual(.ipv4, debugInfo.ipType)
         XCTAssertEqual(0.2, debugInfo.duration)
         XCTAssertEqual("connection_info", debugInfo.connectionInfo)
@@ -129,6 +133,11 @@ final class ChatServiceTests: TestCaseBase {
         do {
             try failWithError("RequestHasInvalidHeader")
         } catch SignalError.internalError(_) {}
+        do {
+            try failWithError("RetryAfter42Seconds")
+        } catch SignalError.rateLimitedError(retryAfter: 42, let message) {
+            XCTAssertEqual(message, "Rate limited; try again after 42s")
+        }
     }
 
     func testConstructRequest() throws {
@@ -136,7 +145,7 @@ final class ChatServiceTests: TestCaseBase {
         let expectedPathAndQuery = "/test"
 
         let request = ChatService.Request(method: expectedMethod, pathAndQuery: expectedPathAndQuery, headers: Self.expectedHeaders, body: Self.expectedContent, timeout: 5)
-        let internalRequest = try ChatService.InternalRequest(request)
+        let internalRequest = try ChatService.Request.InternalRequest(request)
         try internalRequest.withNativeHandle { internalRequest in
             XCTAssertEqual(expectedMethod, try invokeFnReturningString {
                 signal_testing_chat_request_get_method($0, internalRequest)
@@ -155,13 +164,16 @@ final class ChatServiceTests: TestCaseBase {
         }
     }
 
-    func testListenerCallbacks() throws {
+    func testListenerCallbacks() async throws {
         class Listener: ChatListener {
-            var stage = 0
             let queueEmpty: XCTestExpectation
             let firstMessageReceived: XCTestExpectation
             let secondMessageReceived: XCTestExpectation
             let connectionInterrupted: XCTestExpectation
+
+            var expectations: [XCTestExpectation] {
+                [self.firstMessageReceived, self.secondMessageReceived, self.queueEmpty, self.connectionInterrupted]
+            }
 
             init(queueEmpty: XCTestExpectation, firstMessageReceived: XCTestExpectation, secondMessageReceived: XCTestExpectation, connectionInterrupted: XCTestExpectation) {
                 self.queueEmpty = queueEmpty
@@ -170,38 +182,31 @@ final class ChatServiceTests: TestCaseBase {
                 self.connectionInterrupted = connectionInterrupted
             }
 
-            func chatService(_ chat: ChatService, didReceiveIncomingMessage envelope: Data, serverDeliveryTimestamp: UInt64, sendAck: () async throws -> Void) {
+            func chatService(_ chat: AuthenticatedChatService, didReceiveIncomingMessage envelope: Data, serverDeliveryTimestamp: UInt64, sendAck: () async throws -> Void) {
                 // This assumes a little-endian platform.
                 XCTAssertEqual(envelope, withUnsafeBytes(of: serverDeliveryTimestamp) { Data($0) })
                 switch serverDeliveryTimestamp {
                 case 1000:
-                    XCTAssertEqual(self.stage, 0)
-                    self.stage += 1
                     self.firstMessageReceived.fulfill()
                 case 2000:
-                    XCTAssertEqual(self.stage, 1)
-                    self.stage += 1
                     self.secondMessageReceived.fulfill()
                 default:
                     XCTFail("unexpected message")
                 }
             }
 
-            func chatServiceDidReceiveQueueEmpty(_: ChatService) {
-                XCTAssertEqual(self.stage, 2)
-                self.stage += 1
+            func chatServiceDidReceiveQueueEmpty(_: AuthenticatedChatService) {
                 self.queueEmpty.fulfill()
             }
 
-            func chatServiceConnectionWasInterrupted(_: ChatService) {
-                XCTAssertEqual(self.stage, 3)
-                self.stage += 1
+            func connectionWasInterrupted(_: AuthenticatedChatService, error: Error?) {
+                XCTAssertNotNil(error)
                 self.connectionInterrupted.fulfill()
             }
         }
 
         let net = Net(env: .staging, userAgent: Self.userAgent)
-        let chat = net.createChatService(username: "", password: "")
+        let chat = net.createAuthenticatedChatService(username: "", password: "", receiveStories: false)
         let listener = Listener(
             queueEmpty: expectation(description: "queue empty"),
             firstMessageReceived: expectation(description: "first message received"),
@@ -240,13 +245,12 @@ final class ChatServiceTests: TestCaseBase {
 
         chat.injectConnectionInterrupted()
 
-        waitForExpectations(timeout: 2)
-        XCTAssertEqual(listener.stage, 4)
+        await self.fulfillment(of: listener.expectations, timeout: 2, enforceOrder: true)
     }
 
 #endif
 
-    func testListenerCleanup() throws {
+    func testListenerCleanup() async throws {
         class Listener: ChatListener {
             let expectation: XCTestExpectation
             init(expectation: XCTestExpectation) {
@@ -257,34 +261,56 @@ final class ChatServiceTests: TestCaseBase {
                 expectation.fulfill()
             }
 
-            func chatServiceDidReceiveQueueEmpty(_: ChatService) {}
-            func chatService(_ chat: ChatService, didReceiveIncomingMessage envelope: Data, serverDeliveryTimestamp: UInt64, sendAck: () async throws -> Void) {}
+            func chatServiceDidReceiveQueueEmpty(_: AuthenticatedChatService) {}
+            func chatService(_ chat: AuthenticatedChatService, didReceiveIncomingMessage envelope: Data, serverDeliveryTimestamp: UInt64, sendAck: () async throws -> Void) {}
+            func connectionWasInterrupted(_ service: AuthenticatedChatService, error: Error?) {}
         }
 
         let net = Net(env: .staging, userAgent: Self.userAgent)
+        var expectations: [XCTestExpectation] = []
 
         do {
-            let chat = net.createChatService(username: "", password: "")
+            let chat = net.createAuthenticatedChatService(username: "", password: "", receiveStories: false)
 
             do {
-                let listener = Listener(expectation: expectation(description: "first listener destroyed"))
+                let expectation = expectation(description: "first listener destroyed")
+                expectations.append(expectation)
+                let listener = Listener(expectation: expectation)
                 chat.setListener(listener)
             }
             do {
-                let listener = Listener(expectation: expectation(description: "second listener destroyed"))
+                let expectation = expectation(description: "second listener destroyed")
+                expectations.append(expectation)
+                let listener = Listener(expectation: expectation)
                 chat.setListener(listener)
             }
             // Clearing the listener has a separate implementation, so let's make sure both get destroyed.
             chat.setListener(nil)
-            waitForExpectations(timeout: 2)
+            await fulfillment(of: expectations, timeout: 2, enforceOrder: true)
+            expectations.removeAll()
 
             do {
-                let listener = Listener(expectation: expectation(description: "third listener destroyed"))
+                let expectation = expectation(description: "third listener destroyed")
+                expectations.append(expectation)
+                let listener = Listener(expectation: expectation)
                 chat.setListener(listener)
             }
         }
         // If we destroy the ChatService, we should also clean up the listener.
-        waitForExpectations(timeout: 2)
+        await fulfillment(of: expectations, timeout: 2, enforceOrder: true)
+    }
+
+    final class ExpectDisconnectListener: ConnectionEventsListener {
+        let expectation: XCTestExpectation
+
+        init(_ expectation: XCTestExpectation) {
+            self.expectation = expectation
+        }
+
+        func connectionWasInterrupted(_: UnauthenticatedChatService, error: Error?) {
+            XCTAssertNil(error)
+            self.expectation.fulfill()
+        }
     }
 
     func testConnectUnauth() async throws {
@@ -294,10 +320,15 @@ final class ChatServiceTests: TestCaseBase {
         }
 
         let net = Net(env: .staging, userAgent: Self.userAgent)
-        let chat = net.createChatService(username: "", password: "")
+        let chat = net.createUnauthenticatedChatService()
+        let listener = ExpectDisconnectListener(expectation(description: "disconnect"))
+        chat.setListener(listener)
+
         // Just make sure we can connect.
-        try await chat.connectUnauthenticated()
+        try await chat.connect()
         try await chat.disconnect()
+
+        await self.fulfillment(of: [listener.expectation], timeout: 2)
     }
 
     func testConnectUnauthThroughProxy() async throws {
@@ -318,10 +349,15 @@ final class ChatServiceTests: TestCaseBase {
         }
         try net.setProxy(host: String(host), port: port)
 
-        let chat = net.createChatService(username: "", password: "")
+        let chat = net.createUnauthenticatedChatService()
+        let listener = ExpectDisconnectListener(expectation(description: "disconnect"))
+        chat.setListener(listener)
+
         // Just make sure we can connect.
-        try await chat.connectUnauthenticated()
+        try await chat.connect()
         try await chat.disconnect()
+
+        await self.fulfillment(of: [listener.expectation], timeout: 2)
     }
 
     func testInvalidProxyRejected() async throws {

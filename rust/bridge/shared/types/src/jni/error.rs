@@ -2,31 +2,31 @@
 // Copyright 2020-2021 Signal Messenger, LLC.
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-use http::uri::InvalidUri;
 use std::fmt;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use std::time::Duration;
 
-use jni::objects::{GlobalRef, JObject, JString, JThrowable};
-use jni::{JNIEnv, JavaVM};
-
 use attest::hsm_enclave::Error as HsmEnclaveError;
 use device_transfer::Error as DeviceTransferError;
+use http::uri::InvalidUri;
+use jni::objects::{GlobalRef, JObject, JString, JThrowable};
+use jni::{JNIEnv, JavaVM};
+use libsignal_account_keys::Error as PinError;
+use libsignal_net::cdsi::CdsiProtocolError;
 use libsignal_net::chat::ChatServiceError;
 use libsignal_net::infra::ws::{WebSocketConnectError, WebSocketServiceError};
+use libsignal_net::ws::WebSocketServiceConnectError;
 use libsignal_protocol::*;
 use signal_chat::Error as SignalChatError;
 use signal_crypto::Error as SignalCryptoError;
 use signal_grpc::Error as GrpcError;
-use signal_pin::Error as PinError;
 use signal_quic::Error as QuicError;
 use usernames::{UsernameError, UsernameLinkError};
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
+use super::*;
 use crate::net::cdsi::CdsiError;
 use crate::support::describe_panic;
-
-use super::*;
 
 /// The top-level error type for when something goes wrong.
 #[derive(Debug, thiserror::Error)]
@@ -56,10 +56,12 @@ pub enum SignalJniError {
     ChatService(ChatServiceError),
     InvalidUri(InvalidUri),
     ConnectTimedOut,
+    BackupValidation(#[from] libsignal_message_backup::ReadError),
     Bridge(BridgeLayerError),
     TestingError {
         exception_class: ClassName<'static>,
     },
+    KeyTransparency(libsignal_net::keytrans::Error),
 }
 
 /// Subset of errors that can happen in the bridge layer.
@@ -106,11 +108,13 @@ impl fmt::Display for SignalJniError {
             SignalJniError::InvalidUri(e) => write!(f, "{}", e),
             SignalJniError::WebSocket(e) => write!(f, "{e}"),
             SignalJniError::ConnectTimedOut => write!(f, "connect timed out"),
+            SignalJniError::BackupValidation(e) => write!(f, "{}", e),
             SignalJniError::Svr3(e) => write!(f, "{}", e),
             SignalJniError::Bridge(e) => write!(f, "{}", e),
             SignalJniError::TestingError { exception_class } => {
                 write!(f, "TestingError({})", exception_class)
             }
+            SignalJniError::KeyTransparency(e) => write!(f, "{}", e),
         }
     }
 }
@@ -286,7 +290,10 @@ impl From<libsignal_net::cdsi::LookupError> for SignalJniError {
                 ))
             }
             LookupError::InvalidResponse => CdsiError::InvalidResponse,
-            LookupError::Protocol => CdsiError::Protocol,
+            LookupError::EnclaveProtocol(_) => CdsiError::Protocol,
+            LookupError::CdsiProtocol(CdsiProtocolError::NoTokenInResponse) => {
+                CdsiError::NoTokenInResponse
+            }
             LookupError::RateLimited {
                 retry_after_seconds,
             } => CdsiError::RateLimited {
@@ -305,22 +312,21 @@ impl From<BridgeLayerError> for SignalJniError {
     }
 }
 
-impl From<jni::errors::Error> for BridgeLayerError {
-    fn from(e: jni::errors::Error) -> BridgeLayerError {
-        BridgeLayerError::Jni(e)
-    }
-}
-
 impl From<Svr3Error> for SignalJniError {
     fn from(err: Svr3Error) -> Self {
         match err {
             Svr3Error::Connect(inner) => match inner {
-                WebSocketConnectError::Timeout => SignalJniError::ConnectTimedOut,
-                WebSocketConnectError::Transport(e) => SignalJniError::Io(e.into()),
-                WebSocketConnectError::WebSocketError(e) => WebSocketServiceError::from(e).into(),
-                WebSocketConnectError::RejectedByServer(response) => {
-                    WebSocketServiceError::Http(response).into()
-                }
+                WebSocketServiceConnectError::Connect(e, _) => match e {
+                    WebSocketConnectError::Timeout => SignalJniError::ConnectTimedOut,
+                    WebSocketConnectError::Transport(e) => SignalJniError::Io(e.into()),
+                    WebSocketConnectError::WebSocketError(e) => {
+                        WebSocketServiceError::from(e).into()
+                    }
+                },
+                WebSocketServiceConnectError::RejectedByServer {
+                    response,
+                    received_at: _,
+                } => WebSocketServiceError::Http(response).into(),
             },
             Svr3Error::ConnectionTimedOut => SignalJniError::ConnectTimedOut,
             Svr3Error::Service(inner) => inner.into(),
@@ -328,14 +334,22 @@ impl From<Svr3Error> for SignalJniError {
             Svr3Error::Protocol(_)
             | Svr3Error::RequestFailed(_)
             | Svr3Error::RestoreFailed(_)
-            | Svr3Error::DataMissing => SignalJniError::Svr3(err),
+            | Svr3Error::DataMissing
+            | Svr3Error::RotationMachineTooManySteps => SignalJniError::Svr3(err),
         }
     }
 }
 
-impl From<jni::errors::Error> for SignalJniError {
-    fn from(e: jni::errors::Error) -> SignalJniError {
-        BridgeLayerError::from(e).into()
+impl From<KeyTransNetError> for SignalJniError {
+    fn from(err: KeyTransNetError) -> Self {
+        match err {
+            KeyTransNetError::ChatServiceError(e) => SignalJniError::ChatService(e),
+            KeyTransNetError::RequestFailed(_)
+            | KeyTransNetError::VerificationFailed(_)
+            | KeyTransNetError::InvalidResponse(_)
+            | KeyTransNetError::InvalidRequest(_)
+            | KeyTransNetError::DecodingFailed(_) => SignalJniError::KeyTransparency(err),
+        }
     }
 }
 
@@ -395,13 +409,17 @@ impl ThrownException {
     ) -> Result<Self, BridgeLayerError> {
         assert!(!throwable.as_ref().is_null());
         Ok(Self {
-            jvm: env.get_java_vm()?,
-            exception_ref: env.new_global_ref(throwable.as_ref())?,
+            jvm: env.get_java_vm().expect_no_exceptions()?,
+            exception_ref: env
+                .new_global_ref(throwable.as_ref())
+                .expect_no_exceptions()?,
         })
     }
 
     pub fn class_name(&self, env: &mut JNIEnv) -> Result<String, BridgeLayerError> {
-        let class_type = env.get_object_class(self.exception_ref.as_obj())?;
+        let class_type = env
+            .get_object_class(self.exception_ref.as_obj())
+            .check_exceptions(env, "ThrownException::class_name")?;
         let class_name: JObject = call_method_checked(
             env,
             class_type,
@@ -409,7 +427,10 @@ impl ThrownException {
             jni_args!(() -> java.lang.String),
         )?;
 
-        Ok(env.get_string(&JString::from(class_name))?.into())
+        Ok(env
+            .get_string(&JString::from(class_name))
+            .check_exceptions(env, "ThrownException::class_name")?
+            .into())
     }
 
     pub fn message(&self, env: &mut JNIEnv) -> Result<String, BridgeLayerError> {
@@ -419,7 +440,10 @@ impl ThrownException {
             "getMessage",
             jni_args!(() -> java.lang.String),
         )?;
-        Ok(env.get_string(&JString::from(message))?.into())
+        Ok(env
+            .get_string(&JString::from(message))
+            .check_exceptions(env, "ThrownException::class_name")?
+            .into())
     }
 }
 
@@ -456,3 +480,66 @@ impl fmt::Debug for ThrownException {
 }
 
 impl std::error::Error for ThrownException {}
+
+pub trait HandleJniError<T> {
+    fn check_exceptions(
+        self,
+        env: &mut JNIEnv<'_>,
+        context: &'static str,
+    ) -> Result<T, BridgeLayerError>;
+
+    fn expect_no_exceptions(self) -> Result<T, BridgeLayerError>;
+}
+
+impl<T> HandleJniError<T> for Result<T, jni::errors::Error> {
+    fn check_exceptions(
+        self,
+        env: &mut JNIEnv<'_>,
+        context: &'static str,
+    ) -> Result<T, BridgeLayerError> {
+        // Do the bulk of the work in a non-generic helper function.
+        fn check_error(
+            e: jni::errors::Error,
+            env: &mut JNIEnv<'_>,
+            context: &'static str,
+        ) -> Result<std::convert::Infallible, BridgeLayerError> {
+            // Returning a Result is convenient because it lets us use ?, but it is always an error,
+            // so we use Infallible as the success type, which can't be instantiated.
+            if matches!(e, jni::errors::Error::JavaException) {
+                let throwable = env.exception_occurred().expect_no_exceptions()?;
+                if **throwable != *JObject::null() {
+                    env.exception_clear().expect_no_exceptions()?;
+                    return Err(BridgeLayerError::CallbackException(
+                        context,
+                        ThrownException::new(env, throwable)?,
+                    ));
+                }
+                log::warn!(
+                    "'{context}' produced a Java exception, but it has already been cleared from the JVM state"
+                );
+            }
+            Err(BridgeLayerError::Jni(e))
+        }
+
+        self.map_err(|e| match check_error(e, env, context) {
+            // min_exhaustive_patterns was stabilized in 1.82-nightly, which made the
+            // unreachable_patterns lint much more aggressive. The lint was turned back down in
+            // 1.83-nightly and 1.82-beta, but our pinned nightly is between the two changes.
+            // We can remove the allow when we update our nightly toolchain (but we may eventually
+            // have to put it back). We can remove the entire match arm when our MSRV is 1.82+.
+            #[allow(unreachable_patterns)]
+            Ok(_) => unreachable!(),
+            Err(e) => e,
+        })
+    }
+
+    fn expect_no_exceptions(self) -> Result<T, BridgeLayerError> {
+        self.map_err(|e| {
+            assert!(
+                !matches!(e, jni::errors::Error::JavaException),
+                "catching Java exceptions is not supported here"
+            );
+            BridgeLayerError::Jni(e)
+        })
+    }
+}

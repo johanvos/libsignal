@@ -10,11 +10,10 @@ use futures_util::FutureExt;
 use neon::types::{Deferred, JsBigInt};
 use signal_neon_futures::ChannelEx;
 
+use super::*;
 use crate::support::{
     describe_panic, AsyncRuntime, AsyncRuntimeBase, CancellationId, ResultReporter,
 };
-
-use super::*;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Promise cancelled
@@ -125,10 +124,17 @@ where
                             Ok(success.convert_into(*cx)?.upcast())
                         }),
                         Ok(Err(failure)) => {
-                            Ok(failure.throw(*cx, error_module, node_function_name))
+                            let throwable =
+                                failure.into_throwable(*cx, error_module, node_function_name);
+                            Ok(cx.throw(throwable))
                         }
                         Err(CancellationError) => {
-                            Ok(CancellationError.throw(*cx, error_module, node_function_name))
+                            let throwable = CancellationError.into_throwable(
+                                *cx,
+                                error_module,
+                                node_function_name,
+                            );
+                            Ok(cx.throw(throwable))
                         }
                     }
                 });

@@ -5,8 +5,9 @@
 
 //! DCAP quote (Open Enclave "evidence"), ported from Open Enclave headers in v0.17.7.
 
-use sha2::Digest;
 use std::collections::HashMap;
+
+use sha2::Digest;
 
 use crate::dcap::sgx_quote::SgxQuote;
 use crate::dcap::{Error, Expireable};
@@ -101,7 +102,8 @@ impl<'a> TryFrom<&'a [u8]> for CustomClaims<'a> {
         if num_claims > 256 {
             return Err(Error::new("too many custom claims"));
         }
-        let mut claims = HashMap::with_capacity(num_claims as usize);
+        let num_claims = usize::try_from(num_claims).expect("just checked");
+        let mut claims = HashMap::with_capacity(num_claims);
 
         for _ in 0..num_claims {
             let CustomClaimsEntryHeader {
@@ -114,21 +116,23 @@ impl<'a> TryFrom<&'a [u8]> for CustomClaims<'a> {
             if name_size > 1024 {
                 return Err(Error::new("custom claim name too long"));
             }
+            let name_size = usize::try_from(name_size).expect("just checked");
             if value_size > 1024 * 1024 {
                 return Err(Error::new("custom claim value too long"));
             }
+            let value_size = usize::try_from(value_size).expect("just checked");
 
-            if bytes.len() < (name_size + value_size) as usize {
+            if bytes.len() < (name_size + value_size) {
                 return Err(Error::new("underflow"));
             }
 
-            let mut name_bytes = util::read_bytes(&mut bytes, name_size as usize);
+            let mut name_bytes = util::read_bytes(&mut bytes, name_size);
             util::strip_trailing_null_byte(&mut name_bytes);
 
             let name = String::from_utf8(Vec::from(name_bytes))
                 .map_err(|_| Error::new("could not parse claims name to string"))?;
 
-            let value = util::read_bytes(&mut bytes, value_size as usize);
+            let value = util::read_bytes(&mut bytes, value_size);
 
             claims.insert(name, Vec::from(value));
         }
@@ -152,9 +156,10 @@ impl CustomClaims<'_> {
 
 #[cfg(test)]
 mod test {
+    use hex_literal::hex;
+
     use super::*;
     use crate::dcap::MREnclave;
-    use hex_literal::hex;
 
     const EXPECTED_MRENCLAVE: MREnclave =
         hex!("337ac97ce088a132daeb1308ea3159f807de4a827e875b2c90ce21bf4751196f");

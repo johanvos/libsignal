@@ -9,7 +9,6 @@ use std::io;
 use async_trait::async_trait;
 
 use super::*;
-
 use crate::io::{InputStream, InputStreamRead, SyncInputStream};
 
 pub type JavaInputStream<'a> = JObject<'a>;
@@ -37,8 +36,12 @@ impl<'a> JniInputStream<'a> {
     }
 
     fn do_read(&self, buf: &mut [u8]) -> SignalJniResult<usize> {
-        self.env.borrow_mut().with_local_frame(8, |env| {
-            let java_buf = env.new_byte_array(buf.len() as i32)?;
+        self.env.borrow_mut().with_local_frame(8, "read", |env| {
+            let amount = buf
+                .len()
+                .try_into()
+                .expect("cannot read into a buffer bigger than i32::MAX");
+            let java_buf = env.new_byte_array(amount).check_exceptions(env, "read")?;
             let amount_read: jint = call_method_checked(
                 env,
                 self.stream,
@@ -54,13 +57,14 @@ impl<'a> JniInputStream<'a> {
                 0,
                 zerocopy::FromBytes::mut_slice_from(&mut buf[..amount_read])
                     .expect("types have same alignment"),
-            )?;
+            )
+            .check_exceptions(env, "read")?;
             Ok(amount_read)
         })
     }
 
     fn do_skip(&self, amount: u64) -> SignalJniResult<()> {
-        self.env.borrow_mut().with_local_frame(8, |env| {
+        self.env.borrow_mut().with_local_frame(8, "skip", |env| {
             let java_amount = amount.try_into().map_err(|_| {
                 SignalJniError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,

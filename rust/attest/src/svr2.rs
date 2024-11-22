@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use prost::Message;
+
 use crate::constants::{
     ACCEPTABLE_SW_ADVISORIES, DEFAULT_SW_ADVISORIES, EXPECTED_RAFT_CONFIG_SVR2,
 };
-use prost::Message;
-
-use crate::enclave::{Error, Handshake, Result};
+use crate::enclave::{Error, Handshake, HandshakeType, Result};
 use crate::proto::svr;
 
 /// A RaftConfig that can be checked against the attested remote config
@@ -42,6 +42,7 @@ pub fn new_handshake_with_raft_config_lookup(
     mrenclave: &[u8],
     attestation_msg: &[u8],
     current_time: std::time::SystemTime,
+    handshake_type: HandshakeType,
 ) -> Result<Handshake> {
     let expected_raft_config =
         EXPECTED_RAFT_CONFIG_SVR2
@@ -55,6 +56,7 @@ pub fn new_handshake_with_raft_config_lookup(
         attestation_msg,
         current_time,
         expected_raft_config,
+        handshake_type,
     )
 }
 
@@ -63,6 +65,7 @@ pub fn new_handshake(
     attestation_msg: &[u8],
     current_time: std::time::SystemTime,
     expected_raft_config: &'static RaftConfig,
+    handshake_type: HandshakeType,
 ) -> Result<Handshake> {
     new_handshake_with_constants(
         mrenclave,
@@ -72,6 +75,7 @@ pub fn new_handshake(
             .get(&mrenclave)
             .unwrap_or(&DEFAULT_SW_ADVISORIES),
         expected_raft_config,
+        handshake_type,
     )
 }
 
@@ -81,6 +85,7 @@ fn new_handshake_with_constants(
     current_time: std::time::SystemTime,
     acceptable_sw_advisories: &[&str],
     expected_raft_config: &RaftConfig,
+    handshake_type: HandshakeType,
 ) -> Result<Handshake> {
     // Deserialize attestation handshake start.
     let handshake_start = svr::ClientHandshakeStart::decode(attestation_msg)?;
@@ -90,6 +95,7 @@ fn new_handshake_with_constants(
         &handshake_start.endorsement,
         acceptable_sw_advisories,
         current_time,
+        handshake_type,
     )?
     .validate(expected_raft_config)?;
 
@@ -110,13 +116,20 @@ mod tests {
         let current_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1709245753);
         let mrenclave_bytes =
             hex!("acb1973aa0bbbd14b3b4e06f145497d948fd4a98efc500fcce363b3b743ec482");
-        let raft_config: &RaftConfig = &RaftConfig {
-            min_voting_replicas: 3,
-            max_voting_replicas: 5,
-            super_majority: 0,
-            group_id: 16934825672495360159,
-        };
-        new_handshake(&mrenclave_bytes, HANDSHAKE_BYTES, current_time, raft_config).unwrap();
+        new_handshake_with_constants(
+            &mrenclave_bytes,
+            HANDSHAKE_BYTES,
+            current_time,
+            &["INTEL-SA-00615", "INTEL-SA-00657"] as &[&str],
+            &RaftConfig {
+                min_voting_replicas: 3,
+                max_voting_replicas: 5,
+                super_majority: 0,
+                group_id: 16934825672495360159,
+            },
+            HandshakeType::PreQuantum,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -137,6 +150,7 @@ mod tests {
                 super_majority: 0,
                 group_id: 0, // wrong
             },
+            HandshakeType::PreQuantum,
         )
         .is_err());
     }

@@ -70,6 +70,13 @@ java {
     withJavadocJar()
 }
 
+sourcesJar {
+    // Cut down on artifact size by leaving these out of the sources jar.
+    exclude '*.dll'
+    exclude '*.dylib'
+    exclude '*.so'
+}
+
 tasks.named('jar') {
     manifest {
         attributes('Automatic-Module-Name': 'org.signal.libsignal')
@@ -77,7 +84,6 @@ tasks.named('jar') {
 }
 
 processResources {
-    // TODO: Build a different variant of the JNI library for server.
     dependsOn ':makeJniLibrariesDesktop'
 }
 

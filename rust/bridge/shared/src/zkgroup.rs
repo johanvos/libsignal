@@ -4,28 +4,26 @@
 //
 
 use ::zkgroup;
+use backups::BackupCredentialType;
 use libsignal_bridge_macros::*;
 use libsignal_bridge_types::zkgroup::validate_serialization;
 use libsignal_protocol::{Aci, Pni, ServiceId};
-
+use uuid::Uuid;
 use zkgroup::auth::*;
+use zkgroup::backups::{
+    BackupAuthCredential, BackupAuthCredentialPresentation, BackupAuthCredentialRequest,
+    BackupAuthCredentialRequestContext, BackupAuthCredentialResponse, BackupLevel,
+};
 use zkgroup::call_links::*;
 use zkgroup::generic_server_params::*;
 use zkgroup::groups::*;
 use zkgroup::profiles::*;
 use zkgroup::receipts::*;
+pub(crate) use zkgroup::Timestamp;
 use zkgroup::*;
-
-use uuid::Uuid;
-use zkgroup::backups::{
-    BackupAuthCredential, BackupAuthCredentialPresentation, BackupAuthCredentialRequest,
-    BackupAuthCredentialRequestContext, BackupAuthCredentialResponse, BackupLevel,
-};
 
 use crate::support::*;
 use crate::*;
-
-pub(crate) use zkgroup::Timestamp;
 
 bridge_fixed_length_serializable_fns!(ExpiringProfileKeyCredential);
 bridge_fixed_length_serializable_fns!(ExpiringProfileKeyCredentialResponse);
@@ -896,7 +894,9 @@ fn CallLinkAuthCredentialPresentation_GetUserId(
 
 #[bridge_fn]
 fn BackupAuthCredentialRequestContext_New(backup_key: &[u8; 32], uuid: Uuid) -> Vec<u8> {
-    let context = BackupAuthCredentialRequestContext::new(backup_key, &uuid);
+    let backup_key: libsignal_account_keys::BackupKey =
+        libsignal_account_keys::BackupKey(*backup_key);
+    let context = BackupAuthCredentialRequestContext::new(&backup_key, uuid.into());
     zkgroup::serialize(&context)
 }
 
@@ -928,6 +928,7 @@ fn BackupAuthCredentialRequest_IssueDeterministic(
     request_bytes: &[u8],
     redemption_time: Timestamp,
     backup_level: AsType<BackupLevel, u8>,
+    credential_type: AsType<BackupCredentialType, u8>,
     params_bytes: &[u8],
     randomness: &[u8; RANDOMNESS_LEN],
 ) -> Vec<u8> {
@@ -939,6 +940,7 @@ fn BackupAuthCredentialRequest_IssueDeterministic(
     let response = request.issue(
         redemption_time,
         backup_level.into_inner(),
+        credential_type.into_inner(),
         &params,
         *randomness,
     );
@@ -981,7 +983,7 @@ fn BackupAuthCredential_CheckValidContents(
 fn BackupAuthCredential_GetBackupId(credential_bytes: &[u8]) -> [u8; 16] {
     let credential = bincode::deserialize::<BackupAuthCredential>(credential_bytes)
         .expect("should have been parsed previously");
-    credential.backup_id()
+    credential.backup_id().0
 }
 
 #[bridge_fn]
@@ -989,6 +991,13 @@ fn BackupAuthCredential_GetBackupLevel(credential_bytes: &[u8]) -> u8 {
     let credential = bincode::deserialize::<BackupAuthCredential>(credential_bytes)
         .expect("should have been parsed previously");
     credential.backup_level() as u8
+}
+
+#[bridge_fn]
+fn BackupAuthCredential_GetType(credential_bytes: &[u8]) -> u8 {
+    let credential = bincode::deserialize::<BackupAuthCredential>(credential_bytes)
+        .expect("should have been parsed previously");
+    credential.credential_type() as u8
 }
 
 #[bridge_fn]
@@ -1027,18 +1036,25 @@ fn BackupAuthCredentialPresentation_Verify(
     presentation.verify(now, &server_params)
 }
 
-#[bridge_fn(ffi = false, node = false)]
+#[bridge_fn(ffi = false)]
 fn BackupAuthCredentialPresentation_GetBackupId(presentation_bytes: &[u8]) -> [u8; 16] {
     let presentation = bincode::deserialize::<BackupAuthCredentialPresentation>(presentation_bytes)
         .expect("should have been parsed previously");
-    presentation.backup_id()
+    presentation.backup_id().0
 }
 
-#[bridge_fn(ffi = false, node = false)]
+#[bridge_fn(ffi = false)]
 fn BackupAuthCredentialPresentation_GetBackupLevel(presentation_bytes: &[u8]) -> u8 {
     let presentation = bincode::deserialize::<BackupAuthCredentialPresentation>(presentation_bytes)
         .expect("should have been parsed previously");
     presentation.backup_level() as u8
+}
+
+#[bridge_fn(ffi = false)]
+fn BackupAuthCredentialPresentation_GetType(presentation_bytes: &[u8]) -> u8 {
+    let presentation = bincode::deserialize::<BackupAuthCredentialPresentation>(presentation_bytes)
+        .expect("should have been parsed previously");
+    presentation.credential_type() as u8
 }
 
 #[bridge_fn]

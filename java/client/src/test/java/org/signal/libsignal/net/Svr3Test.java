@@ -36,7 +36,7 @@ public class Svr3Test {
 
   @Before
   public void before() {
-    // These tests require access to staging SVR3, and will be ignored if the
+    // These tests require access to the SVR3 instances, and will be ignored if the
     // secret is not provided.
     Assume.assumeNotNull(ENCLAVE_SECRET);
     // Generating a random username for each test run to minimize the
@@ -44,7 +44,7 @@ public class Svr3Test {
     String username = randomBytesHex(16);
     String otp = Native.CreateOTPFromBase64(username, ENCLAVE_SECRET);
     var auth = new EnclaveAuth(username, otp);
-    var net = new Network(Network.Environment.STAGING, USER_AGENT);
+    var net = new Network(Network.Environment.PRODUCTION, USER_AGENT);
     this.state = new State(auth, net);
   }
 
@@ -93,6 +93,23 @@ public class Svr3Test {
       Throwable cause = ex.getCause();
       assertTrue("Unexpected exception: " + cause, cause instanceof DataMissingException);
     }
+  }
+
+  @Test
+  public void restoreAfterRotate() throws Exception {
+    final int tries = 10;
+    byte[] shareSet =
+        state.net().svr3().backup(STORED_SECRET, TEST_PASSWORD, tries, state.auth()).get();
+    Svr3.RestoredSecret restored =
+        state
+            .net()
+            .svr3()
+            .rotate(shareSet, state.auth())
+            .thenCompose(
+                ignored -> state.net().svr3().restore(TEST_PASSWORD, shareSet, state.auth()))
+            .get();
+    assertEquals(Hex.toStringCondensed(STORED_SECRET), Hex.toStringCondensed(restored.value()));
+    assertEquals(tries - 1, restored.triesRemaining());
   }
 
   @Test
@@ -151,7 +168,7 @@ public class Svr3Test {
   public void badShareSet() throws Exception {
     byte[] shareSet =
         state.net().svr3().backup(STORED_SECRET, TEST_PASSWORD, 1, state.auth()).get();
-    shareSet[0] ^= 0xff;
+    shareSet[0] ^= (byte) 0xff;
     try {
       state.net().svr3().restore(TEST_PASSWORD, shareSet, state.auth()).get();
     } catch (ExecutionException ex) {

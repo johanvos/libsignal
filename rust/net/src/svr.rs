@@ -4,49 +4,50 @@
 //
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
-use crate::auth::HttpBasicAuth;
-use crate::enclave::{EnclaveEndpointConnection, IntoAttestedConnection, NewHandshake, Svr3Flavor};
-use crate::infra::connection_manager::ConnectionManager;
-use crate::infra::ws::AttestedConnection;
-use crate::infra::{AsyncDuplexStream, TransportConnector};
+use libsignal_net_infra::connection_manager::ConnectionManager;
+use libsignal_net_infra::host::Host;
+use libsignal_net_infra::ws2::attested::AttestedConnection;
+use libsignal_net_infra::TransportConnector;
 
+use crate::auth::Auth;
 pub use crate::enclave::Error;
+use crate::enclave::{EnclaveEndpointConnection, IntoAttestedConnection, NewHandshake, Svr3Flavor};
 
-pub struct SvrConnection<Flavor: Svr3Flavor, S> {
-    inner: AttestedConnection<S>,
+pub struct SvrConnection<Flavor: Svr3Flavor> {
+    inner: AttestedConnection,
+    remote_address: Host<std::sync::Arc<str>>,
     witness: PhantomData<Flavor>,
 }
 
-impl<Flavor: Svr3Flavor, S> From<SvrConnection<Flavor, S>> for AttestedConnection<S> {
-    fn from(conn: SvrConnection<Flavor, S>) -> Self {
-        conn.inner
+impl<Flavor: Svr3Flavor> From<SvrConnection<Flavor>> for (AttestedConnection, Host<Arc<str>>) {
+    fn from(conn: SvrConnection<Flavor>) -> Self {
+        (conn.inner, conn.remote_address)
     }
 }
 
-impl<Flavor: Svr3Flavor, S: Send> IntoAttestedConnection for SvrConnection<Flavor, S> {
-    type Stream = S;
-}
+impl<Flavor: Svr3Flavor> IntoAttestedConnection for SvrConnection<Flavor> {}
 
-impl<E: Svr3Flavor, S: AsyncDuplexStream> SvrConnection<E, S>
+impl<E: Svr3Flavor> SvrConnection<E>
 where
     E: Svr3Flavor + NewHandshake + Sized,
-    S: AsyncDuplexStream,
 {
     pub async fn connect<C, T>(
-        auth: impl HttpBasicAuth,
+        auth: Auth,
         connection: &EnclaveEndpointConnection<E, C>,
         transport_connector: T,
     ) -> Result<Self, Error>
     where
         C: ConnectionManager,
-        T: TransportConnector<Stream = S>,
+        T: TransportConnector,
     {
         connection
             .connect(auth, transport_connector)
             .await
-            .map(|inner| Self {
-                inner,
+            .map(|(connection, info)| Self {
+                inner: connection,
+                remote_address: info.address,
                 witness: PhantomData,
             })
     }

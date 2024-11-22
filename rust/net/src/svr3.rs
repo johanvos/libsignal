@@ -4,61 +4,58 @@
 //
 
 use std::num::NonZeroU32;
-use std::time::Duration;
 
-use async_trait::async_trait;
 use bincode::Options as _;
+use libsignal_net_infra::errors::LogSafeDisplay;
+use libsignal_net_infra::ws::WebSocketServiceError;
+use libsignal_net_infra::ws2::attested::AttestedConnectionError;
+use libsignal_svr3::{EvaluationResult, MaskedSecret};
 use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use libsignal_svr3::{EvaluationResult, MaskedShareSet};
+mod ppss_ops;
 
-use crate::auth::Auth;
-use crate::enclave::{self, EnclaveEndpointConnection, Nitro, PpssSetup, Sgx, Tpm2Snp};
-use crate::env::Svr3Env;
-use crate::infra::dns::DnsResolver;
-use crate::infra::errors::LogSafeDisplay;
-use crate::infra::tcp_ssl::DirectConnector;
-use crate::infra::ws::{
-    AttestedConnectionError, DefaultStream, WebSocketConnectError, WebSocketServiceError,
-};
-use crate::infra::AsyncDuplexStream;
-use crate::svr::SvrConnection;
+pub mod direct;
 
-const MASKED_SHARE_SET_FORMAT: u8 = 0;
+pub mod traits;
+use traits::*;
+
+use crate::ws::WebSocketServiceConnectError;
+
+// Versions:
+//   0: XOR'd secret
+//   1: AES-GCM encrypted secret
+const MASKED_SHARE_SET_FORMAT: u8 = 1;
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq, Default))]
 pub struct OpaqueMaskedShareSet {
     inner: SerializableMaskedShareSet,
 }
 
-// Non pub version of ppss::MaskedShareSet used for serialization
+// Non pub version of svr3::MaskedSecret used for serialization
 #[derive(Clone, Serialize, Deserialize, Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[cfg_attr(test, derive(PartialEq, Eq, Default))]
 struct SerializableMaskedShareSet {
     server_ids: Vec<u64>,
-    masked_shares: Vec<[u8; 32]>,
-    commitment: [u8; 32],
+    masked_secret: Vec<u8>,
 }
 
-impl From<MaskedShareSet> for SerializableMaskedShareSet {
-    fn from(value: MaskedShareSet) -> Self {
+impl From<MaskedSecret> for SerializableMaskedShareSet {
+    fn from(value: MaskedSecret) -> Self {
         Self {
             server_ids: value.server_ids,
-            masked_shares: value.masked_shares,
-            commitment: value.commitment,
+            masked_secret: value.masked_secret,
         }
     }
 }
 
 impl SerializableMaskedShareSet {
-    fn into(self) -> MaskedShareSet {
-        MaskedShareSet {
+    fn into(self) -> MaskedSecret {
+        MaskedSecret {
             server_ids: self.server_ids,
-            masked_shares: self.masked_shares,
-            commitment: self.commitment,
+            masked_secret: self.masked_secret,
         }
     }
 }
@@ -77,12 +74,12 @@ pub enum DeserializeError {
 impl LogSafeDisplay for DeserializeError {}
 
 impl OpaqueMaskedShareSet {
-    fn new(inner: MaskedShareSet) -> Self {
+    fn new(inner: MaskedSecret) -> Self {
         Self {
             inner: inner.into(),
         }
     }
-    fn into_inner(self) -> MaskedShareSet {
+    fn into_inner(self) -> MaskedSecret {
         self.inner.into()
     }
 
@@ -134,7 +131,7 @@ impl OpaqueMaskedShareSet {
 #[ignore_extra_doc_attributes]
 pub enum Error {
     /// Connection error: {0}
-    Connect(WebSocketConnectError),
+    Connect(WebSocketServiceConnectError),
     /// Network error: {0}
     Service(#[from] WebSocketServiceError),
     /// Protocol error after establishing a connection: {0}
@@ -154,6 +151,8 @@ pub enum Error {
     DataMissing,
     /// Connect timed out
     ConnectionTimedOut,
+    /// Rotation machine took too many steps
+    RotationMachineTooManySteps,
 }
 
 impl From<DeserializeError> for Error {
@@ -170,18 +169,18 @@ impl From<attest::enclave::Error> for Error {
 
 impl From<libsignal_svr3::Error> for Error {
     fn from(err: libsignal_svr3::Error) -> Self {
-        use libsignal_svr3::{Error as LogicError, PPSSError};
+        use libsignal_svr3::Error as LogicError;
         match err {
-            LogicError::Ppss(PPSSError::InvalidCommitment, tries_remaining) => {
-                Self::RestoreFailed(tries_remaining)
-            }
-            LogicError::BadResponseStatus(libsignal_svr3::ErrorStatus::Missing) => {
+            LogicError::RestoreFailed(tries_remaining) => Self::RestoreFailed(tries_remaining),
+            LogicError::BadResponseStatus(libsignal_svr3::ErrorStatus::Missing)
+            | LogicError::BadResponseStatus4(libsignal_svr3::V4Status::Missing) => {
                 Self::DataMissing
             }
-            LogicError::Oprf(_)
-            | LogicError::Ppss(_, _)
-            | LogicError::BadData
+            LogicError::BadData
             | LogicError::BadResponse
+            | LogicError::NumServers { .. }
+            | LogicError::NoUsableVersion
+            | LogicError::BadResponseStatus4(_)
             | LogicError::BadResponseStatus(_) => Self::Protocol(err.to_string()),
         }
     }
@@ -193,7 +192,7 @@ impl From<super::svr::Error> for Error {
         match err {
             SvrError::WebSocketConnect(inner) => Self::Connect(inner),
             SvrError::WebSocket(inner) => Self::Service(inner),
-            SvrError::Protocol => Self::Protocol("General SVR protocol error".to_string()),
+            SvrError::Protocol(error) => Self::Protocol(error.to_string()),
             SvrError::AttestationError(inner) => Self::AttestationError(inner),
             SvrError::ConnectionTimedOut => Self::ConnectionTimedOut,
         }
@@ -203,184 +202,6 @@ impl From<super::svr::Error> for Error {
 impl From<AttestedConnectionError> for Error {
     fn from(err: AttestedConnectionError) -> Self {
         Self::from(super::svr::Error::from(err))
-    }
-}
-
-/// High level data operations on instances of `PpssSetup`
-///
-/// These functions are useful if we ever want to perform multiple operations
-/// on the same set of open connections, as opposed to having to connect for
-/// each individual operation, as implied by `Svr3Client` trait.
-mod ppss_ops {
-    use super::{Error, OpaqueMaskedShareSet};
-
-    use crate::enclave::{IntoConnections, PpssSetup};
-    use crate::infra::ws::{run_attested_interaction, NextOrClose};
-    use crate::infra::AsyncDuplexStream;
-    use futures_util::future::try_join_all;
-    use libsignal_svr3::{Backup, EvaluationResult, Query, Restore};
-    use rand_core::CryptoRngCore;
-    use std::num::NonZeroU32;
-
-    pub async fn do_backup<S: AsyncDuplexStream + 'static, Env: PpssSetup<S>>(
-        connections: Env::Connections,
-        password: &str,
-        secret: [u8; 32],
-        max_tries: NonZeroU32,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<OpaqueMaskedShareSet, Error> {
-        let server_ids = Env::server_ids();
-        let backup = Backup::new(server_ids.as_ref(), password, secret, max_tries, rng)?;
-        let mut connections = connections.into_connections();
-        let futures = connections
-            .as_mut()
-            .iter_mut()
-            .zip(&backup.requests)
-            .map(|(connection, request)| run_attested_interaction(connection, request));
-        let results = try_join_all(futures).await?;
-        let addresses = connections.as_ref().iter().map(|c| c.remote_address());
-        let responses = collect_responses(results, addresses)?;
-        let share_set = backup.finalize(rng, &responses)?;
-        Ok(OpaqueMaskedShareSet::new(share_set))
-    }
-
-    pub async fn do_restore<S: AsyncDuplexStream + 'static, Env: PpssSetup<S>>(
-        connections: Env::Connections,
-        password: &str,
-        share_set: OpaqueMaskedShareSet,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<EvaluationResult, Error> {
-        let restore = Restore::new(password, share_set.into_inner(), rng)?;
-        let mut connections = connections.into_connections();
-        let futures = connections
-            .as_mut()
-            .iter_mut()
-            .zip(&restore.requests)
-            .map(|(connection, request)| run_attested_interaction(connection, request));
-        let results = try_join_all(futures).await?;
-        let addresses = connections.as_ref().iter().map(|c| c.remote_address());
-        let responses = collect_responses(results, addresses)?;
-        Ok(restore.finalize(&responses)?)
-    }
-
-    pub async fn do_remove<S: AsyncDuplexStream + 'static, Env: PpssSetup<S>>(
-        connections: Env::Connections,
-    ) -> Result<(), Error> {
-        let requests = std::iter::repeat(libsignal_svr3::make_remove_request());
-        let mut connections = connections.into_connections();
-        let futures = connections
-            .as_mut()
-            .iter_mut()
-            .zip(requests)
-            .map(|(connection, request)| run_attested_interaction(connection, request));
-        let results = try_join_all(futures).await?;
-        let addresses = connections.as_ref().iter().map(|c| c.remote_address());
-        // RemoveResponse's are empty, safe to ignore as long as they came
-        let _responses = collect_responses(results, addresses)?;
-        Ok(())
-    }
-
-    pub async fn do_query<S: AsyncDuplexStream + 'static, Env: PpssSetup<S>>(
-        connections: Env::Connections,
-    ) -> Result<u32, Error> {
-        let mut connections = connections.into_connections();
-        let futures = connections
-            .as_mut()
-            .iter_mut()
-            .zip(Query::requests())
-            .map(|(connection, request)| run_attested_interaction(connection, request));
-        let results = try_join_all(futures).await?;
-        let addresses = connections.as_ref().iter().map(|c| c.remote_address());
-        let responses = collect_responses(results, addresses)?;
-        Ok(Query::finalize(&responses)?)
-    }
-
-    fn collect_responses<'a>(
-        results: impl IntoIterator<Item = NextOrClose<Vec<u8>>>,
-        addresses: impl IntoIterator<Item = &'a url::Host>,
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        results
-            .into_iter()
-            .zip(addresses)
-            .map(|(next_or_close, address)| {
-                next_or_close.next_or(Error::Protocol(format!("no response from {}", address)))
-            })
-            .collect()
-    }
-}
-
-#[async_trait]
-pub trait Svr3Client {
-    async fn backup(
-        &self,
-        password: &str,
-        secret: [u8; 32],
-        max_tries: NonZeroU32,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<OpaqueMaskedShareSet, Error>;
-
-    async fn restore(
-        &self,
-        password: &str,
-        share_set: OpaqueMaskedShareSet,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<EvaluationResult, Error>;
-
-    async fn remove(&self) -> Result<(), Error>;
-
-    async fn query(&self) -> Result<u32, Error>;
-}
-
-#[async_trait]
-pub trait Svr3Connect {
-    // Stream is needed for the blanket implementation,
-    // otherwise S would be an unconstrained generic parameter.
-    type Stream;
-    type Env: PpssSetup<Self::Stream>;
-    async fn connect(
-        &self,
-    ) -> Result<<Self::Env as PpssSetup<Self::Stream>>::Connections, enclave::Error>;
-}
-
-#[async_trait]
-impl<T> Svr3Client for T
-where
-    T: Svr3Connect + Sync,
-    T::Stream: AsyncDuplexStream + 'static,
-{
-    async fn backup(
-        &self,
-        password: &str,
-        secret: [u8; 32],
-        max_tries: NonZeroU32,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<OpaqueMaskedShareSet, Error> {
-        ppss_ops::do_backup::<T::Stream, T::Env>(
-            self.connect().await?,
-            password,
-            secret,
-            max_tries,
-            rng,
-        )
-        .await
-    }
-
-    async fn restore(
-        &self,
-        password: &str,
-        share_set: OpaqueMaskedShareSet,
-        rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<EvaluationResult, Error> {
-        ppss_ops::do_restore::<T::Stream, T::Env>(self.connect().await?, password, share_set, rng)
-            .await
-    }
-
-    async fn remove(&self) -> Result<(), Error> {
-        ppss_ops::do_remove::<T::Stream, T::Env>(self.connect().await?).await
-    }
-
-    async fn query(&self) -> Result<u32, Error> {
-        ppss_ops::do_query::<T::Stream, T::Env>(self.connect().await?).await
     }
 }
 
@@ -398,14 +219,14 @@ where
 /// respectively, "next" and "current", but ordering of parameters and actions in
 /// the body of the function make "primary" and "fallback" a better fit.
 pub async fn restore_with_fallback<Primary, Fallback>(
-    clients: (Primary, Fallback),
+    clients: (&Primary, &Fallback),
     password: &str,
     share_set: OpaqueMaskedShareSet,
     rng: &mut (impl CryptoRngCore + Send),
 ) -> Result<EvaluationResult, Error>
 where
-    Primary: Svr3Client + Sync,
-    Fallback: Svr3Client + Sync,
+    Primary: Restore + Sync,
+    Fallback: Restore + Sync,
 {
     let (primary_conn, fallback_conn) = clients;
 
@@ -416,33 +237,37 @@ where
     fallback_conn.restore(password, share_set, rng).await
 }
 
-/// Move the backup from `From` to `To`, representing current and next SVR3
-/// environments, respectively.
+/// Move the backup from `RemoveFrom` to `BackupTo`, representing previous and
+/// current SVR3 environments, respectively.
 ///
-/// Despite the name, no data is _read_ from `From`, and instead must be
-/// provided by the caller just like for an ordinary `backup` call.
+/// No data is _read_ from `RemoveFrom` (types guarantee that), and instead must
+/// be provided by the caller just like for an ordinary `backup` call.
 ///
-/// Moving includes _attempting_ deletion from `From` that can fail, in which
-/// case the error will be ignored. The other alternative implementations could
-/// be:
-/// - Do not attempt deleting from `From`.
+/// Moving includes _attempting_ deletion from `RemoveFrom` that can fail, in
+/// which case the error will be ignored. The other alternative implementations
+/// could be:
+/// - Do not attempt deleting from `RemoveFrom`.
 ///   This would leave the data for harvesting longer than necessary, even
 ///   though the migration period is expected to be relatively short, and the
-///   set of `From` enclaves would have been deleted in the end.
-/// - Ignore the successful write to `To`.
+///   set of `RemoveFrom` enclaves would have been deleted in the end.
+/// - Ignore the successful write to `BackupTo`.
 ///   Despite sounding like a better option, it would make `restore_with_fallback`
-///   more complicated, as the data may have been written to `To`, thus
+///   more complicated, as the data may have been written to `BackupTo`, thus
 ///   rendering it impossible to be used for all restores unconditionally.
-pub async fn migrate_backup<From, To>(
-    clients: (From, To),
+///
+/// Using fine-grained SVR3 traits `Remove` and `Backup` guarantees that only
+/// those operations will possibly happen, that is, no removes will happen from
+/// `BackupTo` client, and no backups to `RemoveFrom`.
+pub async fn migrate_backup<RemoveFrom, BackupTo>(
+    clients: (&RemoveFrom, &BackupTo),
     password: &str,
     secret: [u8; 32],
     max_tries: NonZeroU32,
     rng: &mut (impl CryptoRngCore + Send),
 ) -> Result<OpaqueMaskedShareSet, Error>
 where
-    From: Svr3Client + Sync,
-    To: Svr3Client + Sync,
+    RemoveFrom: Remove + Sync,
+    BackupTo: Backup + Sync,
 {
     let (from_client, to_client) = clients;
     let share_set = to_client.backup(password, secret, max_tries, rng).await?;
@@ -450,42 +275,41 @@ where
     Ok(share_set)
 }
 
-/// Simplest way to connect to an SVR3 Environment in integration tests, command
-/// line tools, and examples.
-pub async fn simple_svr3_connect(
-    env: &Svr3Env<'static>,
-    auth: &Auth,
-) -> Result<<Svr3Env<'static> as PpssSetup<DefaultStream>>::Connections, enclave::Error> {
-    let connector = DirectConnector::new(DnsResolver::default());
-    let sgx_connection = EnclaveEndpointConnection::new(env.sgx(), Duration::from_secs(10));
-    let a =
-        SvrConnection::<Sgx, _>::connect(auth.clone(), &sgx_connection, connector.clone()).await?;
+#[cfg(feature = "test-util")]
+pub mod test_support {
 
-    let nitro_connection = EnclaveEndpointConnection::new(env.nitro(), Duration::from_secs(10));
-    let b = SvrConnection::<Nitro, _>::connect(auth.clone(), &nitro_connection, connector.clone())
-        .await?;
+    use crate::auth::Auth;
+    use crate::enclave::PpssSetup;
+    use crate::env::Svr3Env;
+    use crate::svr3::direct::DirectConnect as _;
 
-    let tpm2snp_connection = EnclaveEndpointConnection::new(env.tpm2snp(), Duration::from_secs(10));
-    let c =
-        SvrConnection::<Tpm2Snp, _>::connect(auth.clone(), &tpm2snp_connection, connector).await?;
-
-    Ok((a, b, c))
+    impl Svr3Env<'static> {
+        /// Simplest way to connect to an SVR3 Environment in integration tests, command
+        /// line tools, and examples.
+        pub async fn connect_directly(
+            &self,
+            auth: &Auth,
+        ) -> <Self as PpssSetup>::ConnectionResults {
+            let endpoints = (self.sgx(), self.nitro(), self.tpm2snp());
+            endpoints.connect(auth).await
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::*;
-
     use assert_matches::assert_matches;
+    use async_trait::async_trait;
     use nonzero_ext::nonzero;
     use rand_core::{OsRng, RngCore};
+
+    use super::*;
 
     fn new_empty_share_set() -> OpaqueMaskedShareSet {
         OpaqueMaskedShareSet {
             inner: SerializableMaskedShareSet {
                 server_ids: vec![],
-                masked_shares: vec![],
-                commitment: [0; 32],
+                masked_secret: vec![],
             },
         }
     }
@@ -534,7 +358,7 @@ mod test {
     }
 
     #[async_trait]
-    impl Svr3Client for TestSvr3Client {
+    impl Backup for TestSvr3Client {
         async fn backup(
             &self,
             _password: &str,
@@ -544,7 +368,17 @@ mod test {
         ) -> Result<OpaqueMaskedShareSet, Error> {
             (self.backup_fn)()
         }
+    }
 
+    #[async_trait]
+    impl Remove for TestSvr3Client {
+        async fn remove(&self) -> Result<(), Error> {
+            (self.remove_fn)()
+        }
+    }
+
+    #[async_trait]
+    impl Restore for TestSvr3Client {
         async fn restore(
             &self,
             _password: &str,
@@ -553,11 +387,10 @@ mod test {
         ) -> Result<EvaluationResult, Error> {
             (self.restore_fn)()
         }
+    }
 
-        async fn remove(&self) -> Result<(), Error> {
-            (self.remove_fn)()
-        }
-
+    #[async_trait]
+    impl Query for TestSvr3Client {
         async fn query(&self) -> Result<u32, Error> {
             unreachable!()
         }
@@ -590,7 +423,7 @@ mod test {
 
         let mut rng = OsRng;
         let result =
-            restore_with_fallback((primary, fallback), "", new_empty_share_set(), &mut rng).await;
+            restore_with_fallback((&primary, &fallback), "", new_empty_share_set(), &mut rng).await;
         assert_matches!(result, Ok(evaluation_result) => assert_eq!(evaluation_result, test_evaluation_result()));
     }
 
@@ -607,7 +440,7 @@ mod test {
 
         let mut rng = OsRng;
         let result =
-            restore_with_fallback((primary, fallback), "", new_empty_share_set(), &mut rng).await;
+            restore_with_fallback((&primary, &fallback), "", new_empty_share_set(), &mut rng).await;
         assert_matches!(result, Err(Error::ConnectionTimedOut));
     }
 
@@ -623,7 +456,7 @@ mod test {
         };
         let mut rng = OsRng;
         let result =
-            restore_with_fallback((primary, fallback), "", new_empty_share_set(), &mut rng).await;
+            restore_with_fallback((&primary, &fallback), "", new_empty_share_set(), &mut rng).await;
         assert_matches!(result, Err(Error::RestoreFailed(31415)));
     }
 
@@ -639,7 +472,7 @@ mod test {
         };
         let mut rng = OsRng;
         let result =
-            restore_with_fallback((primary, fallback), "", new_empty_share_set(), &mut rng).await;
+            restore_with_fallback((&primary, &fallback), "", new_empty_share_set(), &mut rng).await;
         assert_matches!(result, Ok(evaluation_result) => assert_eq!(evaluation_result, test_evaluation_result()));
     }
 
@@ -651,7 +484,7 @@ mod test {
         };
         let mut rng = OsRng;
         let result = migrate_backup(
-            (TestSvr3Client::default(), destination),
+            (&TestSvr3Client::default(), &destination),
             "",
             make_secret(),
             nonzero!(42u32),
@@ -673,7 +506,7 @@ mod test {
         };
         let mut rng = OsRng;
         let result = migrate_backup(
-            (source, destination),
+            (&source, &destination),
             "",
             make_secret(),
             nonzero!(42u32),
@@ -695,7 +528,7 @@ mod test {
         };
         let mut rng = OsRng;
         let result = migrate_backup(
-            (source, destination),
+            (&source, &destination),
             "",
             make_secret(),
             nonzero!(42u32),

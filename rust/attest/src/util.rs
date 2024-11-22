@@ -5,7 +5,7 @@
 
 use std::time::SystemTime;
 
-use boring::asn1::Asn1Time;
+use boring_signal::asn1::Asn1Time;
 use libc::time_t;
 
 /// A replacement for [`std::collections::HashMap`] that performs linear lookups.
@@ -97,9 +97,8 @@ pub(crate) fn system_time_to_asn1_time(
 
 #[cfg(test)]
 mod test {
-    use crate::endian::{UInt16LE, UInt32LE, UInt64LE};
-
     use super::*;
+    use crate::endian::{UInt16LE, UInt32LE, UInt64LE};
 
     #[test]
     fn test_strip_trailing_null_byte() {

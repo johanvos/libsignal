@@ -5,22 +5,21 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use boring::bn::BigNum;
-use boring::ecdsa::EcdsaSig;
-use boring::stack;
-use boring::x509::store::X509StoreBuilder;
-use boring::x509::{X509StoreContext, X509};
+use boring_signal::bn::BigNum;
+use boring_signal::ecdsa::EcdsaSig;
+use boring_signal::stack;
+use boring_signal::x509::store::X509StoreBuilder;
+use boring_signal::x509::{X509StoreContext, X509};
 use ciborium::value::{Integer, Value};
 use prost::{DecodeError, Message};
 use sha2::{Digest, Sha384};
 use subtle::ConstantTimeEq;
 
-use crate::enclave::{self, Claims, Handshake};
+use crate::constants::NITRO_EXPECTED_PCRS;
+use crate::enclave::{self, Claims, Handshake, HandshakeType};
 use crate::proto;
 use crate::svr2::RaftConfig;
 use crate::util::SmallMap;
-
-use crate::constants::NITRO_EXPECTED_PCRS;
 
 // A type for Platform Configuration Register values
 // They are Sha-384 hashes, 48 byte long.
@@ -46,8 +45,11 @@ impl Handshake {
         let doc = cose_sign1.extract_attestation_doc(now)?;
         let attestation_data = doc.extract_attestation_data(expected_pcrs)?;
         let attestation_data = attestation_data.ok_or(NitroError::UserDataMissing)?;
-        Self::with_claims(Claims::from_attestation_data(attestation_data)?)?
-            .validate(expected_raft_config)
+        Self::with_claims(
+            Claims::from_attestation_data(attestation_data)?,
+            HandshakeType::PostQuantum,
+        )?
+        .validate(expected_raft_config)
     }
 }
 
@@ -95,8 +97,8 @@ impl From<ciborium::de::Error<std::io::Error>> for NitroError {
     }
 }
 
-impl From<boring::error::ErrorStack> for NitroError {
-    fn from(err: boring::error::ErrorStack) -> NitroError {
+impl From<boring_signal::error::ErrorStack> for NitroError {
+    fn from(err: boring_signal::error::ErrorStack) -> NitroError {
         NitroError::InvalidCertificate(err.to_string())
     }
 }

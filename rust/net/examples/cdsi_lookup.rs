@@ -6,15 +6,15 @@
 
 use std::time::Duration;
 
-use libsignal_net::infra::connection_manager::ConnectionManager;
-use libsignal_net::infra::dns::DnsResolver;
-use tokio::io::AsyncBufReadExt as _;
-
 use libsignal_net::auth::Auth;
 use libsignal_net::cdsi::{CdsiConnection, LookupError, LookupRequest, LookupResponse};
 use libsignal_net::enclave::{Cdsi, EnclaveEndpointConnection};
+use libsignal_net::infra::connection_manager::ConnectionManager;
+use libsignal_net::infra::dns::DnsResolver;
 use libsignal_net::infra::tcp_ssl::DirectConnector as TcpSslTransportConnector;
+use libsignal_net::infra::utils::ObservableEvent;
 use libsignal_net::infra::TransportConnector;
+use tokio::io::AsyncBufReadExt as _;
 
 async fn cdsi_lookup(
     auth: Auth,
@@ -24,7 +24,7 @@ async fn cdsi_lookup(
     timeout: Duration,
 ) -> Result<LookupResponse, LookupError> {
     let connected = CdsiConnection::connect(endpoint, transport_connector, auth).await?;
-    let (_token, remaining_response) = libsignal_net::utils::timeout(
+    let (_token, remaining_response) = libsignal_net::infra::utils::timeout(
         timeout,
         LookupError::ConnectionTimedOut,
         connected.send_request(request),
@@ -54,8 +54,11 @@ async fn main() {
         ..Default::default()
     };
     let env = libsignal_net::env::PROD;
-    let endpoint_connection = EnclaveEndpointConnection::new(&env.cdsi, Duration::from_secs(10));
-    let transport_connection = TcpSslTransportConnector::new(DnsResolver::default());
+    let network_change_event = ObservableEvent::default();
+    let endpoint_connection =
+        EnclaveEndpointConnection::new(&env.cdsi, Duration::from_secs(10), &network_change_event);
+    let transport_connection =
+        TcpSslTransportConnector::new(DnsResolver::new(&network_change_event));
     let cdsi_response = cdsi_lookup(
         Auth { username, password },
         &endpoint_connection,

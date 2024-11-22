@@ -9,24 +9,30 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use derive_where::derive_where;
+use futures_util::FutureExt;
 use http::header::ToStrError;
 use http::status::StatusCode;
+use libsignal_net_infra::service::{
+    CancellationReason, CancellationToken, RemoteAddressInfo, ServiceConnector,
+};
+use libsignal_net_infra::ws::{
+    NextOrClose, TextOrBinary, WebSocketClient, WebSocketClientConnector, WebSocketClientReader,
+    WebSocketClientWriter, WebSocketServiceError,
+};
+use libsignal_net_infra::{
+    AsyncDuplexStream, ConnectionInfo, ConnectionParams, TransportConnector,
+};
 use prost::Message;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::chat::{
-    ChatMessageType, ChatService, ChatServiceError, MessageProto, RemoteAddressInfo, Request,
-    RequestProto, Response, ResponseProto,
+    ChatMessageType, ChatService, ChatServiceError, MessageProto, Request, RequestProto, Response,
+    ResponseProto,
 };
-use crate::infra::reconnect::{ServiceConnector, ServiceStatus};
-use crate::infra::ws::{
-    NextOrClose, TextOrBinary, WebSocketClient, WebSocketClientConnector, WebSocketClientReader,
-    WebSocketClientWriter, WebSocketConnectError, WebSocketServiceError,
-};
-use crate::infra::{AsyncDuplexStream, ConnectionInfo, ConnectionParams, TransportConnector};
 use crate::proto::chat_websocket::web_socket_message::Type;
+use crate::ws::{WebSocketServiceConnectError, WebSocketServiceConnector};
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy)]
 struct RequestId {
@@ -67,7 +73,7 @@ pub enum ServerEvent<S> {
         request_proto: RequestProto,
         response_sender: ResponseSender<S>,
     },
-    Stopped,
+    Stopped(ChatServiceError),
 }
 
 impl<S: AsyncDuplexStream> ServerEvent<S> {
@@ -141,7 +147,7 @@ impl PendingMessagesMap {
 
 #[derive_where(Clone)]
 pub(super) struct ChatOverWebSocketServiceConnector<T: TransportConnector> {
-    ws_client_connector: WebSocketClientConnector<T, ChatServiceError>,
+    ws_client_connector: WebSocketServiceConnector<WebSocketClientConnector<T, ChatServiceError>>,
     incoming_tx: Arc<Mutex<mpsc::Sender<ServerEvent<T::Stream>>>>,
 }
 
@@ -151,7 +157,7 @@ impl<T: TransportConnector> ChatOverWebSocketServiceConnector<T> {
         incoming_tx: mpsc::Sender<ServerEvent<T::Stream>>,
     ) -> Self {
         Self {
-            ws_client_connector,
+            ws_client_connector: WebSocketServiceConnector::new(ws_client_connector),
             incoming_tx: Arc::new(Mutex::new(incoming_tx)),
         }
     }
@@ -161,8 +167,7 @@ impl<T: TransportConnector> ChatOverWebSocketServiceConnector<T> {
 impl<T: TransportConnector> ServiceConnector for ChatOverWebSocketServiceConnector<T> {
     type Service = ChatOverWebSocket<T::Stream>;
     type Channel = (WebSocketStream<T::Stream>, ConnectionInfo);
-    type ConnectError = WebSocketConnectError;
-    type StartError = ChatServiceError;
+    type ConnectError = WebSocketServiceConnectError;
 
     async fn connect_channel(
         &self,
@@ -173,16 +178,15 @@ impl<T: TransportConnector> ServiceConnector for ChatOverWebSocketServiceConnect
             .await
     }
 
-    fn start_service(
-        &self,
-        channel: Self::Channel,
-    ) -> (Self::Service, ServiceStatus<Self::StartError>) {
+    fn start_service(&self, channel: Self::Channel) -> (Self::Service, CancellationToken) {
         let (ws_client, service_status) = self.ws_client_connector.start_service(channel);
-        let WebSocketClient {
-            ws_client_writer,
-            ws_client_reader,
+        let (
+            WebSocketClient {
+                ws_client_writer,
+                ws_client_reader,
+            },
             connection_info,
-        } = ws_client;
+        ) = ws_client;
         let pending_messages: Arc<Mutex<PendingMessagesMap>> = Default::default();
         tokio::spawn(reader_task(
             ws_client_reader,
@@ -194,7 +198,7 @@ impl<T: TransportConnector> ServiceConnector for ChatOverWebSocketServiceConnect
         (
             ChatOverWebSocket {
                 ws_client_writer,
-                service_status: service_status.clone(),
+                service_cancellation: service_status.clone(),
                 pending_messages,
                 connection_info,
             },
@@ -208,7 +212,7 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
     ws_client_writer: WebSocketClientWriter<S, ChatServiceError>,
     incoming_tx: Arc<Mutex<mpsc::Sender<ServerEvent<S>>>>,
     pending_messages: Arc<Mutex<PendingMessagesMap>>,
-    service_status: ServiceStatus<ChatServiceError>,
+    service_cancellation: CancellationToken,
 ) {
     const LONG_REQUEST_PROCESSING_THRESHOLD: Duration = Duration::from_millis(500);
 
@@ -219,23 +223,32 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
 
     let mut previous_request_paths_for_logging =
         VecDeque::with_capacity(incoming_tx.max_capacity());
-    let mut has_ever_sent_server_event = false;
 
-    loop {
+    let error = loop {
         let data = match ws_client_reader.next().await {
             Ok(NextOrClose::Next(TextOrBinary::Binary(data))) => data,
             Ok(NextOrClose::Next(TextOrBinary::Text(_))) => {
                 log::info!("Text frame received on chat websocket");
-                service_status.stop_service_with_error(ChatServiceError::UnexpectedFrameReceived);
-                break;
+                service_cancellation.cancel(CancellationReason::ProtocolError);
+                break ChatServiceError::UnexpectedFrameReceived;
             }
             Ok(NextOrClose::Close(_)) => {
-                service_status.stop_service_with_error(WebSocketServiceError::ChannelClosed.into());
-                break;
+                if service_cancellation.cancelled().now_or_never()
+                    == Some(CancellationReason::ExplicitDisconnect)
+                {
+                    break ChatServiceError::ServiceIntentionallyDisconnected;
+                }
+                service_cancellation.cancel(CancellationReason::RemoteClose);
+                break WebSocketServiceError::ChannelClosed.into();
             }
             Err(e) => {
-                service_status.stop_service_with_error(e);
-                break;
+                if service_cancellation.cancelled().now_or_never()
+                    == Some(CancellationReason::ExplicitDisconnect)
+                {
+                    break ChatServiceError::ServiceIntentionallyDisconnected;
+                }
+                service_cancellation.cancel(CancellationReason::ServiceError);
+                break e;
             }
         };
 
@@ -246,8 +259,8 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
                 let server_request = match ServerEvent::new(req, ws_client_writer.clone()) {
                     Ok(server_request) => server_request,
                     Err(e) => {
-                        service_status.stop_service_with_error(e);
-                        break;
+                        service_cancellation.cancel(CancellationReason::ProtocolError);
+                        break e;
                     }
                 };
 
@@ -256,9 +269,8 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
                 let request_send_elapsed = request_send_start.elapsed();
 
                 if delivery_result.is_err() {
-                    service_status.stop_service_with_error(
-                        ChatServiceError::FailedToPassMessageToIncomingChannel,
-                    );
+                    service_cancellation.cancel(CancellationReason::RemoteClose);
+                    break ChatServiceError::FailedToPassMessageToIncomingChannel;
                 }
 
                 if previous_request_paths_for_logging.len() == incoming_tx.max_capacity() {
@@ -282,7 +294,6 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
                     }
                 }
                 previous_request_paths_for_logging.push_back(request_path);
-                has_ever_sent_server_event = true;
             }
             Ok(ChatMessage::Response(id, res)) => {
                 let map = &mut pending_messages.lock().await;
@@ -293,22 +304,16 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
                 }
             }
             Err(e) => {
-                service_status.stop_service_with_error(e);
+                service_cancellation.cancel(CancellationReason::ProtocolError);
+                break e;
             }
         }
-    }
+    };
 
-    if has_ever_sent_server_event {
-        // We only need a Stopped event to separate the events from different connections. If there
-        // haven't been any events from this connection, we don't bother. This also avoids sending
-        // events for the unauth socket, even though it still has to read responses.
-        // (But don't worry about delivery failure here; if no one's listening, the event is
-        // superfluous anyway.)
-        _ = incoming_tx.send(ServerEvent::Stopped).await;
-    }
+    _ = incoming_tx.send(ServerEvent::Stopped(error)).await;
 
     // before terminating the task, marking channel as inactive
-    service_status.stop_service();
+    service_cancellation.cancel(CancellationReason::RemoteClose);
 
     // Clear the pending messages map. These requests don't wait on the service status just in case
     // a response comes in late; dropping the response senders is how we cancel them.
@@ -319,7 +324,7 @@ async fn reader_task<S: AsyncDuplexStream + 'static>(
 #[derive(Debug)]
 pub struct ChatOverWebSocket<S> {
     ws_client_writer: WebSocketClientWriter<S, ChatServiceError>,
-    service_status: ServiceStatus<ChatServiceError>,
+    service_cancellation: CancellationToken,
     pending_messages: Arc<Mutex<PendingMessagesMap>>,
     connection_info: ConnectionInfo,
 }
@@ -337,8 +342,8 @@ where
 {
     async fn send(&self, msg: Request, timeout: Duration) -> Result<Response, ChatServiceError> {
         // checking if channel has been closed
-        if self.service_status.is_stopped() {
-            return Err(WebSocketServiceError::ChannelClosed.into());
+        if self.service_cancellation.is_cancelled() {
+            return Err(ChatServiceError::ServiceIntentionallyDisconnected);
         }
 
         let (response_tx, response_rx) = oneshot::channel::<ResponseProto>();
@@ -374,7 +379,8 @@ where
     }
 
     async fn disconnect(&self) {
-        self.service_status.stop_service()
+        self.service_cancellation
+            .cancel(CancellationReason::ExplicitDisconnect)
     }
 }
 
@@ -395,8 +401,7 @@ fn decode_and_validate(data: &[u8]) -> Result<ChatMessage, ChatServiceError> {
         _ => Err(ChatServiceError::IncomingDataInvalid),
     }
 }
-
-fn response_for_code(id: u64, code: StatusCode) -> MessageProto {
+pub(super) fn response_for_code(id: u64, code: StatusCode) -> MessageProto {
     MessageProto {
         r#type: Some(Type::Response.into()),
         response: Some(ResponseProto {
@@ -445,6 +450,13 @@ mod test {
     use futures_util::{SinkExt, StreamExt};
     use http::uri::PathAndQuery;
     use http::{Method, StatusCode};
+    use libsignal_net_infra::service::CancellationReason;
+    use libsignal_net_infra::testutil::{
+        InMemoryWarpConnector, NoReconnectService, TestError, TIMEOUT_DURATION,
+    };
+    use libsignal_net_infra::ws::{
+        WebSocketClientConnector, WebSocketConfig, WebSocketServiceError,
+    };
     use prost::Message;
     use tokio::io::DuplexStream;
     use tokio::sync::mpsc::Receiver;
@@ -458,11 +470,6 @@ mod test {
         ChatOverWebSocketServiceConnector, ChatServiceError, RequestId, ServerEvent,
     };
     use crate::chat::{ChatMessageType, ChatService, MessageProto, ResponseProto};
-
-    use crate::infra::test::shared::{
-        InMemoryWarpConnector, NoReconnectService, TestError, TIMEOUT_DURATION,
-    };
-    use crate::infra::ws::{WebSocketClientConnector, WebSocketConfig, WebSocketServiceError};
     use crate::proto::chat_websocket::WebSocketMessage;
 
     fn test_ws_config() -> WebSocketConfig {
@@ -488,12 +495,12 @@ mod test {
         let ws_config = test_ws_config();
         let time_to_wait = ws_config.max_idle_time * 2;
         let (ws_chat, _) = create_ws_chat_service(ws_config, ws_server).await;
-        assert!(!ws_chat.service_status().unwrap().is_stopped());
+        assert!(!ws_chat.service_status().unwrap().is_cancelled());
 
         // sleeping for a period of time long enough to stop the service
         // in case of missing PONG responses
         tokio::time::sleep(time_to_wait).await;
-        assert!(!ws_chat.service_status().unwrap().is_stopped());
+        assert!(!ws_chat.service_status().unwrap().is_cancelled());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -507,12 +514,12 @@ mod test {
         });
 
         let (ws_chat, _) = create_ws_chat_service(ws_config, ws_server).await;
-        assert!(!ws_chat.service_status().unwrap().is_stopped());
+        assert!(!ws_chat.service_status().unwrap().is_cancelled());
 
         // sleeping for a period of time long enough for the service to stop,
         // which is what should happen since the PONG messages are not sent back
         tokio::time::sleep(duration).await;
-        assert!(ws_chat.service_status().unwrap().is_stopped());
+        assert!(ws_chat.service_status().unwrap().is_cancelled());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -533,12 +540,12 @@ mod test {
         });
 
         let (ws_chat, _) = create_ws_chat_service(ws_config, ws_server).await;
-        assert!(!ws_chat.service_status().unwrap().is_stopped());
+        assert!(!ws_chat.service_status().unwrap().is_cancelled());
 
         // sleeping for a period of time long enough to stop the service
         // in case of missing PONG responses
         tokio::time::sleep(time_to_wait).await;
-        assert!(ws_chat.service_status().unwrap().is_stopped());
+        assert!(ws_chat.service_status().unwrap().is_cancelled());
         // making sure server logic completed in the expected way
         validate_server_stopped_successfully(server_res_rx).await;
     }
@@ -562,12 +569,12 @@ mod test {
 
         let ws_config = test_ws_config();
         let (ws_chat, _) = create_ws_chat_service(ws_config, ws_server).await;
-        assert!(!ws_chat.service_status().unwrap().is_stopped());
+        assert!(!ws_chat.service_status().unwrap().is_cancelled());
 
         // sleeping for a period of time long enough to stop the service
         // in case of missing PONG responses
         tokio::time::sleep(time_to_wait).await;
-        assert!(ws_chat.service_status().unwrap().is_stopped());
+        assert!(ws_chat.service_status().unwrap().is_cancelled());
         // making sure server logic completed in the expected way
         validate_server_stopped_successfully(server_res_rx).await;
     }
@@ -595,13 +602,26 @@ mod test {
         });
 
         let ws_config = test_ws_config();
-        let (ws_chat, _) = create_ws_chat_service(ws_config, ws_server).await;
+        let (ws_chat, mut incoming_rx) = create_ws_chat_service(ws_config, ws_server).await;
 
         let response = ws_chat
             .send(test_request(Method::GET, "/"), TIMEOUT_DURATION)
             .await;
         response.expect("response");
         validate_server_running(server_res_rx).await;
+
+        // now we're disconnecting manually in which case we expect a `Stopped` event
+        // with `ChatServiceError::WebSocket(WebSocketServiceError::ChannelClosed)` error
+        let service_status = ws_chat.service_status().expect("some status");
+        service_status.cancel(CancellationReason::ProtocolError);
+        service_status.cancelled().await;
+        let event = incoming_rx.recv().await;
+        assert_matches!(
+            event,
+            Some(ServerEvent::Stopped(ChatServiceError::WebSocket(
+                WebSocketServiceError::ChannelClosed
+            )))
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -737,12 +757,12 @@ mod test {
 
         assert_matches!(
             incoming_rx.recv().await.expect("server request"),
-            ServerEvent::Stopped
+            ServerEvent::Stopped(_)
         );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn ws_service_skips_stop_event_without_requests() {
+    async fn ws_service_receives_stopped_event_if_server_disconnects() {
         // creating a server that accepts a request, responds, then closes the connection.
         let (ws_server, server_res_rx) = ws_warp_filter(move |websocket| async move {
             let (mut tx, mut rx) = websocket.split();
@@ -774,15 +794,16 @@ mod test {
 
         assert_matches!(
             incoming_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
+            Ok(ServerEvent::Stopped(ChatServiceError::WebSocket(
+                WebSocketServiceError::Protocol(_)
+            )))
         );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn ws_service_correctly_handles_multiple_in_flight_requests() {
         // creating a server that responds to requests with 200 after some request processing time
-        const REQUEST_PROCESSING_DURATION: Duration =
-            Duration::from_millis(TIMEOUT_DURATION.as_millis() as u64 / 2);
+        let request_processing_duration = TIMEOUT_DURATION / 2;
         let start = Instant::now();
         let (ws_server, _) = ws_warp_filter(move |websocket| async move {
             let (tx, mut rx) = websocket.split();
@@ -795,7 +816,7 @@ mod test {
                     response_for_request(&request, StatusCode::OK).expect("response");
                 let shared_sender = shared_sender.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(REQUEST_PROCESSING_DURATION).await;
+                    tokio::time::sleep(request_processing_duration).await;
                     let mut sender = shared_sender.lock().await;
                     let _ignore_result = (*sender)
                         .send(warp::ws::Message::binary(response_proto.encode_to_vec()))
@@ -823,7 +844,7 @@ mod test {
 
         // And now making sure that both requests were in fact processed asynchronously,
         // i.e. one was not blocked on the other.
-        assert_eq!(start + REQUEST_PROCESSING_DURATION, Instant::now());
+        assert_eq!(start + request_processing_duration, Instant::now());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

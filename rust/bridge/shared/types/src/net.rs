@@ -3,31 +3,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::*;
+use std::marker::PhantomData;
+use std::num::{NonZeroU16, NonZeroU32};
+use std::panic::RefUnwindSafe;
+use std::sync::Arc;
+
 use aes_gcm_siv::aead::rand_core::CryptoRngCore;
 use async_trait::async_trait;
-use http::uri::PathAndQuery;
+use futures_util::future::join3;
 use libsignal_net::auth::Auth;
 use libsignal_net::enclave::{
     Cdsi, EnclaveEndpoint, EnclaveEndpointConnection, EnclaveKind, Nitro, PpssSetup, Sgx, Tpm2Snp,
 };
-use libsignal_net::env::{add_user_agent_header, Env, Svr3Env};
+use libsignal_net::env::{add_user_agent_header, Env, Svr3Env, UserAgent};
 use libsignal_net::infra::connection_manager::MultiRouteConnectionManager;
 use libsignal_net::infra::dns::DnsResolver;
-use libsignal_net::infra::tcp_ssl::{
-    DirectConnector as TcpSslDirectConnector, ProxyConnector as TcpSslProxyConnector,
-    TcpSslConnector, TcpSslConnectorStream,
-};
-use libsignal_net::infra::{make_ws_config, EndpointConnection};
+use libsignal_net::infra::host::Host;
+use libsignal_net::infra::tcp_ssl::proxy::tls::TlsProxyConnector as TcpSslProxyConnector;
+use libsignal_net::infra::tcp_ssl::{DirectConnector as TcpSslDirectConnector, TcpSslConnector};
+use libsignal_net::infra::timeouts::ONE_ROUTE_CONNECTION_TIMEOUT;
+use libsignal_net::infra::utils::ObservableEvent;
+use libsignal_net::infra::EndpointConnection;
 use libsignal_net::svr::SvrConnection;
-use libsignal_net::svr3::{
-    Error, OpaqueMaskedShareSet, Svr3Client as Svr3ClientTrait, Svr3Connect,
-};
-use libsignal_net::timeouts::ONE_ROUTE_CONNECTION_TIMEOUT;
+use libsignal_net::svr3::traits::*;
+use libsignal_net::svr3::{Error, OpaqueMaskedShareSet};
 use libsignal_svr3::EvaluationResult;
-use std::marker::PhantomData;
-use std::num::{NonZeroU16, NonZeroU32};
-use std::panic::RefUnwindSafe;
+
+use crate::*;
 
 pub mod cdsi;
 pub mod chat;
@@ -44,7 +46,7 @@ pub enum Environment {
 }
 
 impl Environment {
-    fn env<'a>(self) -> Env<'a, Svr3Env<'a>> {
+    pub fn env<'a>(self) -> Env<'a, Svr3Env<'a>> {
         match self {
             Self::Staging => libsignal_net::env::STAGING,
             Self::Prod => libsignal_net::env::PROD,
@@ -52,54 +54,132 @@ impl Environment {
     }
 }
 
-pub struct ConnectionManager {
+type Svr3EndpointConnections = (
+    EnclaveEndpointConnection<Sgx, MultiRouteConnectionManager>,
+    EnclaveEndpointConnection<Nitro, MultiRouteConnectionManager>,
+    EnclaveEndpointConnection<Tpm2Snp, MultiRouteConnectionManager>,
+);
+
+struct EndpointConnections {
     chat: EndpointConnection<MultiRouteConnectionManager>,
     cdsi: EnclaveEndpointConnection<Cdsi, MultiRouteConnectionManager>,
-    svr3: (
-        EnclaveEndpointConnection<Sgx, MultiRouteConnectionManager>,
-        EnclaveEndpointConnection<Nitro, MultiRouteConnectionManager>,
-        EnclaveEndpointConnection<Tpm2Snp, MultiRouteConnectionManager>,
-    ),
+    svr3: Svr3EndpointConnections,
+}
+
+impl EndpointConnections {
+    fn new(
+        env: &Env<'static, Svr3Env<'static>>,
+        user_agent: &str,
+        use_fallbacks: bool,
+        network_change_event: &ObservableEvent,
+    ) -> Self {
+        log::info!(
+            "Creating endpoint connections (fallbacks {}) for {} and others",
+            if use_fallbacks { "enabled" } else { "disabled" },
+            // Note: this is *not* using log_safe_domain, because it is always the direct route.
+            // Either it's chat.signal.org, chat.staging.signal.org, or something that indicates
+            // testing. (Or the person running this isn't Signal.)
+            env.chat_domain_config.connect.hostname
+        );
+        let user_agent = UserAgent::with_libsignal_version(user_agent);
+        let chat = libsignal_net::chat::endpoint_connection(
+            &env.chat_domain_config.connect,
+            &user_agent,
+            use_fallbacks,
+            network_change_event,
+        );
+        let cdsi =
+            Self::endpoint_connection(&env.cdsi, &user_agent, use_fallbacks, network_change_event);
+        let svr3 = (
+            Self::endpoint_connection(
+                env.svr3.sgx(),
+                &user_agent,
+                use_fallbacks,
+                network_change_event,
+            ),
+            Self::endpoint_connection(
+                env.svr3.nitro(),
+                &user_agent,
+                use_fallbacks,
+                network_change_event,
+            ),
+            Self::endpoint_connection(
+                env.svr3.tpm2snp(),
+                &user_agent,
+                use_fallbacks,
+                network_change_event,
+            ),
+        );
+        Self { chat, cdsi, svr3 }
+    }
+
+    fn endpoint_connection<E: EnclaveKind>(
+        endpoint: &EnclaveEndpoint<'static, E>,
+        user_agent: &UserAgent,
+        include_fallback: bool,
+        network_change_event: &ObservableEvent,
+    ) -> EnclaveEndpointConnection<E, MultiRouteConnectionManager> {
+        let params = if include_fallback {
+            endpoint
+                .domain_config
+                .connect
+                .connection_params_with_fallback()
+        } else {
+            vec![endpoint.domain_config.connect.direct_connection_params()]
+        };
+        let params = add_user_agent_header(params, user_agent);
+        EnclaveEndpointConnection::new_multi(
+            endpoint,
+            params,
+            ONE_ROUTE_CONNECTION_TIMEOUT,
+            network_change_event,
+        )
+    }
+}
+
+pub struct ConnectionManager {
+    env: Env<'static, Svr3Env<'static>>,
+    user_agent: String,
+    // We could split this up to a separate mutex on each kind of connection,
+    // but we don't hold it for very long anyway (just enough to clone the Arc).
+    endpoints: std::sync::Mutex<Arc<EndpointConnections>>,
     transport_connector: std::sync::Mutex<TcpSslConnector>,
+    network_change_event: ObservableEvent,
 }
 
 impl RefUnwindSafe for ConnectionManager {}
 
 impl ConnectionManager {
-    pub fn new(environment: Environment, user_agent: String) -> Self {
+    pub fn new(environment: Environment, user_agent: &str) -> Self {
         log::info!("Initializing connection manager for {}...", &environment);
+        Self::new_from_static_environment(environment.env(), user_agent)
+    }
+
+    pub fn new_from_static_environment(
+        env: Env<'static, Svr3Env<'static>>,
+        user_agent: &str,
+    ) -> Self {
+        let network_change_event = ObservableEvent::new();
         let dns_resolver =
-            DnsResolver::new_with_static_fallback(environment.env().static_fallback());
+            DnsResolver::new_with_static_fallback(env.static_fallback(), &network_change_event);
         let transport_connector =
             std::sync::Mutex::new(TcpSslDirectConnector::new(dns_resolver).into());
-        let chat_endpoint =
-            PathAndQuery::from_static(libsignal_net::env::constants::WEB_SOCKET_PATH);
-        let chat_connection_params = environment
-            .env()
-            .chat_domain_config
-            .connection_params_with_fallback();
-        let chat_connection_params = add_user_agent_header(chat_connection_params, &user_agent);
-        let chat_ws_config = make_ws_config(chat_endpoint, ONE_ROUTE_CONNECTION_TIMEOUT);
+        let endpoints = std::sync::Mutex::new(
+            EndpointConnections::new(&env, user_agent, false, &network_change_event).into(),
+        );
         Self {
-            chat: EndpointConnection::new_multi(
-                chat_connection_params,
-                ONE_ROUTE_CONNECTION_TIMEOUT,
-                chat_ws_config,
-            ),
-            cdsi: Self::endpoint_connection(&environment.env().cdsi, &user_agent),
-            svr3: (
-                Self::endpoint_connection(environment.env().svr3.sgx(), &user_agent),
-                Self::endpoint_connection(environment.env().svr3.nitro(), &user_agent),
-                Self::endpoint_connection(environment.env().svr3.tpm2snp(), &user_agent),
-            ),
+            env,
+            user_agent: user_agent.to_owned(),
+            endpoints,
             transport_connector,
+            network_change_event,
         }
     }
 
     pub fn set_proxy(&self, host: &str, port: Option<NonZeroU16>) -> Result<(), std::io::Error> {
+        let host = Host::parse_as_ip_or_domain(host);
+
         let mut guard = self.transport_connector.lock().expect("not poisoned");
-        // We take port as an i32 because Java 'short' is signed and thus can't represent all port
-        // numbers, and we want too-large port numbers to be handled the same way as 0.
         match port {
             Some(port) => {
                 let proxy_addr = (host, port);
@@ -143,13 +223,22 @@ impl ConnectionManager {
         guard.set_ipv6_enabled(ipv6_enabled);
     }
 
-    fn endpoint_connection<E: EnclaveKind>(
-        endpoint: &EnclaveEndpoint<'static, E>,
-        user_agent: &str,
-    ) -> EnclaveEndpointConnection<E, MultiRouteConnectionManager> {
-        let params = endpoint.domain_config.connection_params_with_fallback();
-        let params = add_user_agent_header(params, user_agent);
-        EnclaveEndpointConnection::new_multi(endpoint, params, ONE_ROUTE_CONNECTION_TIMEOUT)
+    /// Resets the endpoint connections to include or exclude censorship circumvention routes.
+    ///
+    /// This is not itself a network change event; existing working connections are expected to
+    /// continue to work, and existing failing connections will continue to fail.
+    pub fn set_censorship_circumvention_enabled(&self, enabled: bool) {
+        let new_endpoints = EndpointConnections::new(
+            &self.env,
+            &self.user_agent,
+            enabled,
+            &self.network_change_event,
+        );
+        *self.endpoints.lock().expect("not poisoned") = Arc::new(new_endpoints);
+    }
+
+    pub fn on_network_change(&self) {
+        self.network_change_event.fire()
     }
 }
 
@@ -195,31 +284,29 @@ impl<'a> Svr3Clients<'a> {
 
 #[async_trait]
 impl<'a> Svr3Connect for Svr3Client<'a, CurrentVersion> {
-    type Stream = TcpSslConnectorStream;
     type Env = Svr3Env<'static>;
 
-    async fn connect(
-        &self,
-    ) -> Result<<Self::Env as PpssSetup<Self::Stream>>::Connections, libsignal_net::enclave::Error>
-    {
+    async fn connect(&self) -> <Self::Env as PpssSetup>::ConnectionResults {
         let ConnectionManager {
-            svr3: (sgx, nitro, tpm2snp),
+            endpoints,
             transport_connector,
             ..
         } = &self.connection_manager;
         let transport_connector = transport_connector.lock().expect("not poisoned").clone();
-        let sgx =
-            SvrConnection::connect(self.auth.clone(), sgx, transport_connector.clone()).await?;
-        let nitro =
-            SvrConnection::connect(self.auth.clone(), nitro, transport_connector.clone()).await?;
-        let tpm2snp =
-            SvrConnection::connect(self.auth.clone(), tpm2snp, transport_connector).await?;
-        Ok((sgx, nitro, tpm2snp))
+        let endpoints = endpoints.lock().expect("not poisoned").clone();
+        let (sgx, nitro, tpm2snp) = &endpoints.svr3;
+        let (sgx, nitro, tpm2snp) = join3(
+            SvrConnection::connect(self.auth.clone(), sgx, transport_connector.clone()),
+            SvrConnection::connect(self.auth.clone(), nitro, transport_connector.clone()),
+            SvrConnection::connect(self.auth.clone(), tpm2snp, transport_connector),
+        )
+        .await;
+        (sgx, nitro, tpm2snp)
     }
 }
 
 #[async_trait]
-impl<'a> Svr3ClientTrait for Svr3Client<'a, PreviousVersion> {
+impl<'a> Backup for Svr3Client<'a, PreviousVersion> {
     async fn backup(
         &self,
         _password: &str,
@@ -229,7 +316,10 @@ impl<'a> Svr3ClientTrait for Svr3Client<'a, PreviousVersion> {
     ) -> Result<OpaqueMaskedShareSet, Error> {
         empty_env::backup().await
     }
+}
 
+#[async_trait]
+impl<'a> Restore for Svr3Client<'a, PreviousVersion> {
     async fn restore(
         &self,
         _password: &str,
@@ -238,20 +328,37 @@ impl<'a> Svr3ClientTrait for Svr3Client<'a, PreviousVersion> {
     ) -> Result<EvaluationResult, Error> {
         empty_env::restore().await
     }
+}
 
+#[async_trait]
+impl<'a> Remove for Svr3Client<'a, PreviousVersion> {
     async fn remove(&self) -> Result<(), Error> {
         empty_env::remove().await
     }
+}
 
+#[async_trait]
+impl<'a> Query for Svr3Client<'a, PreviousVersion> {
     async fn query(&self) -> Result<u32, Error> {
         empty_env::query().await
+    }
+}
+
+#[async_trait]
+impl<'a> Rotate for Svr3Client<'a, PreviousVersion> {
+    async fn rotate(
+        &self,
+        _share_set: OpaqueMaskedShareSet,
+        _rng: &mut (impl CryptoRngCore + Send),
+    ) -> Result<(), Error> {
+        empty_env::rotate().await
     }
 }
 
 // These functions define the behavior of the empty `PreviousVersion`
 // when there is no migration going on.
 // When there _is_ migration both current and previous clients should instead
-// implement `Svr3Connect` and use the blanket implementation of `Svr3Client`.
+// implement `Svr3Connect` and use the blanket implementations of the traits.
 mod empty_env {
     use super::*;
 
@@ -282,16 +389,31 @@ mod empty_env {
     pub async fn query() -> Result<u32, Error> {
         Err(Error::DataMissing)
     }
+
+    pub async fn rotate() -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use assert_matches::assert_matches;
     use test_case::test_case;
+
+    use super::*;
 
     #[test_case(Environment::Staging; "staging")]
     #[test_case(Environment::Prod; "prod")]
     fn can_create_connection_manager(env: Environment) {
-        let _ = ConnectionManager::new(env, "test-user-agent".to_string());
+        let _ = ConnectionManager::new(env, "test-user-agent");
+    }
+
+    #[test]
+    fn connection_manager_invalid_after_invalid_host_port() {
+        let manager = ConnectionManager::new(Environment::Staging, "test-user-agent");
+        // This is not a valid port and so should make the ConnectionManager "invalid".
+        assert_matches!(manager.set_proxy("proxy.host", None), Err(e) if e.kind() == std::io::ErrorKind::InvalidInput);
+        let transport_connector = manager.transport_connector.lock().expect("not poisoned");
+        assert_matches!(&*transport_connector, TcpSslConnector::Invalid(_))
     }
 }

@@ -5,10 +5,8 @@
 
 use libsignal_net::auth::Auth;
 use libsignal_net::cdsi::{self, CdsiConnection, ClientResponseCollector, Token};
-use libsignal_net::infra::tcp_ssl::TcpSslConnectorStream;
 
 use crate::net::ConnectionManager;
-
 use crate::*;
 
 #[cfg(feature = "jni")]
@@ -27,6 +25,8 @@ pub enum CdsiError {
     ParseError,
     /// Request token was invalid
     InvalidToken,
+    /// Response token was missing
+    NoTokenInResponse,
     /// Server error: {reason}
     Server { reason: &'static str },
 }
@@ -44,7 +44,7 @@ bridge_as_handle!(LookupRequest);
 
 pub struct CdsiLookup {
     pub token: Token,
-    remaining: std::sync::Mutex<Option<ClientResponseCollector<TcpSslConnectorStream>>>,
+    remaining: std::sync::Mutex<Option<ClientResponseCollector>>,
 }
 
 impl CdsiLookup {
@@ -58,8 +58,12 @@ impl CdsiLookup {
             .lock()
             .expect("not poisoned")
             .clone();
-        let connected =
-            CdsiConnection::connect(&connection_manager.cdsi, transport_connector, auth).await?;
+        let endpoints = connection_manager
+            .endpoints
+            .lock()
+            .expect("not poisoned")
+            .clone();
+        let connected = CdsiConnection::connect(&endpoints.cdsi, transport_connector, auth).await?;
         let (token, remaining_response) = connected.send_request(request).await?;
 
         Ok(CdsiLookup {
@@ -68,7 +72,7 @@ impl CdsiLookup {
         })
     }
 
-    pub fn take_remaining(&self) -> Option<ClientResponseCollector<TcpSslConnectorStream>> {
+    pub fn take_remaining(&self) -> Option<ClientResponseCollector> {
         self.remaining.lock().expect("not poisoned").take()
     }
 }

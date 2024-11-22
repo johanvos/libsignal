@@ -105,6 +105,10 @@ def translate_to_ts(typ: str) -> str:
         assert typ.endswith(']>')
         return translate_to_ts(typ[5:-2]) + '[]'
 
+    if typ.startswith('Box<dyn'):
+        assert typ.endswith('>')
+        return translate_to_ts(typ[7:-1])
+
     if typ.startswith('Vec<'):
         assert typ.endswith('>')
         return translate_to_ts(typ[4:-1]) + '[]'
@@ -277,7 +281,7 @@ def main() -> None:
     convert_to_typescript(
         rust_crates=[
             Crate(path=os.path.join(our_abs_dir, '..')),
-            Crate(path=os.path.join(our_abs_dir, '..', '..', 'shared'), features=('node', 'signal-media', 'testing-fns')),
+            Crate(path=os.path.join(our_abs_dir, '..', '..', 'shared'), features=('node', 'signal-media')),
             Crate(path=os.path.join(our_abs_dir, '..', '..', 'shared', 'types'), features=('node', 'signal-media')),
             Crate(path=os.path.join(our_abs_dir, '..', '..', 'shared', 'testing'), features=('node', 'signal-media')),
         ],

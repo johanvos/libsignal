@@ -2,42 +2,62 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 use derive_where::derive_where;
 use itertools::Itertools as _;
 
-use crate::backup::method::{Contains, Lookup};
-use crate::backup::{ReferencedTypes, TryFromWith, TryIntoWith as _};
+use crate::backup::file::{FilePointer, FilePointerError};
+use crate::backup::method::{Lookup, Method};
+use crate::backup::serialize::{SerializeOrder, UnorderedList};
+use crate::backup::time::ReportUnusualTimestamp;
+use crate::backup::{serialize, ReferencedTypes, TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
 
+#[derive(serde::Serialize)]
 #[derive_where(Debug)]
-#[cfg_attr(test, derive_where(PartialEq; M::CustomColorReference: PartialEq))]
-pub struct ChatStyle<M: ReferencedTypes> {
-    pub wallpaper: Option<Wallpaper>,
+#[cfg_attr(test, derive_where(PartialEq; M::CustomColorReference: PartialEq, Wallpaper<M>: PartialEq))]
+pub struct ChatStyle<M: Method + ReferencedTypes> {
+    #[serde(bound(serialize = "Wallpaper<M>: serde::Serialize"))]
+    pub wallpaper: Option<Wallpaper<M>>,
     pub bubble_color: BubbleColor<M::CustomColorReference>,
+    pub dim_wallpaper_in_dark_mode: bool,
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
-pub enum Wallpaper {
+#[derive(serde::Serialize)]
+#[derive_where(Debug)]
+#[cfg_attr(test, derive_where(PartialEq; M::BoxedValue<FilePointer>: PartialEq))]
+pub enum Wallpaper<M: Method> {
     Preset(WallpaperPreset),
-    Photo,
+    Photo(M::BoxedValue<FilePointer>),
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct Color(#[allow(unused)] u32);
+#[serde(transparent)]
+pub struct Color(u32);
 
-#[derive(Debug)]
+impl TryFrom<u32> for Color {
+    type Error = ChatStyleError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value >> 24 != 0xFF {
+            return Err(ChatStyleError::ChatColorNotOpaque(value));
+        }
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct WallpaperPreset {
     /// Guaranteed to not be [`proto::chat_style::WallpaperPreset::UNKNOWN_WALLPAPER_PRESET`].
-    #[allow(unused)]
+    #[serde(serialize_with = "serialize::enum_as_string")]
     enum_value: proto::chat_style::WallpaperPreset,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum BubbleColor<CustomColor> {
     Preset(BubbleColorPreset),
@@ -45,32 +65,40 @@ pub enum BubbleColor<CustomColor> {
     Auto,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct BubbleGradientColor {
     pub color: Color,
     /// guaranteed to be in the range `[0, 1]`
-    #[allow(unused)]
     position: f32,
 }
 
-#[derive(Debug)]
+impl SerializeOrder for BubbleGradientColor {
+    fn serialize_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.position
+            .partial_cmp(&other.position)
+            .expect("validated to be non-NaN")
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct BubbleColorPreset {
     /// Guaranteed to not be [`proto::chat_style::BubbleColorPreset::UNKNOWN_BUBBLE_COLOR_PRESET`].
     #[allow(unused)]
+    #[serde(serialize_with = "serialize::enum_as_string")]
     enum_value: proto::chat_style::BubbleColorPreset,
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct CustomColorId(pub(crate) u32);
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+pub struct CustomColorId(pub(crate) u64);
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum CustomChatColor {
     Gradient {
         angle: u32,
-        colors: Vec<BubbleGradientColor>,
+        colors: UnorderedList<BubbleGradientColor>,
     },
     Solid {
         color: Color,
@@ -83,6 +111,28 @@ pub enum CustomChatColor {
 #[derive_where(Debug, Default)]
 #[cfg_attr(test, derive_where(PartialEq; M::CustomColorData: PartialEq))]
 pub struct CustomColorMap<M: ReferencedTypes>(Vec<(CustomColorId, M::CustomColorData)>);
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct KeyExists;
+
+impl<M: ReferencedTypes> CustomColorMap<M> {
+    fn insert(&mut self, key: CustomColorId, value: M::CustomColorData) -> Result<(), KeyExists> {
+        if self.0.iter().any(|(id, _data)| id == &key) {
+            return Err(KeyExists);
+        }
+        self.0.push((key, value));
+        Ok(())
+    }
+}
+
+impl<M: ReferencedTypes> serde::Serialize for CustomColorMap<M> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        BTreeMap::from_iter(self.0.iter().map(|(id, data)| (*id, data))).serialize(serializer)
+    }
+}
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -98,16 +148,22 @@ pub enum ChatStyleError {
     },
     /// wallpaper preset was UNKNOWN
     UnknownPresetWallpaper,
+    /// wallpaper photo: {0}
+    WallpaperPhoto(FilePointerError),
     /// bubble preset was UNKNOWN
     UnknownPresetBubbleColor,
     /// found 0 colors and 0 positions in gradient
     GradientEmpty,
+    /// chat color was not opaque (ARGB 0x{0:08X})
+    ChatColorNotOpaque(u32),
     /// bubble gradient position is invalid: {0}
     InvalidBubbleGradientPosition(f32),
+    /// only simple gradients from 0.0 to 1.0 are permitted
+    UnsupportedGradient,
     /// referenced unknown custom color ID {0:?}
-    UnknownCustomColorId(u32),
+    UnknownCustomColorId(u64),
     /// duplicate custom color ID {0}
-    DuplicateCustomChatColorId(u32),
+    DuplicateCustomChatColorId(u64),
 }
 
 impl<M: ReferencedTypes> TryFrom<Vec<proto::chat_style::CustomChatColor>> for CustomColorMap<M> {
@@ -118,18 +174,11 @@ impl<M: ReferencedTypes> TryFrom<Vec<proto::chat_style::CustomChatColor>> for Cu
             .into_iter()
             .try_fold(Self::default(), |mut colors, custom_color| {
                 let (id, custom_color) = TryFrom::try_from(custom_color)?;
-                if colors.contains(&id) {
-                    return Err(ChatStyleError::DuplicateCustomChatColorId(id.0));
-                }
-                colors.0.push((id, custom_color.into()));
+                colors
+                    .insert(id, custom_color.into())
+                    .map_err(|KeyExists| ChatStyleError::DuplicateCustomChatColorId(id.0))?;
                 Ok(colors)
             })
-    }
-}
-
-impl<M: ReferencedTypes> Contains<CustomColorId> for CustomColorMap<M> {
-    fn contains(&self, key: &CustomColorId) -> bool {
-        self.0.iter().any(|(id, _value)| id == key)
     }
 }
 
@@ -141,45 +190,52 @@ impl<M: ReferencedTypes> Lookup<CustomColorId, M::CustomColorReference> for Cust
     }
 }
 
-impl<C: Lookup<CustomColorId, M::CustomColorReference>, M: ReferencedTypes>
-    TryFromWith<proto::ChatStyle, C> for ChatStyle<M>
-{
-    type Error = ChatStyleError;
-
-    fn try_from_with(value: proto::ChatStyle, context: &C) -> Result<Self, Self::Error> {
+impl<M: Method + ReferencedTypes> ChatStyle<M> {
+    pub fn try_from_proto(
+        value: proto::ChatStyle,
+        color_map: &impl Lookup<CustomColorId, M::CustomColorReference>,
+        context: &dyn ReportUnusualTimestamp,
+    ) -> Result<Self, ChatStyleError> {
         let proto::ChatStyle {
             wallpaper,
             bubbleColor,
+            dimWallpaperInDarkMode,
             special_fields: _,
         } = value;
 
-        let wallpaper = wallpaper.map(TryInto::try_into).transpose()?;
+        let wallpaper = wallpaper.map(|w| w.try_into_with(context)).transpose()?;
 
         let bubble_color = bubbleColor
             .ok_or(ChatStyleError::NoBubbleColor)?
-            .try_into_with(context)?;
+            .try_into_with(color_map)?;
 
         Ok(Self {
             wallpaper,
             bubble_color,
+            dim_wallpaper_in_dark_mode: dimWallpaperInDarkMode,
         })
     }
 }
 
-impl TryFrom<proto::chat_style::Wallpaper> for Wallpaper {
+impl<C: ReportUnusualTimestamp + ?Sized, M: Method> TryFromWith<proto::chat_style::Wallpaper, C>
+    for Wallpaper<M>
+{
     type Error = ChatStyleError;
 
-    fn try_from(value: proto::chat_style::Wallpaper) -> Result<Self, Self::Error> {
+    fn try_from_with(
+        value: proto::chat_style::Wallpaper,
+        context: &C,
+    ) -> Result<Self, Self::Error> {
         Ok(match value {
             proto::chat_style::Wallpaper::WallpaperPreset(preset) => Self::Preset(
                 WallpaperPreset::new(preset.enum_value_or_default())
                     .ok_or(ChatStyleError::UnknownPresetWallpaper)?,
             ),
-            proto::chat_style::Wallpaper::WallpaperPhoto(photo) => {
-                // TODO validate this field.
-                let _photo = photo;
-                Self::Photo
-            }
+            proto::chat_style::Wallpaper::WallpaperPhoto(photo) => Self::Photo(M::boxed_value(
+                photo
+                    .try_into_with(context)
+                    .map_err(ChatStyleError::WallpaperPhoto)?,
+            )),
         })
     }
 }
@@ -246,28 +302,31 @@ impl TryFrom<proto::chat_style::custom_chat_color::Color> for CustomChatColor {
 
                 let color_count = colors.len();
                 let position_count = positions.len();
-                let colors = if color_count != position_count {
-                    return Err(ChatStyleError::GradientLengthMismatch {
-                        color_count,
-                        position_count,
-                    });
-                } else if color_count == 0 {
-                    return Err(ChatStyleError::GradientEmpty);
-                } else {
-                    colors
+                let colors = match color_count {
+                    _ if color_count != position_count => {
+                        return Err(ChatStyleError::GradientLengthMismatch {
+                            color_count,
+                            position_count,
+                        });
+                    }
+                    0 => {
+                        return Err(ChatStyleError::GradientEmpty);
+                    }
+                    2 if positions == [0.0, 1.0] || positions == [1.0, 0.0] => colors
                         .into_iter()
                         .zip(positions)
-                        .map(|(color, position)| {
-                            BubbleGradientColor::new(color, position)
-                                .ok_or(ChatStyleError::InvalidBubbleGradientPosition(position))
-                        })
-                        .try_collect()?
+                        .map(|(color, position)| BubbleGradientColor::new(color, position))
+                        .try_collect()?,
+                    _ => {
+                        // For now, only allow simple gradients with exactly two colors, at 0.0 and 1.0.
+                        return Err(ChatStyleError::UnsupportedGradient);
+                    }
                 };
 
                 CustomChatColor::Gradient { angle, colors }
             }
             ColorProto::Solid(color) => CustomChatColor::Solid {
-                color: Color(color),
+                color: Color::try_from(color)?,
             },
         })
     }
@@ -339,23 +398,25 @@ impl BubbleColorPreset {
 }
 
 impl BubbleGradientColor {
-    fn new(color: u32, position: f32) -> Option<Self> {
-        (0.0..=1.0).contains(&position).then_some(Self {
-            color: Color(color),
-            position,
-        })
+    fn new(color: u32, position: f32) -> Result<Self, ChatStyleError> {
+        let color = Color::try_from(color)?;
+        if !(0.0..=1.0).contains(&position) {
+            return Err(ChatStyleError::InvalidBubbleGradientPosition(position));
+        }
+        Ok(Self { color, position })
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use test_case::test_case;
 
-    use crate::backup::chat::chat_style::Color;
-    use crate::backup::chat::testutil::TestContext;
-    use crate::backup::method::Store;
-
     use super::*;
+    use crate::backup::chat::chat_style::Color;
+    use crate::backup::method::Store;
+    use crate::backup::testutil::TestContext;
 
     impl proto::ChatStyle {
         fn test_data() -> Self {
@@ -364,6 +425,7 @@ mod test {
                 bubbleColor: Some(proto::chat_style::BubbleColor::AutoBubbleColor(
                     Default::default(),
                 )),
+                dimWallpaperInDarkMode: true,
                 special_fields: Default::default(),
             }
         }
@@ -382,7 +444,9 @@ mod test {
         pub(crate) fn test_data() -> Self {
             Self {
                 id: Self::TEST_ID.0,
-                color: Some(proto::chat_style::custom_chat_color::Color::Solid(123456)),
+                color: Some(proto::chat_style::custom_chat_color::Color::Solid(
+                    0xFF123456,
+                )),
                 special_fields: Default::default(),
             }
         }
@@ -391,7 +455,7 @@ mod test {
     impl CustomChatColor {
         pub(crate) fn from_proto_test_data() -> Self {
             Self::Solid {
-                color: Color(123456),
+                color: Color(0xFF123456),
             }
         }
     }
@@ -407,13 +471,15 @@ mod test {
 
     #[test]
     fn valid_chat_style() {
+        let test_context = TestContext::default();
         assert_eq!(
-            proto::ChatStyle::test_data().try_into_with(&TestContext::default()),
+            ChatStyle::try_from_proto(proto::ChatStyle::test_data(), &test_context, &test_context),
             Ok(ChatStyle::<Store> {
                 wallpaper: Some(Wallpaper::Preset(WallpaperPreset {
                     enum_value: proto::chat_style::WallpaperPreset::GRADIENT_AQUA
                 })),
                 bubble_color: BubbleColor::Auto,
+                dim_wallpaper_in_dark_mode: true,
             })
         )
     }
@@ -423,17 +489,24 @@ mod test {
         assert_eq!(
             proto::chat_style::custom_chat_color::Color::Gradient(proto::chat_style::Gradient {
                 angle: 123,
-                colors: vec![555],
-                positions: vec![0.5],
+                colors: vec![0xFF005555, 0xFF009999],
+                positions: vec![1.0, 0.0],
                 special_fields: Default::default(),
             })
             .try_into(),
             Ok(CustomChatColor::Gradient {
                 angle: 123,
-                colors: vec![BubbleGradientColor {
-                    color: Color(555),
-                    position: 0.5
-                }]
+                colors: vec![
+                    BubbleGradientColor {
+                        color: Color(0xFF005555),
+                        position: 1.0,
+                    },
+                    BubbleGradientColor {
+                        color: Color(0xFF009999),
+                        position: 0.0,
+                    },
+                ]
+                .into(),
             })
         );
     }
@@ -451,7 +524,7 @@ mod test {
 
     fn uneven_gradient(proto: &mut proto::chat_style::CustomChatColor) {
         proto.set_gradient(proto::chat_style::Gradient {
-            colors: vec![1; 3],
+            colors: vec![0xFFFFFFFF; 3],
             positions: vec![0.0; 2],
             ..Default::default()
         });
@@ -461,15 +534,27 @@ mod test {
     }
     fn invalid_gradient_position(proto: &mut proto::chat_style::CustomChatColor) {
         proto.set_gradient(proto::chat_style::Gradient {
-            colors: vec![1],
-            positions: vec![-1.0],
+            colors: vec![0xFFFFFFFF, 0xFF000000],
+            positions: vec![-1.0, 1.0],
             ..Default::default()
         });
+    }
+    fn complex_gradient(proto: &mut proto::chat_style::CustomChatColor) {
+        proto.set_gradient(proto::chat_style::Gradient {
+            colors: vec![0xFFFFFFFF, 0xFF000000, 0xFFFFFFFF],
+            positions: vec![0.0, 0.5, 1.0],
+            ..Default::default()
+        });
+    }
+    fn non_opaque_color(proto: &mut proto::chat_style::CustomChatColor) {
+        proto.set_solid(0);
     }
 
     #[test_case(uneven_gradient, ChatStyleError::GradientLengthMismatch {color_count: 3, position_count: 2})]
     #[test_case(empty_gradient, ChatStyleError::GradientEmpty)]
-    #[test_case(invalid_gradient_position, ChatStyleError::InvalidBubbleGradientPosition(-1.0))]
+    #[test_case(complex_gradient, ChatStyleError::UnsupportedGradient)]
+    #[test_case(invalid_gradient_position, ChatStyleError::UnsupportedGradient)]
+    #[test_case(non_opaque_color, ChatStyleError::ChatColorNotOpaque(0))]
     fn custom_color(
         modifier: fn(&mut proto::chat_style::CustomChatColor),
         expected_err: ChatStyleError,
@@ -483,42 +568,51 @@ mod test {
         assert_eq!(result, Err(expected_err))
     }
 
-    fn no_wallpaper(proto: &mut proto::ChatStyle) {
-        proto.wallpaper = None;
-    }
-    fn no_bubble_color(proto: &mut proto::ChatStyle) {
-        proto.bubbleColor = None;
-    }
-    fn invalid_custom_color_id(proto: &mut proto::ChatStyle) {
-        proto.set_customColorId(333333333);
-    }
-    fn unknown_wallpaper_preset(proto: &mut proto::ChatStyle) {
-        proto.set_wallpaperPreset(proto::chat_style::WallpaperPreset::UNKNOWN_WALLPAPER_PRESET);
-    }
-    fn unknown_bubble_preset(proto: &mut proto::ChatStyle) {
-        proto.set_bubbleColorPreset(
-            proto::chat_style::BubbleColorPreset::UNKNOWN_BUBBLE_COLOR_PRESET,
-        );
-    }
-
-    #[test_case(no_wallpaper, Ok(()))]
-    #[test_case(no_bubble_color, Err(ChatStyleError::NoBubbleColor))]
+    #[test_case(|x| x.wallpaper = None => Ok(()); "no wallpaper")]
+    #[test_case(|x| x.bubbleColor = None => Err(ChatStyleError::NoBubbleColor); "no bubble color")]
     #[test_case(
-        invalid_custom_color_id,
-        Err(ChatStyleError::UnknownCustomColorId(333333333))
+        |x| x.set_customColorId(333333333) =>
+        Err(ChatStyleError::UnknownCustomColorId(333333333));
+        "invalid custom color id"
     )]
-    #[test_case(unknown_wallpaper_preset, Err(ChatStyleError::UnknownPresetWallpaper))]
-    #[test_case(unknown_bubble_preset, Err(ChatStyleError::UnknownPresetBubbleColor))]
-    fn chat_style(
-        modifier: fn(&mut proto::ChatStyle),
-        expected_result: Result<(), ChatStyleError>,
-    ) {
+    #[test_case(
+        |x| x.set_wallpaperPreset(proto::chat_style::WallpaperPreset::UNKNOWN_WALLPAPER_PRESET) =>
+        Err(ChatStyleError::UnknownPresetWallpaper);
+        "unknown wallpaper preset"
+    )]
+    #[test_case(|x| x.set_wallpaperPhoto(proto::FilePointer::test_data()) => Ok(()); "wallpaper photo")]
+    #[test_case(
+        |x| x.set_wallpaperPhoto(proto::FilePointer::default()) =>
+        Err(ChatStyleError::WallpaperPhoto(FilePointerError::NoLocator));
+        "invalid wallpaper photo"
+    )]
+    #[test_case(
+        |x| x.set_bubbleColorPreset(proto::chat_style::BubbleColorPreset::UNKNOWN_BUBBLE_COLOR_PRESET) =>
+        Err(ChatStyleError::UnknownPresetBubbleColor);
+        "unknown bubble preset"
+    )]
+    fn chat_style(modifier: fn(&mut proto::ChatStyle)) -> Result<(), ChatStyleError> {
         let mut proto = proto::ChatStyle::test_data();
         modifier(&mut proto);
-        let result = proto
-            .try_into_with(&TestContext::default())
-            .map(|_: ChatStyle<Store>| ());
+        let test_context = TestContext::default();
+        ChatStyle::try_from_proto(proto, &test_context, &test_context).map(|_: ChatStyle<Store>| ())
+    }
 
-        assert_eq!(result, expected_result)
+    #[test]
+    fn custom_color_map_sorts_when_serializing() {
+        let color1 = Arc::new(CustomChatColor::Solid { color: Color(100) });
+        let color2 = Arc::new(CustomChatColor::Solid { color: Color(22) });
+
+        let map1 = CustomColorMap::<Store>(vec![
+            (CustomColorId(1), color1.clone()),
+            (CustomColorId(2), color2.clone()),
+        ]);
+        let map2 =
+            CustomColorMap::<Store>(vec![(CustomColorId(2), color2), (CustomColorId(1), color1)]);
+
+        assert_eq!(
+            serde_json::to_string_pretty(&map1).expect("valid"),
+            serde_json::to_string_pretty(&map2).expect("valid"),
+        );
     }
 }

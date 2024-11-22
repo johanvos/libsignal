@@ -12,6 +12,17 @@
 //! 3. Manipulate the default evidence/endorsements
 //! 4. Create the final evidence/endorsements with [`FakeAttestation::sign`]
 
+use std::time::SystemTime;
+
+use boring_signal::asn1::{Asn1Integer, Asn1IntegerRef};
+use boring_signal::bn::{BigNum, BigNumContext};
+use boring_signal::ec::{EcGroup, EcKey, EcKeyRef};
+use boring_signal::ecdsa::EcdsaSig;
+use boring_signal::hash::{Hasher, MessageDigest};
+use boring_signal::nid::Nid;
+use boring_signal::pkey::{PKey, Private, Public};
+use chrono::Utc;
+
 use crate::cert_chain::testutil::TestCert;
 use crate::cert_chain::CertChain;
 use crate::dcap::ecdsa::EcdsaSigned;
@@ -19,16 +30,6 @@ use crate::dcap::endorsements::SgxEndorsements;
 use crate::dcap::evidence::Evidence;
 use crate::dcap::revocation_list::RevocationList;
 use crate::dcap::{attest_impl, Attestation};
-use boring::asn1::{Asn1Integer, Asn1IntegerRef};
-use boring::bn::{BigNum, BigNumContext};
-use boring::ec::{EcGroup, EcKey, EcKeyRef};
-use boring::ecdsa::EcdsaSig;
-use boring::hash::{Hasher, MessageDigest};
-use boring::nid::Nid;
-use boring::pkey::{PKey, Private, Public};
-use chrono::Utc;
-
-use std::time::SystemTime;
 
 const EVIDENCE_BYTES: &[u8] = include_bytes!("../../tests/data/dcap.evidence");
 const ENDORSEMENT_BYTES: &[u8] = include_bytes!("../../tests/data/dcap.endorsements");
@@ -162,7 +163,7 @@ pub(crate) struct FakeAttestationBuilder {
 
 impl FakeAttestationBuilder {
     fn sign_data(data: &[u8], key: &EcKeyRef<Private>) -> EcdsaSig {
-        let hash = boring::hash::hash(MessageDigest::sha256(), data).unwrap();
+        let hash = boring_signal::hash::hash(MessageDigest::sha256(), data).unwrap();
         EcdsaSig::sign(&hash, key).unwrap()
     }
 

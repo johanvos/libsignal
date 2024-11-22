@@ -61,9 +61,15 @@ java {
     withJavadocJar()
 }
 
+sourcesJar {
+    // Cut down on artifact size by leaving these out of the sources jar.
+    exclude '*.dll'
+    exclude '*.dylib'
+    exclude '*.so'
+}
+
 processResources {
-    // TODO: Build a different variant of the JNI library for server.
-    dependsOn ':makeJniLibrariesDesktop'
+    dependsOn ':makeJniLibrariesServer'
 }
 
 // MARK: Publishing

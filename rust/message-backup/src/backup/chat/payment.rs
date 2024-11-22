@@ -5,10 +5,11 @@
 
 use std::fmt::Display;
 
-use crate::backup::time::Timestamp;
+use crate::backup::time::{ReportUnusualTimestamp, Timestamp};
+use crate::backup::{serialize, TryFromWith, TryIntoWith};
 use crate::proto::backup as proto;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct PaymentNotification {
     pub amount: Option<MobAmount>,
@@ -17,40 +18,48 @@ pub struct PaymentNotification {
     pub details: Option<TransactionDetails>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum TransactionDetails {
     Transaction(Transaction),
     FailedTransaction(FailedTransaction),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Transaction {
+    #[serde(serialize_with = "serialize::enum_as_string")]
     pub status: proto::payment_notification::transaction_details::transaction::Status,
     pub identification: Option<Identification>,
     pub timestamp: Option<Timestamp>,
     pub block_timestamp: Option<Timestamp>,
     pub block_index: Option<u64>,
+    #[serde(serialize_with = "serialize::optional_hex")]
     pub transaction: Option<Vec<u8>>,
+    #[serde(serialize_with = "serialize::optional_hex")]
     pub receipt: Option<Vec<u8>>,
 }
 
 /// Wrapper around an arbitrary-precision decimal number
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
+#[serde(transparent)]
 pub struct MobAmount(String);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum Identification {
+    #[serde(serialize_with = "serialize::list_of_hex")]
     Sent { key_images: Vec<Vec<u8>> },
+    #[serde(serialize_with = "serialize::list_of_hex")]
     Received { public_keys: Vec<Vec<u8>> },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
+#[serde(transparent)]
 pub struct FailedTransaction {
+    #[serde(serialize_with = "serialize::enum_as_string")]
     pub reason: proto::payment_notification::transaction_details::failed_transaction::FailureReason,
 }
 
@@ -76,10 +85,10 @@ pub enum TransactionError {
     IdentificationContainsBoth,
 }
 
-impl TryFrom<proto::PaymentNotification> for PaymentNotification {
+impl<C: ReportUnusualTimestamp> TryFromWith<proto::PaymentNotification, C> for PaymentNotification {
     type Error = PaymentError;
 
-    fn try_from(value: proto::PaymentNotification) -> Result<Self, Self::Error> {
+    fn try_from_with(value: proto::PaymentNotification, context: &C) -> Result<Self, Self::Error> {
         let proto::PaymentNotification {
             amountMob,
             feeMob,
@@ -107,9 +116,9 @@ impl TryFrom<proto::PaymentNotification> for PaymentNotification {
                  }| {
                     use proto::payment_notification::transaction_details::Payment;
                     match payment.ok_or(PaymentError::NoTransactionDetailsPayment)? {
-                        Payment::Transaction(transaction) => {
-                            transaction.try_into().map(TransactionDetails::Transaction)
-                        }
+                        Payment::Transaction(transaction) => transaction
+                            .try_into_with(context)
+                            .map(TransactionDetails::Transaction),
                         Payment::FailedTransaction(failed) => {
                             failed.try_into().map(TransactionDetails::FailedTransaction)
                         }
@@ -128,11 +137,14 @@ impl TryFrom<proto::PaymentNotification> for PaymentNotification {
     }
 }
 
-impl TryFrom<proto::payment_notification::transaction_details::Transaction> for Transaction {
+impl<C: ReportUnusualTimestamp>
+    TryFromWith<proto::payment_notification::transaction_details::Transaction, C> for Transaction
+{
     type Error = TransactionError;
 
-    fn try_from(
+    fn try_from_with(
         value: proto::payment_notification::transaction_details::Transaction,
+        context: &C,
     ) -> Result<Self, Self::Error> {
         use proto::payment_notification::transaction_details::transaction::Status;
         use proto::payment_notification::transaction_details::{
@@ -177,9 +189,10 @@ impl TryFrom<proto::payment_notification::transaction_details::Transaction> for 
             )
             .transpose()?;
 
-        let timestamp = timestamp.map(|t| Timestamp::from_millis(t, "Transaction.timestamp"));
-        let block_timestamp =
-            blockTimestamp.map(|t| Timestamp::from_millis(t, "Transaction.blockTimestamp"));
+        let timestamp =
+            timestamp.map(|t| Timestamp::from_millis(t, "Transaction.timestamp", context));
+        let block_timestamp = blockTimestamp
+            .map(|t| Timestamp::from_millis(t, "Transaction.blockTimestamp", context));
 
         Ok(Self {
             status,
@@ -253,9 +266,9 @@ mod test {
 
     use test_case::test_case;
 
-    use crate::backup::time::testutil::MillisecondsSinceEpoch;
-
     use super::*;
+    use crate::backup::testutil::TestContext;
+    use crate::backup::time::testutil::MillisecondsSinceEpoch;
 
     impl FromStr for MobAmount {
         type Err = ParseError;
@@ -282,7 +295,7 @@ mod test {
     #[test]
     fn valid_payment_notification() {
         assert_eq!(
-            proto::PaymentNotification::test_data().try_into(),
+            proto::PaymentNotification::test_data().try_into_with(&TestContext::default()),
             Ok(PaymentNotification {
                 amount: Some("123".parse().unwrap()),
                 fee: Some("0".parse().unwrap()),
@@ -292,33 +305,18 @@ mod test {
         );
     }
 
-    fn invalid_amount(notification: &mut proto::PaymentNotification) {
-        notification.amountMob = Some("abc".to_string());
-    }
-    fn invalid_fee(notification: &mut proto::PaymentNotification) {
-        notification.feeMob = Some("0.five".to_string());
-    }
-    fn no_amount(notification: &mut proto::PaymentNotification) {
-        notification.amountMob = None;
-    }
-    fn no_fee(notification: &mut proto::PaymentNotification) {
-        notification.feeMob = None;
-    }
-
-    #[test_case(invalid_amount, Err(PaymentError::InvalidAmount))]
-    #[test_case(invalid_fee, Err(PaymentError::InvalidFee))]
-    #[test_case(no_amount, Ok(()))]
-    #[test_case(no_fee, Ok(()))]
+    #[test_case(|x| x.amountMob = Some("abc".to_string()) => Err(PaymentError::InvalidAmount); "invalid amount")]
+    #[test_case(|x| x.feeMob = Some("0.five".to_string()) => Err(PaymentError::InvalidFee); "invalid fee")]
+    #[test_case(|x| x.amountMob = None => Ok(()); "no amount")]
+    #[test_case(|x| x.feeMob = None => Ok(()); "no fee")]
     fn payment_notification(
         modifier: fn(&mut proto::PaymentNotification),
-        expected: Result<(), PaymentError>,
-    ) {
+    ) -> Result<(), PaymentError> {
         let mut notification = proto::PaymentNotification::test_data();
         modifier(&mut notification);
-        assert_eq!(
-            notification.try_into().map(|_: PaymentNotification| ()),
-            expected
-        )
+        notification
+            .try_into_with(&TestContext::default())
+            .map(|_: PaymentNotification| ())
     }
 
     impl proto::payment_notification::transaction_details::Transaction {
@@ -354,7 +352,8 @@ mod test {
     #[test]
     fn valid_transaction() {
         assert_eq!(
-            proto::payment_notification::transaction_details::Transaction::test_data().try_into(),
+            proto::payment_notification::transaction_details::Transaction::test_data()
+                .try_into_with(&TestContext::default()),
             Ok(Transaction {
                 status:
                     proto::payment_notification::transaction_details::transaction::Status::INITIAL,
@@ -392,7 +391,10 @@ mod test {
         let mut transaction =
             proto::payment_notification::transaction_details::Transaction::test_data();
         modifier(transaction.mobileCoinIdentification.as_mut().unwrap());
-        assert_eq!(Transaction::try_from(transaction), Err(expected_err));
+        assert_eq!(
+            Transaction::try_from_with(transaction, &TestContext::default()),
+            Err(expected_err)
+        );
     }
 
     #[test_case("12", Ok(()); "no decimal")]

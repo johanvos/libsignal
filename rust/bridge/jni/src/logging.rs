@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use jni::objects::{AutoLocal, GlobalRef, JClass, JObject, JValue};
-use jni::sys::jint;
-use jni::{JNIEnv, JavaVM};
-use libsignal_bridge::{describe_panic, jni_args};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::abort;
+
+use jni::objects::{AutoLocal, GlobalRef, JClass, JObject, JStaticMethodID, JValue};
+use jni::sys::jint;
+use jni::{JNIEnv, JavaVM};
+use libsignal_bridge::{describe_panic, jni_signature};
 
 // Keep this in sync with SignalProtocolLogger.java, as well as the list below.
 #[derive(Clone, Copy)]
@@ -62,13 +63,19 @@ impl From<JavaLogLevel> for log::Level {
 struct JniLogger {
     vm: JavaVM,
     logger_class: GlobalRef,
+    logger_method: JStaticMethodID,
 }
 
 impl JniLogger {
-    fn new(env: JNIEnv, logger_class: JClass) -> jni::errors::Result<Self> {
+    fn new(mut env: JNIEnv, logger_class: JClass) -> jni::errors::Result<Self> {
         Ok(Self {
             vm: env.get_java_vm()?,
-            logger_class: env.new_global_ref(logger_class)?,
+            logger_class: env.new_global_ref(&logger_class)?,
+            logger_method: env.get_static_method_id(
+                &logger_class,
+                "logFromRust",
+                jni_signature!((int, java.lang.String) -> void),
+            )?,
         })
     }
 
@@ -82,13 +89,17 @@ impl JniLogger {
             record.args(),
         );
         let message = AutoLocal::new(env.new_string(message)?, &env);
-        let module = AutoLocal::new(env.new_string("libsignal")?, &env);
-        let args = jni_args!((
-            level.into() => int,
-            module => java.lang.String,
-            message => java.lang.String,
-        ) -> void);
-        let result = env.call_static_method(&self.logger_class, "log", args.sig, &args.args);
+        let result = unsafe {
+            env.call_static_method_unchecked(
+                &self.logger_class,
+                self.logger_method,
+                jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
+                &[
+                    JValue::Int(level.into()).as_jni(),
+                    JValue::Object(&*message).as_jni(),
+                ],
+            )
+        };
 
         let throwable = env.exception_occurred()?;
         if **throwable == *JObject::null() {

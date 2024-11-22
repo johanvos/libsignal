@@ -9,30 +9,36 @@ use ::http::uri::PathAndQuery;
 use ::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
+use libsignal_net_infra::connection_manager::MultiRouteConnectionManager;
+use libsignal_net_infra::service::{Service, ServiceConnectorWithDecorator};
+use libsignal_net_infra::timeouts::{MULTI_ROUTE_CONNECTION_TIMEOUT, ONE_ROUTE_CONNECTION_TIMEOUT};
+use libsignal_net_infra::utils::ObservableEvent;
+use libsignal_net_infra::ws::WebSocketClientConnector;
+use libsignal_net_infra::{
+    make_ws_config, AsHttpHeader, EndpointConnection, HttpRequestDecorator, IpType,
+    TransportConnector,
+};
 
 use crate::auth::Auth;
 use crate::chat::ws::{ChatOverWebSocketServiceConnector, ServerEvent};
-use crate::infra::connection_manager::MultiRouteConnectionManager;
-use crate::infra::reconnect::{ServiceConnectorWithDecorator, ServiceWithReconnect};
-use crate::infra::ws::WebSocketClientConnector;
-use crate::infra::{
-    ConnectionInfo, EndpointConnection, HttpRequestDecorator, IpType, TransportConnector,
-};
+use crate::env::{add_user_agent_header, ConnectionConfig, UserAgent};
 use crate::proto;
-use crate::utils::basic_authorization;
 
-pub mod chat_reconnect;
 mod error;
-use crate::timeouts::MULTI_ROUTE_CONNECTION_TIMEOUT;
 pub use error::ChatServiceError;
 
+pub mod noise;
 pub mod server_requests;
+pub mod service;
 pub mod ws;
+pub mod ws2;
 
 pub type MessageProto = proto::chat_websocket::WebSocketMessage;
 pub type RequestProto = proto::chat_websocket::WebSocketRequestMessage;
 pub type ResponseProto = proto::chat_websocket::WebSocketResponseMessage;
 pub type ChatMessageType = proto::chat_websocket::web_socket_message::Type;
+
+const RECEIVE_STORIES_HEADER_NAME: &str = "x-signal-receive-stories";
 
 #[async_trait]
 pub trait ChatService {
@@ -65,15 +71,8 @@ pub trait ChatServiceWithDebugInfo: ChatService {
     async fn connect_and_debug(&self) -> Result<DebugInfo, ChatServiceError>;
 }
 
-pub trait RemoteAddressInfo {
-    /// Provides information about the remote address the service is connected to
-    fn connection_info(&self) -> ConnectionInfo;
-}
-
 #[derive(Debug)]
 pub struct DebugInfo {
-    /// Number of times a connection had to be established since the service was created.
-    pub reconnect_count: u32,
     /// IP type of the connection that was used for the request.
     pub ip_type: IpType,
     /// Time it took to complete the request.
@@ -91,6 +90,7 @@ pub struct Request {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Response {
     pub status: StatusCode,
     pub message: Option<String>,
@@ -247,7 +247,9 @@ impl<D: DelegatingChatService> ChatService for D {
         self.inner().send(msg, timeout)
     }
 
-    fn connect<'life0, 'async_trait>(&'life0 self) -> BoxFuture<Result<(), ChatServiceError>>
+    fn connect<'life0, 'async_trait>(
+        &'life0 self,
+    ) -> BoxFuture<'life0, Result<(), ChatServiceError>>
     where
         'life0: 'async_trait,
         Self: 'async_trait,
@@ -387,21 +389,38 @@ impl DelegatingChatService for Arc<dyn ChatServiceWithDebugInfo + Send + Sync> {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ReceiveStories(bool);
+
+impl From<bool> for ReceiveStories {
+    fn from(value: bool) -> Self {
+        Self(value)
+    }
+}
+
+impl AsHttpHeader for ReceiveStories {
+    const HEADER_NAME: HeaderName = HeaderName::from_static(RECEIVE_STORIES_HEADER_NAME);
+
+    fn header_value(&self) -> HeaderValue {
+        HeaderValue::from_static(if self.0 { "true" } else { "false" })
+    }
+}
+
 fn build_authorized_chat_service(
     connection_manager_ws: &MultiRouteConnectionManager,
     service_connector_ws: &ChatOverWebSocketServiceConnector<impl TransportConnector + 'static>,
     auth: Auth,
+    receive_stories: bool,
 ) -> AuthorizedChatService<impl ChatServiceWithDebugInfo> {
-    let header_auth_decorator = HttpRequestDecorator::Header(
-        http::header::AUTHORIZATION,
-        basic_authorization(&auth.username, &auth.password),
-    );
-
+    let header_map = HeaderMap::from_iter([
+        auth.as_header(),
+        ReceiveStories(receive_stories).as_header(),
+    ]);
     // ws authorized
-    let chat_over_ws_auth = ServiceWithReconnect::new(
+    let chat_over_ws_auth = Service::new(
         ServiceConnectorWithDecorator::new(
             service_connector_ws.clone(),
-            header_auth_decorator.clone(),
+            HttpRequestDecorator::Headers(header_map),
         ),
         connection_manager_ws.clone(),
         MULTI_ROUTE_CONNECTION_TIMEOUT,
@@ -419,7 +438,7 @@ fn build_anonymous_chat_service(
     service_connector_ws: &ChatOverWebSocketServiceConnector<impl TransportConnector + 'static>,
 ) -> AnonymousChatService<impl ChatServiceWithDebugInfo> {
     // ws anonymous
-    let chat_over_ws_anonymous = ServiceWithReconnect::new(
+    let chat_over_ws_anonymous = Service::new(
         service_connector_ws.clone(),
         connection_manager_ws.clone(),
         MULTI_ROUTE_CONNECTION_TIMEOUT,
@@ -435,21 +454,27 @@ fn build_anonymous_chat_service(
 pub fn chat_service<T: TransportConnector + 'static>(
     endpoint: &EndpointConnection<MultiRouteConnectionManager>,
     transport_connector: T,
-    incoming_tx: tokio::sync::mpsc::Sender<ServerEvent<T::Stream>>,
+    incoming_auth_tx: tokio::sync::mpsc::Sender<ServerEvent<T::Stream>>,
+    incoming_unauth_tx: tokio::sync::mpsc::Sender<ServerEvent<T::Stream>>,
     auth: Auth,
+    receive_stories: bool,
 ) -> Chat<impl ChatServiceWithDebugInfo, impl ChatServiceWithDebugInfo> {
     // Cannot reuse the same connector, since they lock on `incoming_tx` internally.
     let unauth_ws_connector = ChatOverWebSocketServiceConnector::new(
         WebSocketClientConnector::new(transport_connector.clone(), endpoint.config.clone()),
-        incoming_tx.clone(),
+        incoming_unauth_tx,
     );
     let auth_ws_connector = ChatOverWebSocketServiceConnector::new(
         WebSocketClientConnector::new(transport_connector, endpoint.config.clone()),
-        incoming_tx,
+        incoming_auth_tx,
     );
     {
-        let auth_service =
-            build_authorized_chat_service(&endpoint.manager, &auth_ws_connector, auth);
+        let auth_service = build_authorized_chat_service(
+            &endpoint.manager,
+            &auth_ws_connector,
+            auth,
+            receive_stories,
+        );
         let unauth_service = build_anonymous_chat_service(&endpoint.manager, &unauth_ws_connector);
         Chat {
             auth_service,
@@ -458,27 +483,108 @@ pub fn chat_service<T: TransportConnector + 'static>(
     }
 }
 
+pub fn endpoint_connection(
+    connection_config: &ConnectionConfig,
+    user_agent: &UserAgent,
+    include_fallback: bool,
+    network_change_event: &ObservableEvent,
+) -> EndpointConnection<MultiRouteConnectionManager> {
+    let chat_endpoint = PathAndQuery::from_static(crate::env::constants::WEB_SOCKET_PATH);
+    let chat_connection_params = if include_fallback {
+        connection_config.connection_params_with_fallback()
+    } else {
+        vec![connection_config.direct_connection_params()]
+    };
+    let chat_connection_params = add_user_agent_header(chat_connection_params, user_agent);
+    let chat_ws_config = make_ws_config(chat_endpoint, ONE_ROUTE_CONNECTION_TIMEOUT);
+    EndpointConnection::new_multi(
+        chat_connection_params,
+        ONE_ROUTE_CONNECTION_TIMEOUT,
+        chat_ws_config,
+        network_change_event,
+    )
+}
+
+#[cfg(feature = "test-util")]
+pub mod test_support {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use http::uri::PathAndQuery;
+    use libsignal_net_infra::dns::DnsResolver;
+    use libsignal_net_infra::tcp_ssl::DirectConnector;
+    use libsignal_net_infra::{make_ws_config, ConnectionParams, EndpointConnection};
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::auth::Auth;
+    use crate::chat::{Chat, ChatServiceWithDebugInfo};
+    use crate::env::constants::WEB_SOCKET_PATH;
+    use crate::env::{Env, Svr3Env};
+
+    pub type AnyChat = Chat<
+        Arc<dyn ChatServiceWithDebugInfo + Send + Sync>,
+        Arc<dyn ChatServiceWithDebugInfo + Send + Sync>,
+    >;
+
+    pub fn simple_chat_service(
+        env: &Env<'static, Svr3Env<'static>>,
+        auth: Auth,
+        connection_params: Vec<ConnectionParams>,
+    ) -> AnyChat {
+        let one_route_connect_timeout = Duration::from_secs(5);
+        let network_change_event = ObservableEvent::default();
+        let dns_resolver =
+            DnsResolver::new_with_static_fallback(env.static_fallback(), &network_change_event);
+        let transport_connector = DirectConnector::new(dns_resolver);
+        let chat_endpoint = PathAndQuery::from_static(WEB_SOCKET_PATH);
+        let chat_ws_config = make_ws_config(chat_endpoint, one_route_connect_timeout);
+        let connection = EndpointConnection::new_multi(
+            connection_params,
+            one_route_connect_timeout,
+            chat_ws_config,
+            &network_change_event,
+        );
+
+        let (incoming_auth_tx, _incoming_rx) = mpsc::channel(1);
+        let (incoming_unauth_tx, _incoming_rx) = mpsc::channel(1);
+        chat_service(
+            &connection,
+            transport_connector,
+            incoming_auth_tx,
+            incoming_unauth_tx,
+            auth,
+            false,
+        )
+        .into_dyn()
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test {
-    use crate::chat::{Response, ResponseProto, ResponseProtoInvalidError};
     use assert_matches::assert_matches;
     use http::{HeaderName, HeaderValue};
 
+    use crate::chat::{Response, ResponseProto, ResponseProtoInvalidError};
+
     pub(crate) mod shared {
         use std::fmt::Debug;
+        use std::sync::Arc;
         use std::time::Duration;
 
         use async_trait::async_trait;
         use http::Method;
+        use libsignal_net_infra::connection_manager::SingleRouteThrottlingConnectionManager;
+        use libsignal_net_infra::errors::LogSafeDisplay;
+        use libsignal_net_infra::host::Host;
+        use libsignal_net_infra::service::{CancellationReason, ServiceConnector, ServiceState};
+        use libsignal_net_infra::testutil::{NoReconnectService, TIMEOUT_DURATION};
+        use libsignal_net_infra::utils::ObservableEvent;
+        use libsignal_net_infra::{ConnectionParams, RouteType, TransportConnectionParams};
         use nonzero_ext::nonzero;
 
+        use crate::certs::SIGNAL_ROOT_CERTIFICATES;
         use crate::chat::{ChatService, ChatServiceError, Request, Response};
-        use crate::infra::certs::RootCertificates;
-        use crate::infra::connection_manager::SingleRouteThrottlingConnectionManager;
-        use crate::infra::errors::LogSafeDisplay;
-        use crate::infra::reconnect::{ServiceConnector, ServiceState};
-        use crate::infra::test::shared::{NoReconnectService, TIMEOUT_DURATION};
-        use crate::infra::{ConnectionParams, RouteType};
 
         #[async_trait]
         impl<C> ChatService for NoReconnectService<C>
@@ -487,7 +593,6 @@ pub(crate) mod test {
             C::Service: ChatService + Clone + Send + Sync + 'static,
             C::Channel: Send + Sync,
             C::ConnectError: Send + Sync + Debug + LogSafeDisplay,
-            C::StartError: Send + Sync + Debug + LogSafeDisplay,
         {
             async fn send(
                 &self,
@@ -495,7 +600,7 @@ pub(crate) mod test {
                 timeout: Duration,
             ) -> Result<Response, ChatServiceError> {
                 match &*self.inner {
-                    ServiceState::Active(service, status) if !status.is_stopped() => {
+                    ServiceState::Active(service, status) if !status.is_cancelled() => {
                         service.clone().send(msg, timeout).await
                     }
                     _ => Err(ChatServiceError::AllConnectionRoutesFailed { attempts: 1 }),
@@ -508,7 +613,7 @@ pub(crate) mod test {
 
             async fn disconnect(&self) {
                 if let ServiceState::Active(_, status) = &*self.inner {
-                    status.stop_service()
+                    status.cancel(CancellationReason::ExplicitDisconnect)
                 }
             }
         }
@@ -523,15 +628,27 @@ pub(crate) mod test {
         }
 
         pub fn connection_manager() -> SingleRouteThrottlingConnectionManager {
-            let connection_params = ConnectionParams::new(
-                RouteType::Test,
-                "test.signal.org",
-                "test.signal.org",
-                nonzero!(443u16),
-                Default::default(),
-                RootCertificates::Signal,
-            );
-            SingleRouteThrottlingConnectionManager::new(connection_params, TIMEOUT_DURATION)
+            let connection_params = {
+                let hostname = "test.signal.org".into();
+                let host = Host::Domain(Arc::clone(&hostname));
+                ConnectionParams {
+                    route_type: RouteType::Test,
+                    transport: TransportConnectionParams {
+                        sni: Arc::clone(&hostname),
+                        tcp_host: host,
+                        port: nonzero!(443u16),
+                        certs: SIGNAL_ROOT_CERTIFICATES,
+                    },
+                    http_host: hostname,
+                    http_request_decorator: Default::default(),
+                    connection_confirmation_header: None,
+                }
+            };
+            SingleRouteThrottlingConnectionManager::new(
+                connection_params,
+                TIMEOUT_DURATION,
+                &ObservableEvent::default(),
+            )
         }
     }
 

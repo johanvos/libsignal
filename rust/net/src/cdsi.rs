@@ -4,30 +4,27 @@
 //
 
 use std::default::Default;
-use std::fmt::Display;
-use std::num::{NonZeroU64, ParseIntError};
-use std::str::FromStr;
 
+use futures_util::TryFutureExt as _;
 use http::StatusCode;
-use libsignal_core::{Aci, Pni};
+use libsignal_core::{Aci, Pni, E164};
+use libsignal_net_infra::connection_manager::ConnectionManager;
+use libsignal_net_infra::errors::{LogSafeDisplay, TransportConnectError};
+use libsignal_net_infra::ws::{NextOrClose, WebSocketConnectError, WebSocketServiceError};
+use libsignal_net_infra::ws2::attested::{
+    AttestedConnection, AttestedConnectionError, AttestedProtocolError,
+};
+use libsignal_net_infra::{extract_retry_after_seconds, TransportConnector};
 use prost::Message as _;
 use thiserror::Error;
-use tokio::net::TcpStream;
-use tokio_boring::SslStream;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::CloseFrame;
 use uuid::Uuid;
 
-use crate::auth::HttpBasicAuth;
+use crate::auth::Auth;
 use crate::enclave::{Cdsi, EnclaveEndpointConnection};
-use crate::infra::connection_manager::ConnectionManager;
-use crate::infra::errors::TransportConnectError;
-use crate::infra::ws::{
-    AttestedConnection, AttestedConnectionError, NextOrClose, WebSocketConnectError,
-    WebSocketServiceError,
-};
-use crate::infra::{AsyncDuplexStream, TransportConnector};
 use crate::proto::cds2::{ClientRequest, ClientResponse};
+use crate::ws::WebSocketServiceConnectError;
 
 trait FixedLengthSerializable {
     const SERIALIZED_LEN: usize;
@@ -52,44 +49,11 @@ impl<It: ExactSizeIterator<Item = T>, T: FixedLengthSerializable> CollectSeriali
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct E164(NonZeroU64);
-
-impl E164 {
-    pub const fn new(number: NonZeroU64) -> Self {
-        Self(number)
-    }
-
-    fn from_serialized(bytes: [u8; E164::SERIALIZED_LEN]) -> Option<Self> {
-        NonZeroU64::new(u64::from_be_bytes(bytes)).map(Self)
-    }
-}
-
-impl From<E164> for NonZeroU64 {
-    fn from(value: E164) -> Self {
-        value.0
-    }
-}
-
-impl FromStr for E164 {
-    type Err = ParseIntError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.strip_prefix('+').unwrap_or(s);
-        NonZeroU64::from_str(s).map(Self)
-    }
-}
-
-impl Display for E164 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "+{}", self.0)
-    }
-}
-
 impl FixedLengthSerializable for E164 {
     const SERIALIZED_LEN: usize = 8;
 
     fn serialize_into(&self, target: &mut [u8]) {
-        target.copy_from_slice(&self.0.get().to_be_bytes())
+        target.copy_from_slice(&self.to_be_bytes())
     }
 }
 
@@ -227,7 +191,7 @@ impl LookupResponseEntry {
         // instead of expect() on the output.
         let (e164_bytes, record) = record.split_at(E164::SERIALIZED_LEN);
         let e164_bytes = <&[u8; E164::SERIALIZED_LEN]>::try_from(e164_bytes).expect("split at len");
-        let e164 = E164::from_serialized(*e164_bytes)?;
+        let e164 = E164::from_be_bytes(*e164_bytes)?;
         let (pni_bytes, aci_bytes) = record.split_at(Uuid::SERIALIZED_LEN);
 
         let pni = non_nil_uuid(pni_bytes.try_into().expect("split at len"));
@@ -258,10 +222,10 @@ impl FixedLengthSerializable for LookupResponseEntry {
 }
 
 #[cfg_attr(test, derive(Debug))]
-pub struct CdsiConnection<S>(AttestedConnection<S>);
+pub struct CdsiConnection(AttestedConnection);
 
-impl<S> AsMut<AttestedConnection<S>> for CdsiConnection<S> {
-    fn as_mut(&mut self) -> &mut AttestedConnection<S> {
+impl AsMut<AttestedConnection> for CdsiConnection {
+    fn as_mut(&mut self) -> &mut AttestedConnection {
         &mut self.0
     }
 }
@@ -269,8 +233,6 @@ impl<S> AsMut<AttestedConnection<S>> for CdsiConnection<S> {
 /// Anything that can go wrong during a CDSI lookup.
 #[derive(Debug, Error, displaydoc::Display)]
 pub enum LookupError {
-    /// protocol error after establishing a connection
-    Protocol,
     /// SGX attestation failed.
     AttestationError(attest::enclave::Error),
     /// invalid response received from the server
@@ -281,6 +243,8 @@ pub enum LookupError {
     InvalidToken,
     /// failed to parse the response from the server
     ParseError,
+    /// protocol error after establishing a connection: {0}
+    EnclaveProtocol(AttestedProtocolError),
     /// transport failed: {0}
     ConnectTransport(TransportConnectError),
     /// websocket error: {0}
@@ -291,15 +255,22 @@ pub enum LookupError {
     InvalidArgument { server_reason: String },
     /// server error: {reason}
     Server { reason: &'static str },
+    /// CDS protocol: {0}
+    CdsiProtocol(CdsiProtocolError),
+}
+
+#[derive(Debug, Error, displaydoc::Display)]
+pub enum CdsiProtocolError {
+    /// no token found in response
+    NoTokenInResponse,
 }
 
 impl From<AttestedConnectionError> for LookupError {
     fn from(value: AttestedConnectionError) -> Self {
         match value {
-            AttestedConnectionError::ClientConnection(_) => Self::Protocol,
             AttestedConnectionError::WebSocket(e) => Self::WebSocket(e),
-            AttestedConnectionError::Protocol => Self::Protocol,
-            AttestedConnectionError::Sgx(e) => Self::AttestationError(e),
+            AttestedConnectionError::Protocol(error) => Self::EnclaveProtocol(error),
+            AttestedConnectionError::Attestation(e) => Self::AttestationError(e),
         }
     }
 }
@@ -309,15 +280,13 @@ impl From<crate::enclave::Error> for LookupError {
         use crate::enclave::Error;
         match value {
             Error::WebSocketConnect(err) => match err {
-                WebSocketConnectError::Timeout => Self::ConnectionTimedOut,
-                WebSocketConnectError::Transport(e) => Self::ConnectTransport(e),
-                WebSocketConnectError::RejectedByServer(response) => {
+                WebSocketServiceConnectError::RejectedByServer {
+                    response,
+                    received_at: _,
+                } => {
                     if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after_header = response.headers().get("retry-after");
-
-                        if let Some(retry_after_seconds) = retry_after_header
-                            .and_then(|value| value.to_str().ok())
-                            .and_then(|str| u32::from_str(str).ok())
+                        if let Some(retry_after_seconds) =
+                            extract_retry_after_seconds(response.headers())
                         {
                             return Self::RateLimited {
                                 retry_after_seconds,
@@ -326,11 +295,15 @@ impl From<crate::enclave::Error> for LookupError {
                     }
                     Self::WebSocket(WebSocketServiceError::Http(response))
                 }
-                WebSocketConnectError::WebSocketError(e) => Self::WebSocket(e.into()),
+                WebSocketServiceConnectError::Connect(e, _) => match e {
+                    WebSocketConnectError::Timeout => Self::ConnectionTimedOut,
+                    WebSocketConnectError::Transport(e) => Self::ConnectTransport(e),
+                    WebSocketConnectError::WebSocketError(e) => Self::WebSocket(e.into()),
+                },
             },
             Error::AttestationError(err) => Self::AttestationError(err),
             Error::WebSocket(err) => Self::WebSocket(err),
-            Error::Protocol => Self::Protocol,
+            Error::Protocol(error) => Self::EnclaveProtocol(error),
             Error::ConnectionTimedOut => Self::ConnectionTimedOut,
         }
     }
@@ -338,7 +311,7 @@ impl From<crate::enclave::Error> for LookupError {
 
 impl From<prost::DecodeError> for LookupError {
     fn from(_value: prost::DecodeError) -> Self {
-        Self::Protocol
+        Self::EnclaveProtocol(AttestedProtocolError::ProtobufDecode)
     }
 }
 
@@ -349,36 +322,48 @@ struct RateLimitExceededResponse {
 }
 
 #[cfg_attr(test, derive(Debug))]
-pub struct ClientResponseCollector<S = SslStream<TcpStream>>(CdsiConnection<S>);
+pub struct ClientResponseCollector(CdsiConnection);
 
-impl<S: AsyncDuplexStream> CdsiConnection<S> {
+impl CdsiConnection {
     /// Connect to remote host and verify remote attestation.
     pub async fn connect<C, T>(
         endpoint: &EnclaveEndpointConnection<Cdsi, C>,
         transport_connector: T,
-        auth: impl HttpBasicAuth,
+        auth: Auth,
     ) -> Result<Self, LookupError>
     where
         C: ConnectionManager,
-        T: TransportConnector<Stream = S>,
+        T: TransportConnector,
     {
-        let connection = endpoint.connect(auth, transport_connector).await?;
+        log::info!("connecting to CDSI endpoint");
+        let (connection, _info) = endpoint
+            .connect(auth, transport_connector)
+            .inspect_err(|e| {
+                log::warn!("CDSI connection failed: {e}");
+            })
+            .await?;
+
+        log::info!("successfully established attested connection to CDSI endpoint");
         Ok(Self(connection))
     }
 
     pub async fn send_request(
         mut self,
         request: LookupRequest,
-    ) -> Result<(Token, ClientResponseCollector<S>), LookupError> {
-        self.0.send(request.into_client_request()).await?;
-        let token_response: ClientResponse = self.0.receive().await?.next_or_else(|close| {
-            close
-                .and_then(err_for_close)
-                .unwrap_or(LookupError::Protocol)
-        })?;
+    ) -> Result<(Token, ClientResponseCollector), LookupError> {
+        let request_info = LookupRequestDebugInfo::from(&request);
+        let request = request.into_client_request().encode_to_vec();
+        log::info!(
+            "sending {}-byte initial request: {request_info}",
+            request.len()
+        );
+        self.0.send_bytes(&request).await?;
+        let token_response: ClientResponse = self.0.receive().await?.next_or_else(err_for_close)?;
 
         if token_response.token.is_empty() {
-            return Err(LookupError::Protocol);
+            return Err(LookupError::CdsiProtocol(
+                CdsiProtocolError::NoTokenInResponse,
+            ));
         }
 
         Ok((
@@ -388,7 +373,7 @@ impl<S: AsyncDuplexStream> CdsiConnection<S> {
     }
 }
 
-impl<S: AsyncDuplexStream> ClientResponseCollector<S> {
+impl ClientResponseCollector {
     pub async fn collect(self) -> Result<LookupResponse, LookupError> {
         let Self(mut connection) = self;
 
@@ -398,11 +383,8 @@ impl<S: AsyncDuplexStream> ClientResponseCollector<S> {
         };
 
         connection.0.send(token_ack).await?;
-        let mut response: ClientResponse = connection.0.receive().await?.next_or_else(|close| {
-            close
-                .and_then(err_for_close)
-                .unwrap_or(LookupError::Protocol)
-        })?;
+        let mut response: ClientResponse =
+            connection.0.receive().await?.next_or_else(err_for_close)?;
         loop {
             match connection.0.receive_bytes().await? {
                 NextOrClose::Next(decoded) => {
@@ -416,13 +398,56 @@ impl<S: AsyncDuplexStream> ClientResponseCollector<S> {
                         code: CloseCode::Normal,
                         reason: _,
                     }),
-                ) => break,
-                NextOrClose::Close(Some(close)) => {
-                    return Err(err_for_close(close).unwrap_or(LookupError::Protocol))
+                ) => {
+                    log::info!("finished CDSI lookup");
+                    break;
                 }
+                NextOrClose::Close(Some(close)) => return Err(err_for_close(Some(close))),
             }
         }
         Ok(response.try_into()?)
+    }
+}
+
+/// For logging information about an initiated CDSI request.
+struct LookupRequestDebugInfo {
+    new_e164s: usize,
+    prev_e164s: usize,
+    acis_and_access_keys: usize,
+    return_acis_without_uaks: bool,
+    token: usize,
+}
+
+impl std::fmt::Display for LookupRequestDebugInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupRequestDebugInfo")
+            .field("new_e164s", &self.new_e164s)
+            .field("prev_e164s", &self.prev_e164s)
+            .field("acis_and_access_keys", &self.acis_and_access_keys)
+            .field("return_acis_without_uaks", &self.return_acis_without_uaks)
+            .field("token", &self.token)
+            .finish()
+    }
+}
+
+impl LogSafeDisplay for LookupRequestDebugInfo {}
+
+impl From<&LookupRequest> for LookupRequestDebugInfo {
+    fn from(value: &LookupRequest) -> Self {
+        let LookupRequest {
+            new_e164s,
+            prev_e164s,
+            acis_and_access_keys,
+            return_acis_without_uaks,
+            token,
+        } = value;
+        Self {
+            new_e164s: new_e164s.len(),
+            prev_e164s: prev_e164s.len(),
+            acis_and_access_keys: acis_and_access_keys.len(),
+            return_acis_without_uaks: *return_acis_without_uaks,
+            token: token.len(),
+        }
     }
 }
 
@@ -441,55 +466,67 @@ enum CdsiCloseCode {
 ///
 /// Returns `Some(err)` if there is a relevant `LookupError` value for the
 /// provided close frame. Otherwise returns `None`.
-fn err_for_close(CloseFrame { code, reason }: CloseFrame<'_>) -> Option<LookupError> {
+fn err_for_close(close: Option<CloseFrame<'_>>) -> LookupError {
+    fn unexpected_close(close: Option<CloseFrame<'_>>) -> LookupError {
+        LookupError::EnclaveProtocol(AttestedProtocolError::UnexpectedClose(close.into()))
+    }
+
+    let Some(CloseFrame { code, reason }) = &close else {
+        log::warn!("got unexpected connection close without a Close frame");
+        return unexpected_close(close);
+    };
+
     let Ok(code) = CdsiCloseCode::try_from(u16::from(code)) else {
-        log::warn!("got unexpected websocket error code: {code}",);
-        return None;
+        log::warn!("got unexpected websocket error code: {code}");
+        return unexpected_close(close);
     };
 
     match code {
-        CdsiCloseCode::InvalidArgument => Some(LookupError::InvalidArgument {
-            server_reason: reason.into_owned(),
-        }),
-        CdsiCloseCode::InvalidToken => Some(LookupError::InvalidToken),
+        CdsiCloseCode::InvalidArgument => LookupError::InvalidArgument {
+            server_reason: reason.clone().into_owned(),
+        },
+        CdsiCloseCode::InvalidToken => LookupError::InvalidToken,
         CdsiCloseCode::RateLimitExceeded => {
-            let RateLimitExceededResponse {
+            let Some(RateLimitExceededResponse {
                 retry_after_seconds,
-            } = serde_json::from_str(&reason).ok()?;
-            Some(LookupError::RateLimited {
+            }) = serde_json::from_str(reason).ok()
+            else {
+                log::warn!("failed to parse rate limit from reason");
+                return unexpected_close(close);
+            };
+            LookupError::RateLimited {
                 retry_after_seconds,
-            })
+            }
         }
         CdsiCloseCode::ServerInternalError | CdsiCloseCode::ServerUnavailable => {
-            Some(LookupError::Server {
+            LookupError::Server {
                 reason: code.into(),
-            })
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::num::NonZeroU64;
     use std::time::Duration;
 
     use assert_matches::assert_matches;
     use hex_literal::hex;
+    use libsignal_net_infra::testutil::InMemoryWarpConnector;
+    use libsignal_net_infra::utils::ObservableEvent;
+    use libsignal_net_infra::ws::testutil::fake_websocket;
+    use libsignal_net_infra::ws2::attested::testutil::{
+        run_attested_server, AttestedServerOutput, FAKE_ATTESTATION,
+    };
     use nonzero_ext::nonzero;
     use tungstenite::protocol::frame::coding::CloseCode;
     use tungstenite::protocol::CloseFrame;
     use uuid::Uuid;
     use warp::Filter as _;
 
-    use crate::auth::Auth;
-    use crate::infra::test::shared::InMemoryWarpConnector;
-
-    use crate::infra::ws::testutil::{
-        fake_websocket, mock_connection_info, run_attested_server, AttestedServerOutput,
-        FAKE_ATTESTATION,
-    };
-    use crate::infra::ws::WebSocketClient;
-
     use super::*;
+    use crate::auth::Auth;
 
     #[test]
     fn parse_lookup_response_entries() {
@@ -536,7 +573,7 @@ mod test {
     fn serialize_e164s() {
         let e164s: Vec<E164> = (18005551001..)
             .take(5)
-            .map(|n| E164(NonZeroU64::new(n).unwrap()))
+            .map(|n| E164::new(NonZeroU64::new(n).unwrap()))
             .collect();
         let serialized = e164s.into_iter().collect_serialized();
 
@@ -589,7 +626,7 @@ mod test {
         const RESPONSE_RECORD: LookupResponseEntry = LookupResponseEntry {
             aci: Some(Aci::from_uuid_bytes([b'a'; 16])),
             pni: Some(Pni::from_uuid_bytes([b'p'; 16])),
-            e164: E164(nonzero!(18005550101u64)),
+            e164: E164::new(nonzero!(18005550101u64)),
         };
 
         fn receive_frame(&mut self, frame: &[u8]) -> AttestedServerOutput {
@@ -663,6 +700,12 @@ mod test {
         }
     }
 
+    const FAKE_WS_CONFIG: libsignal_net_infra::ws2::Config = libsignal_net_infra::ws2::Config {
+        local_idle_timeout: Duration::from_secs(5),
+        remote_idle_ping_timeout: Duration::from_secs(100),
+        remote_idle_disconnect_timeout: Duration::from_secs(100),
+    };
+
     #[tokio::test]
     async fn lookup_success() {
         let (server, client) = fake_websocket().await;
@@ -674,9 +717,8 @@ mod test {
             fake_server,
         ));
 
-        let ws_client = WebSocketClient::new_fake(client, mock_connection_info());
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(ws_client, |fake_attestation| {
+            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
             })
@@ -729,9 +771,8 @@ mod test {
             fake_server,
         ));
 
-        let ws_client = WebSocketClient::new_fake(client, mock_connection_info());
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(ws_client, |fake_attestation| {
+            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
             })
@@ -776,9 +817,8 @@ mod test {
             fake_server,
         ));
 
-        let ws_client = WebSocketClient::new_fake(client, mock_connection_info());
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(ws_client, |fake_attestation| {
+            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
             })
@@ -815,8 +855,11 @@ mod test {
         let connector = InMemoryWarpConnector::new(h2_server);
 
         let env = crate::env::PROD;
-        let endpoint_connection =
-            EnclaveEndpointConnection::new(&env.cdsi, Duration::from_secs(10));
+        let endpoint_connection = EnclaveEndpointConnection::new(
+            &env.cdsi,
+            Duration::from_secs(10),
+            &ObservableEvent::default(),
+        );
         let auth = Auth {
             username: "username".to_string(),
             password: "password".to_string(),
@@ -850,9 +893,8 @@ mod test {
             fake_server,
         ));
 
-        let ws_client = WebSocketClient::new_fake(client, mock_connection_info());
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(ws_client, |fake_attestation| {
+            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
             })

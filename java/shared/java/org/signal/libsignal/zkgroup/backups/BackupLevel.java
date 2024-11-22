@@ -5,19 +5,10 @@
 
 package org.signal.libsignal.zkgroup.backups;
 
-import java.util.Arrays;
-import java.util.Map;
-import java.util.function.Function;
-import java.util.stream.Collectors;
-
 public enum BackupLevel {
   // This must match the Rust version of the enum.
-  MESSAGES(200),
-  MEDIA(201);
-
-  private static final Map<Integer, BackupLevel> LOOKUP =
-      Arrays.stream(BackupLevel.values())
-          .collect(Collectors.toMap(BackupLevel::getValue, Function.identity()));
+  FREE(200),
+  PAID(201);
 
   private final int value;
 
@@ -30,10 +21,12 @@ public enum BackupLevel {
   }
 
   public static BackupLevel fromValue(int value) {
-    BackupLevel backupLevel = LOOKUP.get(value);
-    if (backupLevel == null) {
-      throw new IllegalArgumentException("Invalid backup level: " + value);
+    // A linear scan is simpler than a hash lookup for a set of values this small.
+    for (final var backupLevel : BackupLevel.values()) {
+      if (backupLevel.getValue() == value) {
+        return backupLevel;
+      }
     }
-    return backupLevel;
+    throw new IllegalArgumentException("Invalid backup level: " + value);
   }
 }

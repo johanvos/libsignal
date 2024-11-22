@@ -9,18 +9,18 @@ use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use attest::enclave::Error as EnclaveError;
 use attest::hsm_enclave::Error as HsmEnclaveError;
 use device_transfer::Error as DeviceTransferError;
+use libsignal_account_keys::Error as PinError;
 use libsignal_net::chat::ChatServiceError;
 use libsignal_net::infra::ws::WebSocketConnectError;
 use libsignal_net::svr3::Error as Svr3Error;
+use libsignal_net::ws::WebSocketServiceConnectError;
 use libsignal_protocol::*;
 use signal_crypto::Error as SignalCryptoError;
-use signal_pin::Error as PinError;
 use usernames::{UsernameError, UsernameLinkError};
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
-use crate::support::describe_panic;
-
 use super::{FutureCancelled, NullPointerError, UnexpectedPanic};
+use crate::support::describe_panic;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -76,31 +76,35 @@ pub enum SignalErrorCode {
     UsernameLinkInvalidEntropyDataLength = 127,
     UsernameLinkInvalid = 128,
 
-    UsernameDiscriminatorCannotBeEmpty = 140,
-    UsernameDiscriminatorCannotBeZero = 141,
-    UsernameDiscriminatorCannotBeSingleDigit = 142,
-    UsernameDiscriminatorCannotHaveLeadingZeros = 143,
-    UsernameDiscriminatorTooLarge = 144,
+    UsernameDiscriminatorCannotBeEmpty = 130,
+    UsernameDiscriminatorCannotBeZero = 131,
+    UsernameDiscriminatorCannotBeSingleDigit = 132,
+    UsernameDiscriminatorCannotHaveLeadingZeros = 133,
+    UsernameDiscriminatorTooLarge = 134,
 
-    IoError = 130,
+    IoError = 140,
     #[allow(dead_code)]
-    InvalidMediaInput = 131,
+    InvalidMediaInput = 141,
     #[allow(dead_code)]
-    UnsupportedMediaInput = 132,
+    UnsupportedMediaInput = 142,
 
-    ConnectionTimedOut = 133,
-    NetworkProtocol = 134,
-    RateLimited = 135,
-    WebSocket = 136,
-    CdsiInvalidToken = 137,
-    ConnectionFailed = 138,
-    ChatServiceInactive = 139,
+    ConnectionTimedOut = 143,
+    NetworkProtocol = 144,
+    RateLimited = 145,
+    WebSocket = 146,
+    CdsiInvalidToken = 147,
+    ConnectionFailed = 148,
+    ChatServiceInactive = 149,
+    ChatServiceIntentionallyDisconnected = 150,
 
-    SvrDataMissing = 150,
-    SvrRestoreFailed = 151,
+    SvrDataMissing = 160,
+    SvrRestoreFailed = 161,
+    SvrRotationMachineTooManySteps = 162,
 
-    AppExpired = 160,
-    DeviceDeregistered = 161,
+    AppExpired = 170,
+    DeviceDeregistered = 171,
+
+    BackupValidation = 180,
 }
 
 pub trait UpcastAsAny {
@@ -129,6 +133,9 @@ pub trait FfiError: UpcastAsAny + fmt::Debug + Send + 'static {
         Err(WrongErrorKind)
     }
     fn provide_tries_remaining(&self) -> Result<u32, WrongErrorKind> {
+        Err(WrongErrorKind)
+    }
+    fn provide_unknown_fields(&self) -> Result<Vec<String>, WrongErrorKind> {
         Err(WrongErrorKind)
     }
 }
@@ -430,7 +437,11 @@ impl FfiError for IoError {
 impl FfiError for libsignal_net::cdsi::LookupError {
     fn describe(&self) -> String {
         match self {
-            Self::Protocol | Self::InvalidResponse | Self::ParseError | Self::Server { .. } => {
+            Self::CdsiProtocol(_)
+            | Self::EnclaveProtocol(_)
+            | Self::InvalidResponse
+            | Self::ParseError
+            | Self::Server { .. } => {
                 format!("Protocol error: {self}")
             }
             Self::AttestationError(e) => e.describe(),
@@ -447,9 +458,11 @@ impl FfiError for libsignal_net::cdsi::LookupError {
 
     fn code(&self) -> SignalErrorCode {
         match self {
-            Self::Protocol | Self::InvalidResponse | Self::ParseError | Self::Server { .. } => {
-                SignalErrorCode::NetworkProtocol
-            }
+            Self::CdsiProtocol(_)
+            | Self::EnclaveProtocol(_)
+            | Self::InvalidResponse
+            | Self::ParseError
+            | Self::Server { .. } => SignalErrorCode::NetworkProtocol,
             Self::AttestationError(e) => e.code(),
             Self::RateLimited { .. } => SignalErrorCode::RateLimited,
             Self::InvalidToken => SignalErrorCode::CdsiInvalidToken,
@@ -473,20 +486,33 @@ impl FfiError for libsignal_net::cdsi::LookupError {
 impl FfiError for Svr3Error {
     fn describe(&self) -> String {
         match self {
-            Self::Connect(WebSocketConnectError::Timeout) | Self::ConnectionTimedOut => {
-                "Connect timed out".to_owned()
+            Self::Connect(WebSocketServiceConnectError::Connect(
+                WebSocketConnectError::Timeout,
+                _,
+            ))
+            | Self::ConnectionTimedOut => "Connect timed out".to_owned(),
+            Self::Connect(WebSocketServiceConnectError::Connect(
+                WebSocketConnectError::Transport(e),
+                _,
+            )) => {
+                format!("IO error: {e}")
             }
-            Self::Connect(WebSocketConnectError::Transport(e)) => format!("IO error: {e}"),
             Self::Connect(
-                e @ (WebSocketConnectError::WebSocketError(_)
-                | WebSocketConnectError::RejectedByServer(_)),
+                e @ (WebSocketServiceConnectError::Connect(
+                    WebSocketConnectError::WebSocketError(_),
+                    _,
+                )
+                | WebSocketServiceConnectError::RejectedByServer { .. }),
             ) => {
                 format!("WebSocket error: {e}")
             }
             Self::Service(e) => format!("WebSocket error: {e}"),
             Self::Protocol(e) => format!("Protocol error: {e}"),
             Self::AttestationError(inner) => inner.describe(),
-            Self::RequestFailed(_) | Self::RestoreFailed(_) | Self::DataMissing => {
+            Self::RequestFailed(_)
+            | Self::RestoreFailed(_)
+            | Self::DataMissing
+            | Self::RotationMachineTooManySteps => {
                 format!("SVR error: {self}")
             }
         }
@@ -495,10 +521,12 @@ impl FfiError for Svr3Error {
     fn code(&self) -> SignalErrorCode {
         match self {
             Self::Connect(e) => match e {
-                WebSocketConnectError::Transport(_) => SignalErrorCode::IoError,
-                WebSocketConnectError::Timeout => SignalErrorCode::ConnectionTimedOut,
-                WebSocketConnectError::WebSocketError(_)
-                | WebSocketConnectError::RejectedByServer(_) => SignalErrorCode::WebSocket,
+                WebSocketServiceConnectError::RejectedByServer { .. } => SignalErrorCode::WebSocket,
+                WebSocketServiceConnectError::Connect(e, _) => match e {
+                    WebSocketConnectError::Transport(_) => SignalErrorCode::IoError,
+                    WebSocketConnectError::Timeout => SignalErrorCode::ConnectionTimedOut,
+                    WebSocketConnectError::WebSocketError(_) => SignalErrorCode::WebSocket,
+                },
             },
             Self::Service(_) => SignalErrorCode::WebSocket,
             Self::ConnectionTimedOut => SignalErrorCode::ConnectionTimedOut,
@@ -507,6 +535,7 @@ impl FfiError for Svr3Error {
             Self::RequestFailed(_) => SignalErrorCode::UnknownError,
             Self::RestoreFailed(_) => SignalErrorCode::SvrRestoreFailed,
             Self::DataMissing => SignalErrorCode::SvrDataMissing,
+            Self::RotationMachineTooManySteps => SignalErrorCode::SvrRotationMachineTooManySteps,
         }
     }
 
@@ -537,6 +566,12 @@ impl FfiError for ChatServiceError {
             Self::ServiceInactive => "Chat service inactive".to_owned(),
             Self::AppExpired => "App expired".to_owned(),
             Self::DeviceDeregistered => "Device deregistered or delinked".to_owned(),
+            Self::ServiceIntentionallyDisconnected => {
+                "Chat service explicitly disconnected".to_owned()
+            }
+            Self::RetryLater {
+                retry_after_seconds,
+            } => format!("Rate limited; try again after {retry_after_seconds}s"),
         }
     }
 
@@ -558,6 +593,18 @@ impl FfiError for ChatServiceError {
             Self::ServiceInactive => SignalErrorCode::ChatServiceInactive,
             Self::AppExpired => SignalErrorCode::AppExpired,
             Self::DeviceDeregistered => SignalErrorCode::DeviceDeregistered,
+            Self::ServiceIntentionallyDisconnected => {
+                SignalErrorCode::ChatServiceIntentionallyDisconnected
+            }
+            Self::RetryLater { .. } => SignalErrorCode::RateLimited,
+        }
+    }
+    fn provide_retry_after_seconds(&self) -> Result<u32, WrongErrorKind> {
+        match self {
+            ChatServiceError::RetryLater {
+                retry_after_seconds,
+            } => Ok(*retry_after_seconds),
+            _ => Err(WrongErrorKind),
         }
     }
 }
@@ -624,6 +671,24 @@ impl FfiError for signal_media::sanitize::webp::Error {
                 }
             },
         }
+    }
+}
+
+impl FfiError for libsignal_message_backup::ReadError {
+    fn describe(&self) -> String {
+        self.to_string()
+    }
+
+    fn code(&self) -> SignalErrorCode {
+        SignalErrorCode::BackupValidation
+    }
+
+    fn provide_unknown_fields(&self) -> Result<Vec<String>, WrongErrorKind> {
+        Ok(self
+            .found_unknown_fields
+            .iter()
+            .map(ToString::to_string)
+            .collect())
     }
 }
 

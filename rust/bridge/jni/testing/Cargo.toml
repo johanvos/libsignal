@@ -5,21 +5,21 @@
 
 [package]
 name = "libsignal-jni-testing"
-version = "0.52.3"
+version = "0.62.0"
 authors = ["Signal Messenger LLC"]
 edition = "2021"
 license = "AGPL-3.0-only"
+
+[lints]
+workspace = true
 
 [lib]
 name = "signal_jni_testing"
 crate-type = ["cdylib"]
 
 [dependencies]
-libsignal-bridge-testing = { path = "../../shared/testing", features = ["jni"] }
+libsignal-bridge-testing = { workspace = true, features = ["jni"] }
+libsignal-bridge-types = { workspace = true, features = ["jni"] }
 
-async-trait = "0.1.41"
-cfg-if = "1.0.0"
-jni = "0.21.0"
-log = { version = "0.4", features = ["release_max_level_info"] }
-log-panics = { version = "2.1.0", features = ["with-backtrace"] }
-rand = "0.8"
+jni = { workspace = true }
+log = { workspace = true }

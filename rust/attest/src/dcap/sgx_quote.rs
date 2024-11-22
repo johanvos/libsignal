@@ -7,16 +7,16 @@
 //!
 //! See <https://download.01.org/intel-sgx/sgx-dcap/1.7/linux/docs/Intel_SGX_ECDSA_QuoteLibReference_DCAP_API.pdf> section A.4
 
-use boring::bn::BigNum;
-use boring::ec::{EcGroup, EcKey};
-use boring::ecdsa::{EcdsaSig, EcdsaSigRef};
-use boring::error::ErrorStack;
-use boring::nid::Nid;
-use boring::pkey::Public;
+use std::time::SystemTime;
+
+use boring_signal::bn::BigNum;
+use boring_signal::ec::{EcGroup, EcKey};
+use boring_signal::ecdsa::{EcdsaSig, EcdsaSigRef};
+use boring_signal::error::ErrorStack;
+use boring_signal::nid::Nid;
+use boring_signal::pkey::Public;
 use sha2::Digest;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
-
-use std::time::SystemTime;
 
 use crate::cert_chain::CertChain;
 use crate::dcap::ecdsa::{ecdsa_signature_from_bytes, EcdsaSigned};
@@ -325,13 +325,12 @@ static_assertions::const_assert_eq!(578, std::mem::size_of::<SgxEcdsaSignatureHe
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use boring::pkey::Private;
-
     use std::fs;
     use std::path::Path;
 
+    use boring_signal::pkey::Private;
+
+    use super::*;
     use crate::cert_chain::testutil::cert_chain;
 
     #[test]

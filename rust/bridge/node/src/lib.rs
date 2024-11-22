@@ -15,12 +15,12 @@ use minidump_unwind::Symbolizer;
 use neon::prelude::*;
 use neon::types::buffer::TypedArray;
 
+mod logging;
+
 // Import bridged functions. Without this, the compiler and/or linker are too
 // smart and don't include the symbols in the library.
 #[allow(unused)]
 use libsignal_bridge_testing::*;
-
-mod logging;
 
 #[neon::main]
 fn main(mut cx: ModuleContext) -> NeonResult<()> {
@@ -41,8 +41,8 @@ fn identitykeypair_deserialize(mut cx: FunctionContext) -> JsResult<JsObject> {
     let identity_keypair_or_error = IdentityKeyPair::try_from(buffer.as_slice(&cx));
     let identity_keypair = identity_keypair_or_error.or_else(|e| {
         let module = cx.this()?;
-        SignalNodeError::throw(e, &mut cx, module, "identitykeypair_deserialize")?;
-        unreachable!()
+        let throwable = e.into_throwable(&mut cx, module, "identitykeypair_deserialize");
+        cx.throw(throwable)
     })?;
     let public_key = identity_keypair.public_key().convert_into(&mut cx)?;
     let private_key = identity_keypair.private_key().convert_into(&mut cx)?;
@@ -86,13 +86,12 @@ fn sealed_sender_multi_recipient_message_parse(mut cx: FunctionContext) -> JsRes
         Ok(messages) => messages,
         Err(e) => {
             let module = cx.this()?;
-            SignalNodeError::throw(
-                e,
+            let throwable = e.into_throwable(
                 &mut cx,
                 module,
                 "sealed_sender_multi_recipient_parse_sent_message",
-            )?;
-            unreachable!()
+            );
+            cx.throw(throwable)?
         }
     };
 

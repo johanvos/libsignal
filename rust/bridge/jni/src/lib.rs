@@ -6,14 +6,13 @@
 #![allow(clippy::missing_safety_doc)]
 #![deny(clippy::unwrap_used)]
 
-use jni::objects::{JByteArray, JClass, JLongArray, JObject, JString};
 #[cfg(not(target_os = "android"))]
-use jni::objects::{JMap, JValue};
+use jni::objects::{AutoLocal, JList, JMap, JValue};
+use jni::objects::{JByteArray, JClass, JLongArray, JObject, JString};
 use jni::JNIEnv;
-
 use libsignal_bridge::jni::*;
+use libsignal_bridge::jni_args;
 use libsignal_bridge::net::TokioAsyncContext;
-use libsignal_bridge::{jni_args, jni_class_name};
 use libsignal_protocol::*;
 
 pub mod logging;
@@ -27,15 +26,18 @@ pub unsafe extern "C" fn Java_org_signal_libsignal_internal_Native_IdentityKeyPa
     data: JByteArray,
 ) -> JLongArray<'local> {
     run_ffi_safe(&mut env, |env| {
-        let data = env.convert_byte_array(data)?;
+        let data = env
+            .convert_byte_array(data)
+            .check_exceptions(env, "deserialize")?;
         let key = IdentityKeyPair::try_from(data.as_ref())?;
 
         let public_key_handle = key.identity_key().public_key().convert_into(env)?;
         let private_key_handle = key.private_key().convert_into(env)?;
         let tuple = [public_key_handle, private_key_handle];
 
-        let result = env.new_long_array(2)?;
-        env.set_long_array_region(&result, 0, &tuple)?;
+        let result = env.new_long_array(2).check_exceptions(env, "deserialize")?;
+        env.set_long_array_region(&result, 0, &tuple)
+            .check_exceptions(env, "deserialize")?;
         Ok(result)
     })
 }
@@ -89,7 +91,10 @@ pub unsafe extern "C" fn Java_org_signal_libsignal_internal_Native_AsyncLoadClas
             jni_args!(() -> long),
         )?;
         let tokio_context = <&TokioAsyncContext>::convert_from(env, &handle)?;
-        let class_name = env.get_string(&class_name)?.into();
+        let class_name = env
+            .get_string(&class_name)
+            .check_exceptions(env, "AsyncLoadClass")?
+            .into();
         run_future_on_runtime(env, tokio_context, |_cancel| async {
             FutureResultReporter::new(Ok(LoadClassFromName(class_name)), ())
         })
@@ -108,7 +113,8 @@ pub unsafe extern "C" fn Java_org_signal_libsignal_internal_Native_SealedSender_
 ) -> JObject<'local> {
     run_ffi_safe(&mut env, |env| {
         let mut data_stored =
-            unsafe { env.get_array_elements(&data, jni::objects::ReleaseMode::NoCopyBack)? };
+            unsafe { env.get_array_elements(&data, jni::objects::ReleaseMode::NoCopyBack) }
+                .check_exceptions(env, "MultiRecipientParseSentMessage")?;
         let data_as_slice = <&[u8]>::load_from(&mut data_stored);
         let messages = SealedSenderV2SentMessage::parse(data_as_slice)?;
 
@@ -117,94 +123,85 @@ pub unsafe extern "C" fn Java_org_signal_libsignal_internal_Native_SealedSender_
             ClassName("java.util.LinkedHashMap"),
             jni_args!(() -> void),
         )?;
-        let recipient_map: JMap = JMap::from_env(env, &recipient_map_object)?;
+        let recipient_map: JMap = JMap::from_env(env, &recipient_map_object)
+            .check_exceptions(env, "MultiRecipientParseSentMessage")?;
 
-        const NUMBER_OF_OBJECTS_PER_RECIPIENT: usize = 5; // ServiceId + service ID bytes + Recipient + array of device IDs + array of registration IDs
-        let excluded_recipients_array = env.with_local_frame_returning_local(
-            (messages.recipients.len() * NUMBER_OF_OBJECTS_PER_RECIPIENT)
-                .try_into()
-                .expect("too many recipients"),
-            |env| -> SignalJniResult<_> {
-                let recipient_class = find_class(
+        let recipient_class_name =
+            ClassName("org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage$Recipient");
+        let recipient_class = find_class(env, recipient_class_name)?;
+        let service_id_class =
+            find_class(env, ClassName("org.signal.libsignal.protocol.ServiceId"))?;
+
+        let excluded_recipients_list_object =
+            new_instance(env, ClassName("java.util.ArrayList"), jni_args!(() -> void))?;
+        let excluded_recipients_list = JList::from_env(env, &excluded_recipients_list_object)
+            .check_exceptions(env, "java.util.List")?;
+
+        for (service_id, recipient) in &messages.recipients {
+            let java_service_id_bytes = AutoLocal::new(service_id.convert_into(env)?, env);
+            let java_service_id = AutoLocal::new(
+                call_static_method_checked(
                     env,
-                    ClassName(
-                        "org.signal.libsignal.protocol.SealedSenderMultiRecipientMessage$Recipient",
-                    ),
-                )?;
-                let service_id_class =
-                    find_class(env, ClassName("org.signal.libsignal.protocol.ServiceId"))?;
+                    &service_id_class,
+                    "parseFromFixedWidthBinary",
+                    jni_args!((
+                        java_service_id_bytes => [byte]
+                    ) -> org.signal.libsignal.protocol.ServiceId),
+                )?,
+                env,
+            );
 
-                let mut excluded_recipient_java_service_ids = vec![];
+            if recipient.devices.is_empty() {
+                excluded_recipients_list
+                    .add(env, &java_service_id)
+                    .check_exceptions(env, "add")?;
+                continue;
+            }
 
-                for (service_id, recipient) in &messages.recipients {
-                    let java_service_id_bytes = service_id.convert_into(env)?;
-                    let java_service_id = call_static_method_checked(
-                        env,
-                        &service_id_class,
-                        "parseFromFixedWidthBinary",
-                        jni_args!((
-                            java_service_id_bytes => [byte]
-                        ) -> org.signal.libsignal.protocol.ServiceId),
-                    )?;
+            let (device_ids, registration_ids): (Vec<u8>, Vec<i16>) = recipient
+                .devices
+                .iter()
+                .map(|(device_id, registration_id)| {
+                    (
+                        u8::try_from(u32::from(*device_id)).expect("checked during parsing"),
+                        i16::try_from(*registration_id).expect("checked during parsing"),
+                    )
+                })
+                .unzip();
+            let java_device_ids = AutoLocal::new(
+                env.byte_array_from_slice(&device_ids)
+                    .check_exceptions(env, "MultiRecipientParseSentMessage")?,
+                env,
+            );
+            let java_registration_ids = AutoLocal::new(
+                env.new_short_array(registration_ids.len().try_into().expect("too many devices"))
+                    .check_exceptions(env, "MultiRecipientParseSentMessage")?,
+                env,
+            );
+            env.set_short_array_region(&java_registration_ids, 0, &registration_ids)
+                .check_exceptions(env, "MultiRecipientParseSentMessage")?;
 
-                    if recipient.devices.is_empty() {
-                        excluded_recipient_java_service_ids.push(java_service_id);
-                        continue;
-                    }
+            let range = messages.range_for_recipient_key_material(recipient);
 
-                    let (device_ids, registration_ids): (Vec<u8>, Vec<i16>) = recipient
-                        .devices
-                        .iter()
-                        .map(|(device_id, registration_id)| {
-                            (
-                                u8::try_from(u32::from(*device_id))
-                                    .expect("checked during parsing"),
-                                i16::try_from(*registration_id).expect("checked during parsing"),
-                            )
-                        })
-                        .unzip();
-                    let java_device_ids = env.byte_array_from_slice(&device_ids)?;
-                    let java_registration_ids = env.new_short_array(
-                        registration_ids.len().try_into().expect("too many devices"),
-                    )?;
-                    env.set_short_array_region(&java_registration_ids, 0, &registration_ids)?;
+            let java_recipient = AutoLocal::new(
+                new_object(
+                    env,
+                    &recipient_class,
+                    jni_args!((
+                        java_device_ids => [byte],
+                        java_registration_ids => [short],
+                        range.start.try_into().expect("data too large") => int,
+                        range.len().try_into().expect("data too large") => int,
+                    ) -> void),
+                )
+                .check_exceptions(env, recipient_class_name.0)?,
+                env,
+            );
 
-                    let range = messages.range_for_recipient_key_material(recipient);
-
-                    let java_recipient = new_object(
-                        env,
-                        &recipient_class,
-                        jni_args!((
-                            java_device_ids => [byte],
-                            java_registration_ids => [short],
-                            range.start.try_into().expect("data too large") => int,
-                            range.len().try_into().expect("data too large") => int,
-                        ) -> void),
-                    )?;
-
-                    recipient_map.put(env, &java_service_id, &java_recipient)?;
-                }
-
-                let excluded_recipients_array = env.new_object_array(
-                    excluded_recipient_java_service_ids
-                        .len()
-                        .try_into()
-                        .expect("too many excluded recipients"),
-                    jni_class_name!(org.signal.libsignal.protocol.ServiceId),
-                    JObject::null(),
-                )?;
-                for (java_excluded_recipient, i) in
-                    excluded_recipient_java_service_ids.into_iter().zip(0i32..)
-                {
-                    env.set_object_array_element(
-                        &excluded_recipients_array,
-                        i,
-                        java_excluded_recipient,
-                    )?;
-                }
-                Ok(excluded_recipients_array.into())
-            },
-        )?;
+            recipient_map
+                .put(env, &java_service_id, &java_recipient)
+                .check_exceptions(env, "put")?;
+        }
 
         let offset_of_shared_bytes = messages.offset_of_shared_bytes();
 
@@ -214,7 +211,7 @@ pub unsafe extern "C" fn Java_org_signal_libsignal_internal_Native_SealedSender_
             jni_args!((
                 data => [byte],
                 recipient_map => java.util.Map,
-                excluded_recipients_array => [org.signal.libsignal.protocol.ServiceId],
+                excluded_recipients_list => java.util.List,
                 offset_of_shared_bytes.try_into().expect("data too large") => int,
             ) -> void),
         )?)

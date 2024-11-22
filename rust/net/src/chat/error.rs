@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use crate::infra::connection_manager::{ErrorClass, ErrorClassifier};
-use crate::infra::errors::{LogSafeDisplay, TransportConnectError};
-use crate::infra::reconnect;
-use crate::infra::ws::{WebSocketConnectError, WebSocketServiceError};
+use libsignal_net_infra::errors::{LogSafeDisplay, TransportConnectError};
+use libsignal_net_infra::ws::{WebSocketConnectError, WebSocketServiceError};
+use libsignal_net_infra::{extract_retry_after_seconds, service};
+
+use crate::ws::WebSocketServiceConnectError;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ChatServiceError {
@@ -36,6 +37,10 @@ pub enum ChatServiceError {
     ServiceInactive,
     /// Service is unavailable due to the lost connection
     ServiceUnavailable,
+    /// Service was disconnected by an intentional local call
+    ServiceIntentionallyDisconnected,
+    /// Service is unavailable now, try again after {retry_after_seconds}s
+    RetryLater { retry_after_seconds: u32 },
 }
 
 impl LogSafeDisplay for ChatServiceError {}
@@ -46,70 +51,81 @@ impl From<WebSocketServiceError> for ChatServiceError {
     }
 }
 
-impl From<WebSocketConnectError> for ChatServiceError {
-    fn from(e: WebSocketConnectError) -> Self {
-        if !matches!(e.classify(), ErrorClass::Fatal) {
-            log::warn!(
-                "intermittent WebSocketConnectError should be retried, not returned as a ChatServiceError ({e})"
-            );
-        }
+impl From<WebSocketServiceConnectError> for ChatServiceError {
+    fn from(e: WebSocketServiceConnectError) -> Self {
         match e {
-            WebSocketConnectError::Transport(e) => match e {
-                TransportConnectError::InvalidConfiguration => {
-                    WebSocketServiceError::Other("invalid configuration")
+            WebSocketServiceConnectError::Connect(e, _) => match e {
+                WebSocketConnectError::Transport(e) => match e {
+                    TransportConnectError::InvalidConfiguration => {
+                        WebSocketServiceError::Other("invalid configuration")
+                    }
+                    TransportConnectError::TcpConnectionFailed => {
+                        WebSocketServiceError::Other("TCP connection failed")
+                    }
+                    TransportConnectError::DnsError => WebSocketServiceError::Other("DNS error"),
+                    TransportConnectError::SslError(_)
+                    | TransportConnectError::SslFailedHandshake(_) => {
+                        WebSocketServiceError::Other("TLS failure")
+                    }
+                    TransportConnectError::CertError => {
+                        WebSocketServiceError::Other("failed to load certificates")
+                    }
+                    TransportConnectError::ProxyProtocol => {
+                        WebSocketServiceError::Other("proxy protocol error")
+                    }
+                    TransportConnectError::ClientAbort => {
+                        WebSocketServiceError::Other("client abort error")
+                    }
                 }
-                TransportConnectError::TcpConnectionFailed => {
-                    WebSocketServiceError::Other("TCP connection failed")
+                .into(),
+                WebSocketConnectError::Timeout => Self::Timeout,
+                WebSocketConnectError::WebSocketError(e) => Self::WebSocket(e.into()),
+            },
+            WebSocketServiceConnectError::RejectedByServer {
+                response,
+                received_at: _,
+            } => {
+                // Retry-After takes precedence over everything else.
+                if let Some(retry_after_seconds) = extract_retry_after_seconds(response.headers()) {
+                    return Self::RetryLater {
+                        retry_after_seconds,
+                    };
                 }
-                TransportConnectError::DnsError => WebSocketServiceError::Other("DNS error"),
-                TransportConnectError::SslError(_)
-                | TransportConnectError::SslFailedHandshake(_) => {
-                    WebSocketServiceError::Other("TLS failure")
+                match response.status().as_u16() {
+                    499 => Self::AppExpired,
+                    403 => {
+                        // Technically this only applies to identified sockets,
+                        // but unidentified sockets should never produce a 403 anyway.
+                        Self::DeviceDeregistered
+                    }
+                    _ => Self::WebSocket(WebSocketServiceError::Http(response)),
                 }
-                TransportConnectError::CertError => {
-                    WebSocketServiceError::Other("failed to load certificates")
-                }
-            }
-            .into(),
-            WebSocketConnectError::Timeout => Self::Timeout,
-            WebSocketConnectError::WebSocketError(e) => Self::WebSocket(e.into()),
-            WebSocketConnectError::RejectedByServer(response) if response.status() == 499 => {
-                Self::AppExpired
-            }
-            WebSocketConnectError::RejectedByServer(response) if response.status() == 403 => {
-                // Technically this only applies to identified sockets,
-                // but unidentified sockets should never produce a 403 anyway.
-                Self::DeviceDeregistered
-            }
-            WebSocketConnectError::RejectedByServer(response) => {
-                Self::WebSocket(WebSocketServiceError::Http(response))
             }
         }
     }
 }
 
-impl<E: LogSafeDisplay + Into<ChatServiceError>> From<reconnect::ReconnectError<E>>
+impl<E: LogSafeDisplay + Into<ChatServiceError>> From<service::ConnectError<E>>
     for ChatServiceError
 {
-    fn from(e: reconnect::ReconnectError<E>) -> Self {
+    fn from(e: service::ConnectError<E>) -> Self {
         match e {
-            reconnect::ReconnectError::Timeout { attempts } => {
+            service::ConnectError::Timeout { attempts } => {
                 Self::TimeoutEstablishingConnection { attempts }
             }
-            reconnect::ReconnectError::AllRoutesFailed { attempts } => {
+            service::ConnectError::AllRoutesFailed { attempts } => {
                 Self::AllConnectionRoutesFailed { attempts }
             }
-            reconnect::ReconnectError::RejectedByServer(e) => e.into(),
-            reconnect::ReconnectError::Inactive => Self::ServiceInactive,
+            service::ConnectError::RejectedByServer(e) => e.into(),
         }
     }
 }
 
-impl From<reconnect::StateError> for ChatServiceError {
-    fn from(e: reconnect::StateError) -> Self {
+impl From<service::StateError> for ChatServiceError {
+    fn from(e: service::StateError) -> Self {
         match e {
-            reconnect::StateError::Inactive => Self::ServiceInactive,
-            reconnect::StateError::ServiceUnavailable => Self::ServiceUnavailable,
+            service::StateError::Inactive => Self::ServiceInactive,
+            service::StateError::ServiceUnavailable => Self::ServiceUnavailable,
         }
     }
 }

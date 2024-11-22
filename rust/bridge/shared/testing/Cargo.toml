@@ -10,24 +10,37 @@ authors = ["Signal Messenger LLC"]
 edition = "2021"
 license = "AGPL-3.0-only"
 
+[lints]
+workspace = true
+
 [dependencies]
-libsignal-bridge-macros = { path = "../macros" }
-libsignal-bridge-types = { path = "../types" }
-libsignal-message-backup = { path = "../../../message-backup" }
+attest = { workspace = true }
+libsignal-bridge-macros = { workspace = true }
+libsignal-bridge-types = { workspace = true }
+libsignal-core = { workspace = true }
+libsignal-keytrans = { workspace = true }
+libsignal-message-backup = { workspace = true, features = ["json"] }
+libsignal-net = { workspace = true }
+libsignal-protocol = { workspace = true }
 
-futures-util = "0.3.7"
-paste = "1.0"
-scopeguard = "1.0"
-thiserror = "1.0.50"
+const-str = { workspace = true, features = ["std"] }
+futures-util = { workspace = true }
+hex-literal = { workspace = true }
+http = { workspace = true }
+nonzero_ext = { workspace = true }
+paste = { workspace = true }
+prost = { workspace = true }
+scopeguard = { workspace = true }
+strum = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
+uuid = { workspace = true }
 
-jni = { version = "0.21", package = "jni", optional = true }
-linkme = { version = "0.3.9", optional = true }
-neon = { version = "1.0.0", optional = true, default-features = false, features = ["napi-6"] }
-signal-neon-futures = { path = "../../node/futures", optional = true }
-strum = { version = "0.26", features = ["derive"] }
+jni = { workspace = true, optional = true }
+linkme = { workspace = true, optional = true }
+neon = { workspace = true, optional = true, default-features = false, features = ["napi-6"] }
 
 [features]
 ffi = ["libsignal-bridge-types/ffi"]
 jni = ["dep:jni", "libsignal-bridge-types/jni"]
-node = ["dep:linkme", "libsignal-bridge-types/node"]
+node = ["dep:linkme", "dep:neon", "libsignal-bridge-types/node"]
 signal-media = ["libsignal-bridge-types/signal-media"]

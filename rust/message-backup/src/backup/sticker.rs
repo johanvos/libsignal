@@ -10,11 +10,15 @@
 
 use derive_where::derive_where;
 
+use crate::backup::file::{FilePointer, FilePointerError};
 use crate::backup::method::Method;
+use crate::backup::time::ReportUnusualTimestamp;
+use crate::backup::{TryFromWith, TryIntoWith};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::StickerPack`].
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
         M::Value<Key>: PartialEq,
     ))]
@@ -23,20 +27,22 @@ pub struct StickerPack<M: Method> {
     _limit_construction_to_module: (),
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct MessageSticker {
     pub pack_id: PackId,
     pub pack_key: Key,
+    pub sticker_id: u32,
     pub emoji: Option<String>,
+    pub data: FilePointer,
     _limit_construction_to_module: (),
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PackId([u8; 16]);
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, serde::Serialize)]
+pub struct PackId(#[serde(with = "hex")] [u8; 16]);
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct Key([u8; 32]);
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, serde::Serialize)]
+pub struct Key(#[serde(with = "hex")] [u8; 32]);
 
 impl<'a> TryFrom<&'a [u8]> for PackId {
     type Error = <&'a [u8] as TryInto<[u8; 16]>>::Error;
@@ -66,6 +72,10 @@ pub enum MessageStickerError {
     InvalidPackId,
     /// pack key is invalid
     InvalidPackKey,
+    /// missing data pointer
+    MissingDataPointer,
+    /// data pointer: {0}
+    DataPointer(#[from] FilePointerError),
 }
 
 impl<M: Method> TryFrom<proto::StickerPack> for StickerPack<M> {
@@ -88,18 +98,17 @@ impl<M: Method> TryFrom<proto::StickerPack> for StickerPack<M> {
     }
 }
 
-impl TryFrom<proto::Sticker> for MessageSticker {
+impl<C: ReportUnusualTimestamp> TryFromWith<proto::Sticker, C> for MessageSticker {
     type Error = MessageStickerError;
 
-    fn try_from(item: proto::Sticker) -> Result<Self, Self::Error> {
+    fn try_from_with(item: proto::Sticker, context: &C) -> Result<Self, Self::Error> {
         let proto::Sticker {
             packId,
             packKey,
-            stickerId: _,
+            stickerId,
             emoji,
+            data,
             special_fields: _,
-            // TODO validate these fields
-            data: _,
         } = item;
 
         let pack_id = packId
@@ -111,10 +120,17 @@ impl TryFrom<proto::Sticker> for MessageSticker {
             .try_into()
             .map_err(|_| MessageStickerError::InvalidPackKey)?;
 
+        let data = data
+            .into_option()
+            .ok_or(MessageStickerError::MissingDataPointer)?
+            .try_into_with(context)?;
+
         Ok(Self {
             pack_id,
             pack_key,
+            sticker_id: stickerId,
             emoji,
+            data,
             _limit_construction_to_module: (),
         })
     }
@@ -124,9 +140,9 @@ impl TryFrom<proto::Sticker> for MessageSticker {
 mod test {
     use test_case::test_case;
 
-    use crate::backup::method::Store;
-
     use super::*;
+    use crate::backup::method::Store;
+    use crate::backup::testutil::TestContext;
 
     impl proto::StickerPack {
         pub(crate) const TEST_ID: PackId = PackId(Self::TEST_ID_BYTES);
@@ -151,6 +167,7 @@ mod test {
                 packId: proto::StickerPack::TEST_ID_BYTES.into(),
                 packKey: proto::StickerPack::TEST_KEY.into(),
                 stickerId: Self::TEST_ID,
+                data: Some(proto::FilePointer::minimal_test_data()).into(),
                 ..Default::default()
             }
         }
@@ -167,72 +184,47 @@ mod test {
         )
     }
 
-    trait StickerPackFields {
-        fn pack_key_mut(&mut self) -> &mut Vec<u8>;
-    }
-    impl StickerPackFields for proto::StickerPack {
-        fn pack_key_mut(&mut self) -> &mut Vec<u8> {
-            &mut self.packKey
-        }
-    }
-    impl StickerPackFields for proto::Sticker {
-        fn pack_key_mut(&mut self) -> &mut Vec<u8> {
-            &mut self.packKey
-        }
-    }
-
-    #[test_case(invalid_key, Err(StickerPackError::InvalidKey))]
-    #[test_case(no_key, Err(StickerPackError::InvalidKey))]
-    fn sticker_pack(mutator: fn(&mut proto::StickerPack), expected: Result<(), StickerPackError>) {
+    #[test_case(|x| x.packKey = vec![0xaa; 45] => Err(StickerPackError::InvalidKey); "invalid key")]
+    #[test_case(|x| x.packKey = vec![] => Err(StickerPackError::InvalidKey); "no key")]
+    fn sticker_pack(mutator: fn(&mut proto::StickerPack)) -> Result<(), StickerPackError> {
         let mut sticker_pack = proto::StickerPack::test_data();
         mutator(&mut sticker_pack);
 
-        let result = sticker_pack.try_into().map(|_: StickerPack<Store>| ());
-        assert_eq!(result, expected);
+        sticker_pack.try_into().map(|_: StickerPack<Store>| ())
     }
 
     #[test]
     fn valid_message_sticker() {
         assert_eq!(
-            proto::Sticker::test_data().try_into(),
+            proto::Sticker::test_data().try_into_with(&TestContext::default()),
             Ok(MessageSticker {
                 pack_id: proto::StickerPack::TEST_ID,
                 pack_key: Key(proto::StickerPack::TEST_KEY),
+                sticker_id: proto::Sticker::TEST_ID,
                 emoji: None,
+                data: FilePointer::default(),
                 _limit_construction_to_module: (),
             })
         );
     }
 
-    fn invalid_pack_id(input: &mut proto::Sticker) {
-        input.packId = vec![123; 3];
-    }
-    fn unknown_pack_id(input: &mut proto::Sticker) {
-        input.packId = vec![0xff; 16];
-    }
-    fn unknown_sticker_id(input: &mut proto::Sticker) {
-        input.stickerId = 555555;
-    }
-    fn invalid_key(pack: &mut impl StickerPackFields) {
-        *pack.pack_key_mut() = vec![0xaa; 45];
-    }
-    fn no_key(pack: &mut impl StickerPackFields) {
-        *pack.pack_key_mut() = vec![];
-    }
-
-    #[test_case(invalid_key, Err(MessageStickerError::InvalidPackKey))]
-    #[test_case(no_key, Err(MessageStickerError::InvalidPackKey))]
-    #[test_case(invalid_pack_id, Err(MessageStickerError::InvalidPackId))]
-    #[test_case(unknown_sticker_id, Ok(()))]
-    #[test_case(unknown_pack_id, Ok(()))]
-    fn message_sticker(
-        mutator: fn(&mut proto::Sticker),
-        expected: Result<(), MessageStickerError>,
-    ) {
+    #[test_case(|x| x.packKey = vec![0xaa; 45] => Err(MessageStickerError::InvalidPackKey); "invalid key")]
+    #[test_case(|x| x.packKey = vec![] => Err(MessageStickerError::InvalidPackKey); "no key")]
+    #[test_case(|x| x.packId = vec![123; 3] => Err(MessageStickerError::InvalidPackId); "invalid pack ID")]
+    #[test_case(|x| x.stickerId = 555555 => Ok(()); "unknown sticker ID")]
+    #[test_case(|x| x.packId = vec![0xff; 16] => Ok(()); "unknown pack ID")]
+    #[test_case(|x| x.data = None.into() => Err(MessageStickerError::MissingDataPointer); "no data")]
+    #[test_case(
+        |x| x.data = Some(proto::FilePointer::default()).into() =>
+        Err(MessageStickerError::DataPointer(FilePointerError::NoLocator));
+        "invalid data"
+    )]
+    fn message_sticker(mutator: fn(&mut proto::Sticker)) -> Result<(), MessageStickerError> {
         let mut sticker = proto::Sticker::test_data();
         mutator(&mut sticker);
 
-        let result = sticker.try_into().map(|_: MessageSticker| ());
-        assert_eq!(result, expected);
+        sticker
+            .try_into_with(&TestContext::default())
+            .map(|_: MessageSticker| ())
     }
 }

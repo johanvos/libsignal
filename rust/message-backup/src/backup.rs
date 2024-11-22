@@ -3,24 +3,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::cell::RefCell;
 use std::collections::{hash_map, HashMap};
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use derive_where::derive_where;
-use libsignal_protocol::Aci;
+use libsignal_account_keys::BACKUP_KEY_LEN;
+use libsignal_core::Aci;
 
 pub(crate) use crate::backup::account_data::{AccountData, AccountDataError};
 use crate::backup::call::{AdHocCall, CallError};
 use crate::backup::chat::chat_style::{CustomChatColor, CustomColorId};
 use crate::backup::chat::{ChatData, ChatError, ChatItemData, ChatItemError, PinOrder};
 use crate::backup::frame::{ChatId, RecipientId};
-use crate::backup::method::{Contains, Lookup, LookupPair, Method, Store, ValidateOnly};
+use crate::backup::method::{Lookup, LookupPair, Method, Store, ValidateOnly};
 use crate::backup::recipient::{
     DestinationKind, FullRecipientData, MinimalRecipientData, RecipientError,
 };
+use crate::backup::serialize::{backup_key_as_hex, SerializeOrder};
 use crate::backup::sticker::{PackId as StickerPackId, StickerPack, StickerPackError};
-use crate::backup::time::Timestamp;
+use crate::backup::time::{
+    ReportUnusualTimestamp, Timestamp, TimestampIssue, UnusualTimestampTracker,
+};
 use crate::proto::backup as proto;
 use crate::proto::backup::frame::Item as FrameItem;
 
@@ -31,19 +36,23 @@ mod file;
 mod frame;
 pub(crate) mod method;
 mod recipient;
+pub mod serialize;
 mod sticker;
 mod time;
+
+#[cfg(test)]
+mod testutil;
 
 pub trait ReferencedTypes {
     /// Recorded information from a [`proto::Recipient`].
     type RecipientData: Debug + AsRef<DestinationKind>;
     /// Resolved data for a [`RecipientId`] in a non-`proto::Recipient` message.
-    type RecipientReference: Clone + Debug;
+    type RecipientReference: Clone + Debug + serde::Serialize + SerializeOrder;
 
     /// Recorded information from a [`proto::chat_style::CustomChatColor`].
-    type CustomColorData: Debug + From<CustomChatColor>;
+    type CustomColorData: Debug + From<CustomChatColor> + serde::Serialize;
     /// Resolved data for a [`CustomColorId`] in a non-`CustomChatColor` message.
-    type CustomColorReference: Clone + Debug;
+    type CustomColorReference: Clone + Debug + serde::Serialize;
 
     fn color_reference<'a>(
         id: &'a CustomColorId,
@@ -65,7 +74,7 @@ pub trait ReferencedTypes {
     /// with one method that takes a context type with the `LookupPair` bound,
     /// but that doesn't seem to provide additional value.
     fn try_convert_recipient<
-        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference>,
+        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference> + ReportUnusualTimestamp,
     >(
         recipient: proto::Recipient,
         context: &C,
@@ -77,20 +86,25 @@ pub struct PartialBackup<M: Method + ReferencedTypes> {
     account_data: Option<AccountData<M>>,
     recipients: HashMap<RecipientId, M::RecipientData>,
     chats: ChatsData<M>,
-    ad_hoc_calls: M::List<AdHocCall<RecipientId>>,
+    ad_hoc_calls: M::List<AdHocCall<M::RecipientReference>>,
     sticker_packs: HashMap<StickerPackId, StickerPack<M>>,
+    /// Stored here so PartialBackup can be the only context necessary for processing backup frames.
+    unusual_timestamp_tracker: RefCell<UnusualTimestampTracker>,
 }
 
+#[derive_where(Debug)]
 pub struct CompletedBackup<M: Method + ReferencedTypes> {
     meta: BackupMeta,
     account_data: AccountData<M>,
     recipients: HashMap<RecipientId, M::RecipientData>,
     chats: ChatsData<M>,
-    ad_hoc_calls: M::List<AdHocCall<RecipientId>>,
+    ad_hoc_calls: M::List<AdHocCall<M::RecipientReference>>,
     sticker_packs: HashMap<StickerPackId, StickerPack<M>>,
 }
 
-#[derive_where(Default)]
+pub type Backup = CompletedBackup<Store>;
+
+#[derive_where(Debug, Default)]
 struct ChatsData<M: Method + ReferencedTypes> {
     items: HashMap<ChatId, ChatData<M>>,
     pinned: Vec<(PinOrder, M::RecipientReference)>,
@@ -98,22 +112,18 @@ struct ChatsData<M: Method + ReferencedTypes> {
     pub chat_items_count: usize,
 }
 
-#[derive(Debug)]
-pub struct Backup {
-    pub meta: BackupMeta,
-    pub account_data: AccountData<Store>,
-    pub recipients: HashMap<RecipientId, FullRecipientData>,
-    pub chats: HashMap<ChatId, ChatData<Store>>,
-    pub ad_hoc_calls: Vec<AdHocCall<RecipientId>>,
-    pub sticker_packs: HashMap<StickerPackId, StickerPack<Store>>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct BackupMeta {
     /// The version of the backup format being parsed.
     pub version: u64,
     /// When the backup process started.
+    ///
+    /// Omitted from the canonical backup string, so that subsequent backups can be compared.
+    #[serde(skip)]
     pub backup_time: Timestamp,
+    /// The key used to encrypt and upload media associated with this backup.
+    #[serde(serialize_with = "backup_key_as_hex")]
+    pub media_root_backup_key: libsignal_account_keys::BackupKey,
     /// What purpose the backup was intended for.
     pub purpose: Purpose,
 }
@@ -128,6 +138,7 @@ pub struct BackupMeta {
     strum::EnumString,
     strum::Display,
     strum::IntoStaticStr,
+    serde::Serialize,
 )]
 pub enum Purpose {
     /// Intended for immediate transfer from one device to another.
@@ -163,6 +174,7 @@ impl<M: Method + ReferencedTypes> TryFrom<PartialBackup<M>> for CompletedBackup<
             chats,
             ad_hoc_calls,
             sticker_packs,
+            unusual_timestamp_tracker: _,
         } = value;
 
         let account_data = account_data.ok_or(CompletionError::MissingAccountData)?;
@@ -178,37 +190,12 @@ impl<M: Method + ReferencedTypes> TryFrom<PartialBackup<M>> for CompletedBackup<
     }
 }
 
-impl From<CompletedBackup<Store>> for Backup {
-    fn from(value: CompletedBackup<Store>) -> Self {
-        let CompletedBackup {
-            meta,
-            account_data,
-            recipients,
-            chats:
-                ChatsData {
-                    items: chats,
-                    pinned: _,
-                    chat_items_count: _,
-                },
-            ad_hoc_calls,
-            sticker_packs,
-        } = value;
-
-        Self {
-            meta,
-            account_data,
-            recipients,
-            chats,
-            ad_hoc_calls,
-            sticker_packs,
-        }
-    }
-}
-
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub enum ValidationError {
     /// Frame.item is a oneof but has no value
     EmptyFrame,
+    /// BackupInfo error: {0}
+    BackupInfoError(#[from] MetadataError),
     /// multiple AccountData frames found
     MultipleAccountData,
     /// AccountData error: {0}
@@ -239,7 +226,7 @@ pub struct CallFrameError {
 ///
 /// Implements fallible conversions from `T` into `Self` with an additional
 /// "context" argument.
-trait TryFromWith<T, C>: Sized {
+trait TryFromWith<T, C: ?Sized>: Sized {
     type Error;
 
     /// Uses additional context to convert `item` into an instance of `Self`.
@@ -253,7 +240,7 @@ trait TryFromWith<T, C>: Sized {
 /// This trait is blanket-implemented for types that implement [`TryFromWith`].
 /// Its only purpose is to offer the more convenient `x.try_into_with(c)` as
 /// opposed to `Y::try_from_with(x, c)`.
-trait TryIntoWith<T, C>: Sized {
+trait TryIntoWith<T, C: ?Sized>: Sized {
     type Error;
 
     /// Uses additional context to convert `self` into an instance of `T`.
@@ -262,7 +249,7 @@ trait TryIntoWith<T, C>: Sized {
     fn try_into_with(self, context: &C) -> Result<T, Self::Error>;
 }
 
-impl<A, B: TryFromWith<A, C>, C> TryIntoWith<B, C> for A {
+impl<A, B: TryFromWith<A, C>, C: ?Sized> TryIntoWith<B, C> for A {
     type Error = B::Error;
     fn try_into_with(self, context: &C) -> Result<B, Self::Error> {
         B::try_from_with(self, context)
@@ -306,7 +293,7 @@ impl ReferencedTypes for Store {
     }
 
     fn try_convert_recipient<
-        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference>,
+        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference> + ReportUnusualTimestamp,
     >(
         recipient: proto::Recipient,
         context: &C,
@@ -338,7 +325,7 @@ impl ReferencedTypes for ValidateOnly {
     }
 
     fn try_convert_recipient<
-        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference>,
+        C: LookupPair<RecipientId, DestinationKind, Self::RecipientReference> + ReportUnusualTimestamp,
     >(
         recipient: proto::Recipient,
         context: &C,
@@ -351,40 +338,65 @@ impl ReferencedTypes for ValidateOnly {
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 pub struct RecipientFrameError(RecipientId, RecipientError);
 
+#[derive(Debug, displaydoc::Display, thiserror::Error)]
+pub enum MetadataError {
+    /// invalid mediaRootBackupKey (expected {BACKUP_KEY_LEN:?} bytes, got {0:?})
+    InvalidMediaRootBackupKey(usize),
+}
+
 impl PartialBackup<ValidateOnly> {
-    pub fn new_validator(value: proto::BackupInfo, purpose: Purpose) -> Self {
+    pub fn new_validator(
+        value: proto::BackupInfo,
+        purpose: Purpose,
+    ) -> Result<Self, ValidationError> {
         Self::new(value, purpose)
     }
 }
 
 impl PartialBackup<Store> {
-    pub fn new_store(value: proto::BackupInfo, purpose: Purpose) -> Self {
+    pub fn new_store(value: proto::BackupInfo, purpose: Purpose) -> Result<Self, ValidationError> {
         Self::new(value, purpose)
     }
 }
 
 impl<M: Method + ReferencedTypes> PartialBackup<M> {
-    pub fn new(value: proto::BackupInfo, purpose: Purpose) -> Self {
+    pub fn new(value: proto::BackupInfo, purpose: Purpose) -> Result<Self, ValidationError> {
         let proto::BackupInfo {
             version,
             backupTimeMs,
+            mediaRootBackupKey,
             special_fields: _,
         } = value;
 
+        let unusual_timestamp_tracker: RefCell<UnusualTimestampTracker> = Default::default();
+
+        let media_root_backup_key = libsignal_account_keys::BackupKey(
+            mediaRootBackupKey
+                .as_slice()
+                .try_into()
+                .map_err(|_| MetadataError::InvalidMediaRootBackupKey(mediaRootBackupKey.len()))?,
+        );
+
         let meta = BackupMeta {
             version,
-            backup_time: Timestamp::from_millis(backupTimeMs, "BackupInfo.backupTimeMs"),
+            backup_time: Timestamp::from_millis(
+                backupTimeMs,
+                "BackupInfo.backupTimeMs",
+                &unusual_timestamp_tracker,
+            ),
+            media_root_backup_key,
             purpose,
         };
 
-        Self {
+        Ok(Self {
             meta,
             account_data: None,
             recipients: Default::default(),
             chats: Default::default(),
             ad_hoc_calls: Default::default(),
             sticker_packs: HashMap::new(),
-        }
+            unusual_timestamp_tracker,
+        })
     }
 
     pub fn add_frame(&mut self, frame: proto::Frame) -> Result<(), ValidationError> {
@@ -407,13 +419,11 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
     fn add_ad_hoc_call(&mut self, call: proto::AdHocCall) -> Result<(), CallFrameError> {
         let recipient_id = call.recipientId;
         let call_id = call.callId;
-        let call = call
-            .try_into_with(&self.recipients)
-            .map_err(|error| CallFrameError {
-                recipient_id,
-                call_id,
-                error,
-            })?;
+        let call = call.try_into_with(self).map_err(|error| CallFrameError {
+            recipient_id,
+            call_id,
+            error,
+        })?;
         self.ad_hoc_calls.extend(Some(call));
         Ok(())
     }
@@ -425,7 +435,7 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
         if self.account_data.is_some() {
             return Err(ValidationError::MultipleAccountData);
         }
-        let account_data = account_data.try_into()?;
+        let account_data = account_data.try_into_with(self)?;
         self.account_data = Some(account_data);
         Ok(())
     }
@@ -528,12 +538,6 @@ impl<M: Method + ReferencedTypes> ChatsData<M> {
     }
 }
 
-impl<M: Method + ReferencedTypes> Contains<RecipientId> for PartialBackup<M> {
-    fn contains(&self, key: &RecipientId) -> bool {
-        self.recipients.contains(key)
-    }
-}
-
 impl<M: Method + ReferencedTypes> Lookup<RecipientId, M::RecipientReference> for PartialBackup<M> {
     fn lookup<'a>(&'a self, key: &'a RecipientId) -> Option<&'a M::RecipientReference> {
         self.recipients
@@ -565,18 +569,6 @@ impl<M: Method + ReferencedTypes> Lookup<CustomColorId, M::CustomColorReference>
     }
 }
 
-impl<M: Method + ReferencedTypes> Contains<ChatId> for PartialBackup<M> {
-    fn contains(&self, key: &ChatId) -> bool {
-        self.chats.items.contains(key)
-    }
-}
-
-impl<M: Method + ReferencedTypes> Contains<PinOrder> for PartialBackup<M> {
-    fn contains(&self, key: &PinOrder) -> bool {
-        self.lookup(key).is_some()
-    }
-}
-
 impl<M: Method + ReferencedTypes> Lookup<PinOrder, M::RecipientReference> for PartialBackup<M> {
     fn lookup(&self, key: &PinOrder) -> Option<&M::RecipientReference> {
         // This is a linear search, but the number of pinned chats should be
@@ -595,14 +587,11 @@ impl<M: Method + ReferencedTypes> AsRef<BackupMeta> for PartialBackup<M> {
     }
 }
 
-impl<M: Method + ReferencedTypes> Contains<CustomColorId> for PartialBackup<M> {
-    fn contains(&self, key: &CustomColorId) -> bool {
-        self.account_data.as_ref().is_some_and(|account_data| {
-            account_data
-                .account_settings
-                .custom_chat_colors
-                .contains(key)
-        })
+impl<M: Method + ReferencedTypes> ReportUnusualTimestamp for PartialBackup<M> {
+    #[track_caller]
+    fn report(&self, since_epoch: u64, context: &'static str, issue: TimestampIssue) {
+        self.unusual_timestamp_tracker
+            .report(since_epoch, context, issue);
     }
 }
 
@@ -718,13 +707,19 @@ mod test {
 
     trait TestPartialBackupMethod: Method + ReferencedTypes + Sized {
         fn empty() -> PartialBackup<Self> {
-            PartialBackup::new(proto::BackupInfo::new(), Purpose::RemoteBackup)
+            let proto = proto::BackupInfo {
+                mediaRootBackupKey: vec![0; BACKUP_KEY_LEN],
+                ..Default::default()
+            };
+            PartialBackup::new(proto, Purpose::RemoteBackup).expect("valid")
         }
 
         fn fake() -> PartialBackup<Self> {
             Self::fake_with([
                 proto::Recipient::test_data().into(),
                 proto::Chat::test_data().into(),
+                proto::Recipient::test_data_contact().into(),
+                // References both SELF_ID and CONTACT_ID
                 proto::ChatItem::test_data().into(),
             ])
         }
@@ -800,6 +795,9 @@ mod test {
             .expect("valid account data");
         partial
             .add_recipient(proto::Recipient::test_data())
+            .expect("valid recipient");
+        partial
+            .add_recipient(proto::Recipient::test_data_contact())
             .expect("valid recipient");
 
         const CHAT_IDS: std::ops::RangeInclusive<u64> = 1..=2;

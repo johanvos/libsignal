@@ -10,15 +10,18 @@
 
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::num::{NonZeroU32, NonZeroU64};
+use std::num::NonZeroU32;
 
 use derive_where::derive_where;
 
 use crate::backup::chat::chat_style::{ChatStyle, ChatStyleError, CustomColorId};
+use crate::backup::file::{FilePointerError, MessageAttachmentError};
 use crate::backup::frame::RecipientId;
-use crate::backup::method::{Contains, Lookup, Method};
+use crate::backup::method::{Lookup, LookupPair, Method};
+use crate::backup::recipient::DestinationKind;
+use crate::backup::serialize::{SerializeOrder, UnorderedList};
 use crate::backup::sticker::MessageStickerError;
-use crate::backup::time::{Duration, Timestamp};
+use crate::backup::time::{Duration, ReportUnusualTimestamp, Timestamp, TimestampOrForever};
 use crate::backup::{BackupMeta, CallError, ReferencedTypes, TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
 
@@ -30,7 +33,7 @@ pub(crate) mod chat_style;
 mod gift_badge;
 use gift_badge::*;
 
-mod group;
+pub(crate) mod group;
 use group::*;
 
 mod link;
@@ -42,20 +45,23 @@ use payment::*;
 mod quote;
 use quote::*;
 
+mod reactions;
+use reactions::*;
+
 mod standard_message;
 use standard_message::*;
 
 mod sticker_message;
 use sticker_message::*;
 
-#[cfg(test)]
-mod testutil;
-
-mod text;
+pub(crate) mod text;
 use text::*;
 
 mod update_message;
 use update_message::*;
+
+mod view_once_message;
+use view_once_message::*;
 
 mod voice_message;
 use voice_message::*;
@@ -67,6 +73,10 @@ pub enum ChatError {
     DuplicateId,
     /// no record for {0:?}
     NoRecipient(RecipientId),
+    /// cannot have a chat with recipient {0:?}, a {1:?}
+    InvalidRecipient(RecipientId, DestinationKind),
+    /// chat with {0:?} has an expirationTimerMs but no expireTimerVersion
+    MissingExpireTimerVersion(RecipientId),
     /// chat item: {0}
     ChatItem(#[from] ChatItemError),
     /// {0:?} already appeared
@@ -82,10 +92,18 @@ pub enum ChatItemError {
     NoChatForItem,
     /// no record for chat item author {0:?}
     AuthorNotFound(RecipientId),
+    /// chat item author {0:?} is a {1:?}
+    InvalidAuthor(RecipientId, DestinationKind),
+    /// incoming message authored by self
+    IncomingMessageFromSelf,
+    /// outgoing message authored by {1:?} {0:?}
+    OutgoingMessageFrom(RecipientId, DestinationKind),
     /// ChatItem.item is a oneof but is empty
     MissingItem,
     /// text: {0}
     Text(#[from] TextError),
+    /// long text: {0}
+    LongText(FilePointerError),
     /// quote: {0}
     Quote(#[from] QuoteError),
     /// link preview: {0}
@@ -110,24 +128,40 @@ pub enum ChatItemError {
     StickerMessage(#[from] MessageStickerError),
     /// gift badge: {0}
     GiftBadge(#[from] GiftBadgeError),
+    /// view-once message: {0}
+    ViewOnce(#[from] ViewOnceMessageError),
     /// ChatItem.directionalDetails is a oneof but is empty
     NoDirection,
+    /// directionless ChatItem wasn't an update message
+    DirectionlessMessage,
     /// outgoing message {0}
     Outgoing(#[from] OutgoingSendError),
+    /// attachment: {0}
+    Attachment(#[from] MessageAttachmentError),
     /// contact message: {0}
     ContactAttachment(#[from] ContactAttachmentError),
     /// chat update type is UNKNOWN
     ChatUpdateUnknown,
     /// voice message: {0}
     VoiceMessage(#[from] VoiceMessageError),
-    /// found exactly one of expiration start date and duration
+    /// item has expiration start date but no duration
     ExpirationMismatch,
+    /// item has been read/sent but expiration timer has not started
+    ExpirationNotStarted,
     /// expiration too soon: {0}
     InvalidExpiration(#[from] InvalidExpiration),
+    /// revisions of message from author {0:?} contained message from author {1:?}
+    RevisionWithMismatchedAuthor(RecipientId, RecipientId),
+    /// revisions of {0:?} message contained {1:?} message
+    RevisionWithMismatchedDirection(DirectionDiscriminants, DirectionDiscriminants),
     /// revisions contains a ChatItem with a call message
     RevisionContainsCall,
+    /// nested revisions
+    RevisionContainsRevisions,
     /// learned profile chat update has no e164 or name
     LearnedProfileIsEmpty,
+    /// invalid e164
+    InvalidE164,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +173,7 @@ pub struct InvalidExpiration {
 
 /// Validated version of [`proto::Chat`].
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
     M::List<ChatItemData<M>>: PartialEq,
     M::RecipientReference: PartialEq,
@@ -146,9 +181,16 @@ pub struct InvalidExpiration {
 ))]
 pub struct ChatData<M: Method + ReferencedTypes> {
     pub recipient: M::RecipientReference,
+    // This list can get quite large (when using the Store method), to the point that reallocation
+    // times start showing up in benchmarks of the `validator` CLI tool. However, experiments with a
+    // custom "segmented list" type (roughly `Vec<Vec<ChatItemData>>`) showed that there wasn't too
+    // much time to be gained here; while we can move less data around on reallocation, ultimately
+    // large backups just have a lot of ChatItems to push, one at a time.
+    #[serde(bound(serialize = "M::List<ChatItemData<M>>: serde::Serialize"))]
     pub items: M::List<ChatItemData<M>>,
     pub expiration_timer: Option<Duration>,
-    pub mute_until: Option<Timestamp>,
+    pub expiration_timer_version: u32,
+    pub mute_until: Option<TimestampOrForever>,
     pub style: Option<ChatStyle<M>>,
     pub pinned_order: Option<PinOrder>,
     pub dont_notify_for_mentions_if_muted: bool,
@@ -156,20 +198,23 @@ pub struct ChatData<M: Method + ReferencedTypes> {
     pub archived: bool,
 }
 
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PinOrder(NonZeroU32);
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, serde::Serialize)]
+pub struct PinOrder(pub(super) NonZeroU32);
 
 /// Validated version of [`proto::ChatItem`].
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
     ChatItemMessage<M>: PartialEq,
     M::RecipientReference: PartialEq
 ))]
 pub struct ChatItemData<M: Method + ReferencedTypes> {
     pub author: M::RecipientReference,
+    #[serde(bound(serialize = "ChatItemMessage<M>: serde::Serialize"))]
     pub message: ChatItemMessage<M>,
+    // This could be Self: Serialize but that just confuses the compiler.
     pub revisions: Vec<ChatItemData<M>>,
-    pub direction: Direction,
+    pub direction: Direction<M::RecipientReference>,
     pub expire_start: Option<Timestamp>,
     pub expires_in: Option<Duration>,
     pub sent_at: Timestamp,
@@ -180,77 +225,69 @@ pub struct ChatItemData<M: Method + ReferencedTypes> {
     _limit_construction_to_module: (),
 }
 
+const MAX_REMOTE_BACKUP_DISAPPEARING_MESSAGE_TIME: Duration = Duration::from_hours(24);
+
 /// Validated version of [`proto::chat_item::Item`].
 #[derive_where(Debug)]
+#[derive(serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq;
     M::BoxedValue<GiftBadge>: PartialEq,
     M::RecipientReference: PartialEq
 ))]
 pub enum ChatItemMessage<M: Method + ReferencedTypes> {
-    Standard(StandardMessage),
-    Contact(ContactMessage),
-    Voice(VoiceMessage),
-    Sticker(StickerMessage),
+    Standard(StandardMessage<M::RecipientReference>),
+    Contact(ContactMessage<M::RecipientReference>),
+    Voice(VoiceMessage<M::RecipientReference>),
+    Sticker(StickerMessage<M::RecipientReference>),
     RemoteDeleted,
     Update(UpdateMessage<M::RecipientReference>),
     PaymentNotification(PaymentNotification),
     GiftBadge(M::BoxedValue<GiftBadge>),
+    ViewOnce(ViewOnceMessage<M::RecipientReference>),
 }
 
-/// Validated version of [`proto::Reaction`].
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, strum::EnumDiscriminants)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct Reaction {
-    pub emoji: String,
-    pub sort_order: u64,
-    pub author: RecipientId,
-    pub sent_timestamp: Timestamp,
-    pub received_timestamp: Option<Timestamp>,
-    _limit_construction_to_module: (),
-}
-
-#[derive(Debug, thiserror::Error, displaydoc::Display)]
-#[cfg_attr(test, derive(PartialEq))]
-pub enum ReactionError {
-    /// unknown author {0:?}
-    AuthorNotFound(RecipientId),
-    /// "emoji" is an empty string
-    EmptyEmoji,
-}
-
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
-pub enum Direction {
+pub enum Direction<Recipient> {
     Incoming {
-        sent: Timestamp,
+        sent: Option<Timestamp>,
         received: Timestamp,
         read: bool,
         sealed_sender: bool,
     },
-    Outgoing(Vec<OutgoingSend>),
+    Outgoing(
+        #[serde(bound(serialize = "Recipient: serde::Serialize + SerializeOrder"))]
+        UnorderedList<OutgoingSend<Recipient>>,
+    ),
     Directionless,
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
-pub struct OutgoingSend {
-    pub recipient: RecipientId,
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq, Clone))]
+pub struct OutgoingSend<Recipient> {
+    #[serde(bound(serialize = "Recipient: serde::Serialize"))]
+    pub recipient: Recipient,
     pub status: DeliveryStatus,
     pub last_status_update: Timestamp,
-    pub network_failure: bool,
-    pub identity_key_mismatch: bool,
-    pub sealed_sender: bool,
 }
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq))]
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq, Clone))]
+pub enum DeliveryFailureReason {
+    Unknown,
+    Network,
+    IdentityKeyMismatch,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq, Clone))]
 pub enum DeliveryStatus {
-    Failed,
+    Failed(DeliveryFailureReason),
     Pending,
-    Sent,
-    Delivered,
-    Read,
-    Viewed,
+    Sent { sealed_sender: bool },
+    Delivered { sealed_sender: bool },
+    Read { sealed_sender: bool },
+    Viewed { sealed_sender: bool },
     Skipped,
 }
 
@@ -259,8 +296,10 @@ pub enum DeliveryStatus {
 pub enum OutgoingSendError {
     /// send status has unknown recipient {0:?}
     UnknownRecipient(RecipientId),
-    /// send status is unknown
-    SendStatusUnknown,
+    /// send status recipient {0:?} is a {1:?}, not a contact or self
+    InvalidRecipient(RecipientId, DestinationKind),
+    /// send status is missing
+    SendStatusMissing,
 }
 
 impl std::fmt::Display for InvalidExpiration {
@@ -285,9 +324,10 @@ impl std::fmt::Display for InvalidExpiration {
 
 impl<
         M: Method + ReferencedTypes,
-        C: Lookup<RecipientId, M::RecipientReference>
+        C: LookupPair<RecipientId, DestinationKind, M::RecipientReference>
             + Lookup<PinOrder, M::RecipientReference>
-            + Lookup<CustomColorId, M::CustomColorReference>,
+            + Lookup<CustomColorId, M::CustomColorReference>
+            + ReportUnusualTimestamp,
     > TryFromWith<proto::Chat, C> for ChatData<M>
 {
     type Error = ChatError;
@@ -297,6 +337,7 @@ impl<
             id: _,
             recipientId,
             expirationTimerMs,
+            expireTimerVersion,
             muteUntilMs,
             pinnedOrder,
             archived,
@@ -306,12 +347,22 @@ impl<
             special_fields: _,
         } = value;
 
-        let recipient = RecipientId(recipientId);
-        let Some(recipient) = context.lookup(&recipient).cloned() else {
-            return Err(ChatError::NoRecipient(recipient));
+        let recipient_id = RecipientId(recipientId);
+        let Some((&kind, recipient)) = context.lookup_pair(&recipient_id) else {
+            return Err(ChatError::NoRecipient(recipient_id));
         };
+        let recipient = match kind {
+            DestinationKind::Contact
+            | DestinationKind::Group
+            | DestinationKind::Self_
+            | DestinationKind::ReleaseNotes => Ok(recipient.clone()),
+            DestinationKind::DistributionList | DestinationKind::CallLink => {
+                Err(ChatError::InvalidRecipient(recipient_id, kind))
+            }
+        }?;
 
-        let pinned_order = NonZeroU32::new(pinnedOrder).map(PinOrder);
+        // For compatibility with earlier backups, allow 0 as "unpinned" for now.
+        let pinned_order = pinnedOrder.and_then(NonZeroU32::new).map(PinOrder);
         if let Some(pinned_order) = pinned_order {
             if let Some(_recipient) = context.lookup(&pinned_order) {
                 return Err(ChatError::DuplicatePinnedOrder(pinned_order));
@@ -320,17 +371,23 @@ impl<
 
         let style = style
             .into_option()
-            .map(|chat_style| chat_style.try_into_with(context))
+            .map(|style| ChatStyle::try_from_proto(style, context, context))
             .transpose()?;
 
-        let expiration_timer =
-            NonZeroU64::new(expirationTimerMs).map(|t| Duration::from_millis(t.get()));
-        let mute_until = NonZeroU64::new(muteUntilMs)
-            .map(|t| Timestamp::from_millis(t.get(), "Chat.muteUntilMs"));
+        let expiration_timer = expirationTimerMs.map(Duration::from_millis);
+
+        let mute_until =
+            muteUntilMs.map(|t| TimestampOrForever::from_millis(t, "Chat.muteUntilMs", context));
+
+        if expiration_timer.is_some() && expireTimerVersion == 0 {
+            return Err(ChatError::MissingExpireTimerVersion(recipient_id));
+        }
+        let expiration_timer_version = expireTimerVersion;
 
         Ok(Self {
             recipient,
             expiration_timer,
+            expiration_timer_version,
             mute_until,
             items: Default::default(),
             style,
@@ -343,7 +400,9 @@ impl<
 }
 
 impl<
-        C: Lookup<RecipientId, M::RecipientReference> + AsRef<BackupMeta>,
+        C: LookupPair<RecipientId, DestinationKind, M::RecipientReference>
+            + AsRef<BackupMeta>
+            + ReportUnusualTimestamp,
         M: Method + ReferencedTypes,
     > TryFromWith<proto::ChatItem, C> for ChatItemData<M>
 {
@@ -363,24 +422,72 @@ impl<
             special_fields: _,
         } = value;
 
-        let author = RecipientId(authorId);
+        let direction = directionalDetails
+            .ok_or(ChatItemError::NoDirection)?
+            .try_into_with(context)?;
 
-        let Some(author) = context.lookup(&author).cloned() else {
-            return Err(ChatItemError::AuthorNotFound(author));
+        let author_id = RecipientId(authorId);
+
+        let Some((&author_kind, author)) = context.lookup_pair(&author_id) else {
+            return Err(ChatItemError::AuthorNotFound(author_id));
         };
+        let author = match (author_kind, &direction) {
+            // Even update messages in groups are still attributed to self (if not a specific
+            // author)
+            (
+                DestinationKind::Group
+                | DestinationKind::DistributionList
+                | DestinationKind::CallLink,
+                _,
+            ) => Err(ChatItemError::InvalidAuthor(author_id, author_kind)),
+
+            (DestinationKind::Self_, Direction::Incoming { .. }) => {
+                Err(ChatItemError::IncomingMessageFromSelf)
+            }
+
+            (DestinationKind::Contact | DestinationKind::ReleaseNotes, Direction::Outgoing(_)) => {
+                Err(ChatItemError::OutgoingMessageFrom(author_id, author_kind))
+            }
+
+            (DestinationKind::Self_, Direction::Outgoing(_))
+            | (DestinationKind::Contact, Direction::Incoming { .. })
+            | (DestinationKind::ReleaseNotes, Direction::Incoming { .. })
+            | (DestinationKind::Self_, Direction::Directionless)
+            | (DestinationKind::Contact, Direction::Directionless)
+            | (DestinationKind::ReleaseNotes, Direction::Directionless) => Ok(author.clone()),
+        }?;
 
         let message = item
             .ok_or(ChatItemError::MissingItem)?
             .try_into_with(context)?;
 
-        let direction = directionalDetails
-            .ok_or(ChatItemError::NoDirection)?
-            .try_into_with(context)?;
+        match (&direction, &message) {
+            (Direction::Directionless, ChatItemMessage::Update(_)) => Ok(()),
+            (Direction::Directionless, _) => Err(ChatItemError::DirectionlessMessage),
+            (_, _) => Ok(()),
+        }?;
 
         let revisions: Vec<_> = revisions
             .into_iter()
             .map(|rev| {
+                // We have to test this on the raw IDs because RecipientReference isn't necessarily
+                // comparable.
+                if author_id.0 != rev.authorId {
+                    return Err(ChatItemError::RevisionWithMismatchedAuthor(
+                        author_id,
+                        RecipientId(rev.authorId),
+                    ));
+                }
+
                 let item: ChatItemData<M> = rev.try_into_with(context)?;
+                if DirectionDiscriminants::from(&direction)
+                    != DirectionDiscriminants::from(&item.direction)
+                {
+                    return Err(ChatItemError::RevisionWithMismatchedDirection(
+                        DirectionDiscriminants::from(&direction),
+                        DirectionDiscriminants::from(&item.direction),
+                    ));
+                }
                 match &item.message {
                     ChatItemMessage::Update(update) => match update {
                         UpdateMessage::GroupCall(_) | UpdateMessage::IndividualCall(_) => {
@@ -393,8 +500,8 @@ impl<
                             previous: _,
                             new: _,
                         }
-                        | UpdateMessage::ThreadMerge
-                        | UpdateMessage::SessionSwitchover
+                        | UpdateMessage::ThreadMerge { previous_e164: _ }
+                        | UpdateMessage::SessionSwitchover { e164: _ }
                         | UpdateMessage::LearnedProfileUpdate(_) => (),
                     },
                     ChatItemMessage::Standard(_)
@@ -403,40 +510,75 @@ impl<
                     | ChatItemMessage::PaymentNotification(_)
                     | ChatItemMessage::Sticker(_)
                     | ChatItemMessage::GiftBadge(_)
-                    | ChatItemMessage::RemoteDeleted => (),
-                };
+                    | ChatItemMessage::RemoteDeleted
+                    | ChatItemMessage::ViewOnce(_) => (),
+                }
+                if !item.revisions.is_empty() {
+                    return Err(ChatItemError::RevisionContainsRevisions);
+                }
                 Ok(item)
             })
             .collect::<Result<_, _>>()?;
 
-        let sent_at = Timestamp::from_millis(dateSent, "ChatItem.dateSent");
-        let expire_start = NonZeroU64::new(expireStartDate)
-            .map(|date| Timestamp::from_millis(date.into(), "ChatItem.expireStartDate"));
-        let expires_in = NonZeroU64::new(expiresInMs)
-            .map(Into::into)
-            .map(Duration::from_millis);
+        let sent_at = Timestamp::from_millis(dateSent, "ChatItem.dateSent", context);
+        let expire_start = expireStartDate
+            .map(|date| Timestamp::from_millis(date, "ChatItem.expireStartDate", context));
+        let expires_in = expiresInMs.map(Into::into).map(Duration::from_millis);
 
-        let expires_at = match (expire_start, expires_in) {
-            (Some(expire_start), Some(expires_in)) => Some(expire_start + expires_in),
-            (None, None) => None,
-            (Some(_), None) | (None, Some(_)) => return Err(ChatItemError::ExpirationMismatch),
-        };
+        match (expire_start, expires_in) {
+            (None, None) => {
+                // Not a disappearing message.
+            }
+            (Some(_), None) => return Err(ChatItemError::ExpirationMismatch),
+            (None, Some(_)) => {
+                let should_have_started = match &direction {
+                    Direction::Incoming {
+                        sent: _,
+                        received: _,
+                        read,
+                        sealed_sender: _,
+                    } => *read,
+                    Direction::Outgoing(outgoing) => {
+                        outgoing.0.iter().all(|send| match send.status {
+                            DeliveryStatus::Failed(_) => false,
+                            DeliveryStatus::Pending => false,
 
-        if let Some(expires_at) = expires_at {
-            // Ensure that ephemeral content that's due to expire soon isn't backed up.
-            let backup_time = context.as_ref().backup_time;
-            let allowed_expire_at = backup_time
-                + match context.as_ref().purpose {
-                    crate::backup::Purpose::DeviceTransfer => Duration::ZERO,
-                    crate::backup::Purpose::RemoteBackup => Duration::TWELVE_HOURS,
+                            // The timer starts when the "sent" checkmark shows up.
+                            DeliveryStatus::Sent { .. } => true,
+                            DeliveryStatus::Delivered { .. } => true,
+                            DeliveryStatus::Read { .. } => true,
+                            DeliveryStatus::Viewed { .. } => true,
+                            DeliveryStatus::Skipped => true,
+                        })
+                    }
+                    Direction::Directionless => {
+                        // "read" state isn't tracked, so we have to conservatively allow this.
+                        false
+                    }
                 };
-
-            if expires_at < allowed_expire_at {
-                return Err(InvalidExpiration {
-                    expires_at,
-                    backup_time,
+                if should_have_started {
+                    return Err(ChatItemError::ExpirationNotStarted);
                 }
-                .into());
+            }
+            (Some(expire_start), Some(expires_in)) => {
+                let expires_at = expire_start + expires_in;
+                // Ensure that ephemeral content that's due to expire soon isn't backed up.
+                let backup_time = context.as_ref().backup_time;
+                let allowed_expire_at = backup_time
+                    + match context.as_ref().purpose {
+                        crate::backup::Purpose::DeviceTransfer => Duration::ZERO,
+                        crate::backup::Purpose::RemoteBackup => {
+                            MAX_REMOTE_BACKUP_DISAPPEARING_MESSAGE_TIME
+                        }
+                    };
+
+                if expires_at < allowed_expire_at {
+                    return Err(InvalidExpiration {
+                        expires_at,
+                        backup_time,
+                    }
+                    .into());
+                }
             }
         }
 
@@ -455,12 +597,14 @@ impl<
     }
 }
 
-impl<R: Contains<RecipientId>> TryFromWith<proto::chat_item::DirectionalDetails, R> for Direction {
+impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+    TryFromWith<proto::chat_item::DirectionalDetails, C> for Direction<R>
+{
     type Error = ChatItemError;
 
     fn try_from_with(
         item: proto::chat_item::DirectionalDetails,
-        context: &R,
+        context: &C,
     ) -> Result<Self, Self::Error> {
         use proto::chat_item::*;
         match item {
@@ -471,10 +615,14 @@ impl<R: Contains<RecipientId>> TryFromWith<proto::chat_item::DirectionalDetails,
                 read,
                 sealedSender,
             }) => {
-                let sent =
-                    Timestamp::from_millis(dateServerSent, "DirectionalDetails.dateServerSent");
-                let received =
-                    Timestamp::from_millis(dateReceived, "DirectionalDetails.dateReceived");
+                let sent = dateServerSent.map(|sent| {
+                    Timestamp::from_millis(sent, "DirectionalDetails.dateServerSent", context)
+                });
+                let received = Timestamp::from_millis(
+                    dateReceived,
+                    "DirectionalDetails.dateReceived",
+                    context,
+                );
                 Ok(Self::Incoming {
                     received,
                     sent,
@@ -497,62 +645,100 @@ impl<R: Contains<RecipientId>> TryFromWith<proto::chat_item::DirectionalDetails,
         }
     }
 }
-impl<R: Contains<RecipientId>> TryFromWith<proto::SendStatus, R> for OutgoingSend {
+impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+    TryFromWith<proto::SendStatus, C> for OutgoingSend<R>
+{
     type Error = OutgoingSendError;
 
-    fn try_from_with(item: proto::SendStatus, context: &R) -> Result<Self, Self::Error> {
+    fn try_from_with(item: proto::SendStatus, context: &C) -> Result<Self, Self::Error> {
         let proto::SendStatus {
             recipientId,
+            timestamp,
             deliveryStatus,
-            lastStatusUpdateTimestamp,
-            networkFailure,
-            identityKeyMismatch,
-            sealedSender,
             special_fields: _,
         } = item;
 
-        let recipient = RecipientId(recipientId);
-
-        if !context.contains(&recipient) {
-            return Err(OutgoingSendError::UnknownRecipient(recipient));
+        let recipient_id = RecipientId(recipientId);
+        let Some((&kind, recipient)) = context.lookup_pair(&recipient_id) else {
+            return Err(OutgoingSendError::UnknownRecipient(recipient_id));
+        };
+        if !kind.is_individual() {
+            return Err(OutgoingSendError::InvalidRecipient(recipient_id, kind));
         }
+        let recipient = recipient.clone();
 
-        use proto::send_status::Status;
-        let status = match deliveryStatus.enum_value_or_default() {
-            Status::UNKNOWN => return Err(OutgoingSendError::SendStatusUnknown),
-            Status::FAILED => DeliveryStatus::Failed,
-            Status::PENDING => DeliveryStatus::Pending,
-            Status::SENT => DeliveryStatus::Sent,
-            Status::DELIVERED => DeliveryStatus::Delivered,
-            Status::READ => DeliveryStatus::Read,
-            Status::VIEWED => DeliveryStatus::Viewed,
-            Status::SKIPPED => DeliveryStatus::Skipped,
+        let Some(status) = deliveryStatus else {
+            return Err(OutgoingSendError::SendStatusMissing);
         };
 
-        let last_status_update = Timestamp::from_millis(
-            lastStatusUpdateTimestamp,
-            "SendStatus.lastStatusUpdateTimestamp",
-        );
+        use proto::send_status;
+        let status = match status {
+            send_status::DeliveryStatus::Pending(send_status::Pending { special_fields: _ }) => {
+                DeliveryStatus::Pending
+            }
+            send_status::DeliveryStatus::Sent(send_status::Sent {
+                sealedSender,
+                special_fields: _,
+            }) => DeliveryStatus::Sent {
+                sealed_sender: sealedSender,
+            },
+            send_status::DeliveryStatus::Delivered(send_status::Delivered {
+                sealedSender,
+                special_fields: _,
+            }) => DeliveryStatus::Delivered {
+                sealed_sender: sealedSender,
+            },
+            send_status::DeliveryStatus::Read(send_status::Read {
+                sealedSender,
+                special_fields: _,
+            }) => DeliveryStatus::Read {
+                sealed_sender: sealedSender,
+            },
+            send_status::DeliveryStatus::Viewed(send_status::Viewed {
+                sealedSender,
+                special_fields: _,
+            }) => DeliveryStatus::Viewed {
+                sealed_sender: sealedSender,
+            },
+            send_status::DeliveryStatus::Skipped(send_status::Skipped { special_fields: _ }) => {
+                DeliveryStatus::Skipped
+            }
+            send_status::DeliveryStatus::Failed(send_status::Failed {
+                reason,
+                special_fields: _,
+            }) => {
+                // Note that we treat truly unknown enum values here as the default; that's already
+                // checked separately.
+                DeliveryStatus::Failed(match reason.enum_value_or_default() {
+                    send_status::failed::FailureReason::UNKNOWN => DeliveryFailureReason::Unknown,
+                    send_status::failed::FailureReason::NETWORK => DeliveryFailureReason::Network,
+                    send_status::failed::FailureReason::IDENTITY_KEY_MISMATCH => {
+                        DeliveryFailureReason::IdentityKeyMismatch
+                    }
+                })
+            }
+        };
+
+        let last_status_update = Timestamp::from_millis(timestamp, "SendStatus.timestamp", context);
 
         Ok(Self {
             recipient,
             status,
             last_status_update,
-            network_failure: networkFailure,
-            identity_key_mismatch: identityKeyMismatch,
-            sealed_sender: sealedSender,
         })
     }
 }
 
 impl<
-        R: Lookup<RecipientId, M::RecipientReference> + AsRef<BackupMeta>,
+        C: LookupPair<RecipientId, DestinationKind, M::RecipientReference>
+            + AsRef<BackupMeta>
+            + ReportUnusualTimestamp,
         M: Method + ReferencedTypes,
-    > TryFromWith<proto::chat_item::Item, R> for ChatItemMessage<M>
+    > TryFromWith<proto::chat_item::Item, C> for ChatItemMessage<M>
 {
     type Error = ChatItemError;
 
-    fn try_from_with(value: proto::chat_item::Item, recipients: &R) -> Result<Self, Self::Error> {
+    fn try_from_with(value: proto::chat_item::Item, context: &C) -> Result<Self, Self::Error> {
         use proto::chat_item::Item;
 
         Ok(match value {
@@ -564,64 +750,30 @@ impl<
                 );
 
                 if is_voice_message {
-                    ChatItemMessage::Voice(message.try_into_with(recipients)?)
+                    ChatItemMessage::Voice(message.try_into_with(context)?)
                 } else {
-                    ChatItemMessage::Standard(message.try_into_with(recipients)?)
+                    ChatItemMessage::Standard(message.try_into_with(context)?)
                 }
             }
             Item::ContactMessage(message) => {
-                ChatItemMessage::Contact(message.try_into_with(recipients)?)
+                ChatItemMessage::Contact(message.try_into_with(context)?)
             }
             Item::StickerMessage(message) => {
-                ChatItemMessage::Sticker(message.try_into_with(recipients)?)
+                ChatItemMessage::Sticker(message.try_into_with(context)?)
             }
             Item::RemoteDeletedMessage(proto::RemoteDeletedMessage { special_fields: _ }) => {
                 ChatItemMessage::RemoteDeleted
             }
             Item::UpdateMessage(message) => {
-                ChatItemMessage::Update(message.try_into_with(recipients)?)
+                ChatItemMessage::Update(message.try_into_with(context)?)
             }
             Item::PaymentNotification(message) => {
-                ChatItemMessage::PaymentNotification(message.try_into()?)
+                ChatItemMessage::PaymentNotification(message.try_into_with(context)?)
             }
             Item::GiftBadge(badge) => ChatItemMessage::GiftBadge(M::boxed_value(badge.try_into()?)),
-        })
-    }
-}
-
-impl<R: Contains<RecipientId>> TryFromWith<proto::Reaction, R> for Reaction {
-    type Error = ReactionError;
-
-    fn try_from_with(item: proto::Reaction, context: &R) -> Result<Self, Self::Error> {
-        let proto::Reaction {
-            authorId,
-            sentTimestamp,
-            receivedTimestamp,
-            emoji,
-            sortOrder,
-            special_fields: _,
-        } = item;
-
-        if emoji.is_empty() {
-            return Err(ReactionError::EmptyEmoji);
-        }
-
-        let author = RecipientId(authorId);
-        if !context.contains(&author) {
-            return Err(ReactionError::AuthorNotFound(author));
-        }
-
-        let sent_timestamp = Timestamp::from_millis(sentTimestamp, "Reaction.sentTimestamp");
-        let received_timestamp = receivedTimestamp
-            .map(|timestamp| Timestamp::from_millis(timestamp, "Reaction.receivedTimestamp"));
-
-        Ok(Self {
-            emoji,
-            sort_order: sortOrder,
-            author,
-            sent_timestamp,
-            received_timestamp,
-            _limit_construction_to_module: (),
+            Item::ViewOnceMessage(message) => {
+                ChatItemMessage::ViewOnce(message.try_into_with(context)?)
+            }
         })
     }
 }
@@ -631,62 +783,34 @@ mod test {
     use std::time::UNIX_EPOCH;
 
     use assert_matches::assert_matches;
-
-    use protobuf::{EnumOrUnknown, SpecialFields};
+    use protobuf::SpecialFields;
     use test_case::test_case;
 
-    use crate::backup::chat::testutil::TestContext;
+    use super::*;
     use crate::backup::method::Store;
+    use crate::backup::testutil::TestContext;
     use crate::backup::time::testutil::MillisecondsSinceEpoch;
     use crate::backup::Purpose;
-
-    use super::*;
 
     impl proto::ChatItem {
         pub(crate) fn test_data() -> Self {
             Self {
                 chatId: proto::Chat::TEST_ID,
-                authorId: proto::Recipient::TEST_ID,
+                authorId: TestContext::CONTACT_ID.0,
                 item: Some(proto::chat_item::Item::StandardMessage(
                     proto::StandardMessage::test_data(),
                 )),
                 directionalDetails: Some(proto::chat_item::DirectionalDetails::Incoming(
                     proto::chat_item::IncomingMessageDetails {
                         dateReceived: MillisecondsSinceEpoch::TEST_VALUE.0,
-                        dateServerSent: MillisecondsSinceEpoch::TEST_VALUE.0,
+                        dateServerSent: Some(MillisecondsSinceEpoch::TEST_VALUE.0),
                         ..Default::default()
                     },
                 )),
-                expireStartDate: MillisecondsSinceEpoch::TEST_VALUE.0,
-                expiresInMs: 12 * 60 * 60 * 1000,
+                expireStartDate: Some(MillisecondsSinceEpoch::TEST_VALUE.0),
+                expiresInMs: Some(24 * 60 * 60 * 1000),
                 dateSent: MillisecondsSinceEpoch::TEST_VALUE.0,
                 ..Default::default()
-            }
-        }
-    }
-
-    impl proto::Reaction {
-        pub(crate) fn test_data() -> Self {
-            Self {
-                emoji: "📲".to_string(),
-                sortOrder: 3,
-                authorId: proto::Recipient::TEST_ID,
-                sentTimestamp: MillisecondsSinceEpoch::TEST_VALUE.0,
-                receivedTimestamp: Some(MillisecondsSinceEpoch::TEST_VALUE.0),
-                ..Default::default()
-            }
-        }
-    }
-
-    impl Reaction {
-        pub(crate) fn from_proto_test_data() -> Self {
-            Self {
-                emoji: "📲".to_string(),
-                sort_order: 3,
-                author: RecipientId(proto::Recipient::TEST_ID),
-                sent_timestamp: Timestamp::test_value(),
-                received_timestamp: Some(Timestamp::test_value()),
-                _limit_construction_to_module: (),
             }
         }
     }
@@ -704,7 +828,9 @@ mod test {
         fn test_data() -> Self {
             Self {
                 recipientId: proto::Recipient::TEST_ID,
-                deliveryStatus: proto::send_status::Status::PENDING.into(),
+                deliveryStatus: Some(proto::send_status::DeliveryStatus::Pending(
+                    proto::send_status::Pending::default(),
+                )),
                 ..Default::default()
             }
         }
@@ -718,6 +844,7 @@ mod test {
                 recipient: TestContext::test_recipient().clone(),
                 items: Vec::default(),
                 expiration_timer: None,
+                expiration_timer_version: 0,
                 mute_until: None,
                 style: None,
                 pinned_order: None,
@@ -728,31 +855,29 @@ mod test {
         );
     }
 
-    fn duplicate_pinned_order(message: &mut proto::Chat) {
-        message.pinnedOrder = TestContext::DUPLICATE_PINNED_ORDER.0.get();
-    }
-
-    fn with_expiration_timer(chat: &mut proto::Chat) {
-        chat.expirationTimerMs = 123456;
-    }
-    fn with_mute_until(chat: &mut proto::Chat) {
-        chat.muteUntilMs = MillisecondsSinceEpoch::TEST_VALUE.0;
-    }
-
-    #[test_case(with_expiration_timer, Ok(()))]
-    #[test_case(with_mute_until, Ok(()))]
+    #[test_case(|x| {
+        x.expirationTimerMs = Some(123456);
+        x.expireTimerVersion = 3;
+     } => Ok(()); "with_expiration_timer")]
+    #[test_case(|x| x.expirationTimerMs = Some(123456) => Err(ChatError::MissingExpireTimerVersion(TestContext::SELF_ID)); "with_expiration_timer_only")]
+    #[test_case(|x| x.expireTimerVersion = 3 => Ok(()); "with_expire_timer_version_only")]
+    #[test_case(|x| x.muteUntilMs = Some(MillisecondsSinceEpoch::TEST_VALUE.0) => Ok(()); "with mute until")]
     #[test_case(
-        duplicate_pinned_order,
-        Err(ChatError::DuplicatePinnedOrder(TestContext::DUPLICATE_PINNED_ORDER,))
+        |x| x.pinnedOrder = Some(TestContext::DUPLICATE_PINNED_ORDER.0.get()) =>
+        Err(ChatError::DuplicatePinnedOrder(TestContext::DUPLICATE_PINNED_ORDER));
+        "duplicate_pinned_order"
     )]
-    fn chat(modifier: fn(&mut proto::Chat), expected: Result<(), ChatError>) {
+    #[test_case(|x| {
+        x.recipientId = TestContext::CALL_LINK_ID.0;
+    } => Err(ChatError::InvalidRecipient(TestContext::CALL_LINK_ID, DestinationKind::CallLink)); "call link chat")]
+    #[test_case(|x| {
+        x.recipientId = 0;
+    } => Err(ChatError::NoRecipient(RecipientId(0))); "unknown recipient")]
+    fn chat(modifier: fn(&mut proto::Chat)) -> Result<(), ChatError> {
         let mut chat = proto::Chat::test_data();
         modifier(&mut chat);
-        assert_eq!(
-            chat.try_into_with(&TestContext::default())
-                .map(|_: ChatData::<Store>| ()),
-            expected
-        );
+        chat.try_into_with(&TestContext::default())
+            .map(|_: ChatData<Store>| ())
     }
 
     #[test]
@@ -760,17 +885,17 @@ mod test {
         assert_eq!(
             proto::ChatItem::test_data().try_into_with(&TestContext::default()),
             Ok(ChatItemData::<Store> {
-                author: TestContext::test_recipient().clone(),
+                author: TestContext::contact_recipient().clone(),
                 message: ChatItemMessage::Standard(StandardMessage::from_proto_test_data()),
                 revisions: vec![],
                 direction: Direction::Incoming {
                     received: Timestamp::test_value(),
-                    sent: Timestamp::test_value(),
+                    sent: Some(Timestamp::test_value()),
                     read: false,
                     sealed_sender: false,
                 },
                 expire_start: Some(Timestamp::test_value()),
-                expires_in: Some(Duration::TWELVE_HOURS),
+                expires_in: Some(MAX_REMOTE_BACKUP_DISAPPEARING_MESSAGE_TIME),
                 sent_at: Timestamp::test_value(),
                 sms: false,
                 total_chat_item_order_index: 0,
@@ -779,30 +904,46 @@ mod test {
         )
     }
 
-    fn unknown_author(message: &mut proto::ChatItem) {
-        message.authorId = 0xffff;
-    }
-    fn no_direction(message: &mut proto::ChatItem) {
-        message.directionalDetails = None;
-    }
-    fn outgoing_valid(message: &mut proto::ChatItem) {
-        message.directionalDetails =
-            Some(proto::chat_item::OutgoingMessageDetails::test_data().into());
-    }
-    fn outgoing_send_status_unknown(message: &mut proto::ChatItem) {
-        message.directionalDetails = Some(
+    #[test_case(|x| x.authorId = 0xffff => Err(ChatItemError::AuthorNotFound(RecipientId(0xffff))); "unknown_author")]
+    #[test_case(|x| x.authorId = TestContext::GROUP_ID.0 => Err(ChatItemError::InvalidAuthor(TestContext::GROUP_ID, DestinationKind::Group)); "invalid author")]
+    #[test_case(|x| x.directionalDetails = None => Err(ChatItemError::NoDirection); "no_direction")]
+    #[test_case(|x| {
+        x.authorId = TestContext::SELF_ID.0;
+        x.directionalDetails = Some(proto::chat_item::OutgoingMessageDetails::test_data().into());
+    } => Ok(()); "outgoing_valid")]
+    #[test_case(|x| x.directionalDetails = Some(
             proto::chat_item::OutgoingMessageDetails {
                 sendStatus: vec![proto::SendStatus {
-                    deliveryStatus: EnumOrUnknown::default(),
+                    deliveryStatus: None,
                     ..proto::SendStatus::test_data()
                 }],
                 ..proto::chat_item::OutgoingMessageDetails::test_data()
             }
             .into(),
+        ) => Err(ChatItemError::Outgoing(OutgoingSendError::SendStatusMissing)); "outgoing_send_status_unknown"
+    )]
+    #[test_case(|x| {
+        x.authorId = TestContext::SELF_ID.0;
+        x.directionalDetails = Some(
+            proto::chat_item::OutgoingMessageDetails {
+                sendStatus: vec![proto::SendStatus {
+                    deliveryStatus: Some(proto::send_status::DeliveryStatus::Failed(
+                        proto::send_status::Failed {
+                            // Unlike many other UNKNOWN cases in Backup.proto, this one is
+                            // considered valid; the other cases are just being more specific.
+                            reason: proto::send_status::failed::FailureReason::UNKNOWN.into(),
+                            ..Default::default()
+                        },
+                    )),
+                    ..proto::SendStatus::test_data()
+                }],
+                ..proto::chat_item::OutgoingMessageDetails::test_data()
+            }
+            .into()
         );
-    }
-    fn outgoing_unknown_recipient(message: &mut proto::ChatItem) {
-        message.directionalDetails = Some(
+    } => Ok(()); "outgoing send status failed")]
+    #[test_case(
+        |x| x.directionalDetails = Some(
             proto::chat_item::OutgoingMessageDetails {
                 sendStatus: vec![proto::SendStatus {
                     recipientId: 0xffff,
@@ -811,59 +952,64 @@ mod test {
                 ..proto::chat_item::OutgoingMessageDetails::test_data()
             }
             .into(),
-        );
-    }
-
-    #[test_case(
-        unknown_author,
-        Err(ChatItemError::AuthorNotFound(RecipientId(0xffff)))
-    )]
-    #[test_case(no_direction, Err(ChatItemError::NoDirection))]
-    #[test_case(outgoing_valid, Ok(()))]
-    #[test_case(
-        outgoing_send_status_unknown,
-        Err(ChatItemError::Outgoing(OutgoingSendError::SendStatusUnknown))
+        ) => Err(ChatItemError::Outgoing(OutgoingSendError::UnknownRecipient(RecipientId(0xffff)))); "outgoing_unknown_recipient"
     )]
     #[test_case(
-        outgoing_unknown_recipient,
-        Err(ChatItemError::Outgoing(OutgoingSendError::UnknownRecipient(RecipientId(0xffff))))
+        |x| x.directionalDetails = Some(
+            proto::chat_item::OutgoingMessageDetails {
+                sendStatus: vec![proto::SendStatus {
+                    recipientId: TestContext::GROUP_ID.0,
+                    ..proto::SendStatus::test_data()
+                }],
+                ..proto::chat_item::OutgoingMessageDetails::test_data()
+            }
+            .into(),
+        ) => Err(ChatItemError::Outgoing(OutgoingSendError::InvalidRecipient(TestContext::GROUP_ID, DestinationKind::Group))); "outgoing invalid recipient"
     )]
-    fn chat_item(modifier: fn(&mut proto::ChatItem), expected: Result<(), ChatItemError>) {
+    #[test_case(|x| x.directionalDetails = Some(proto::chat_item::DirectionlessMessageDetails::default().into()) => Err(ChatItemError::DirectionlessMessage); "directionless_non_update")]
+    #[test_case(|x| {
+        x.directionalDetails = Some(proto::chat_item::DirectionlessMessageDetails::default().into());
+        x.set_updateMessage(proto::ChatUpdateMessage {
+            update: Some(proto::chat_update_message::Update::SimpleUpdate(proto::SimpleChatUpdate {
+                type_: proto::simple_chat_update::Type::JOINED_SIGNAL.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        });
+    } => Ok(()); "directionless_update")]
+    #[test_case(|x| x.revisions.push(proto::ChatItem::test_data()) => Ok(()); "revision")]
+    #[test_case(|x| {
+        x.revisions.push(proto::ChatItem {
+            authorId: 0,
+            ..proto::ChatItem::test_data()
+        })
+    } => Err(ChatItemError::RevisionWithMismatchedAuthor(TestContext::CONTACT_ID, RecipientId(0))); "revision mismatched author")]
+    #[test_case(|x| {
+        x.revisions.push(proto::ChatItem {
+            directionalDetails: Some(proto::chat_item::DirectionlessMessageDetails::default().into()),
+            item: Some(proto::chat_item::Item::UpdateMessage(proto::ChatUpdateMessage {
+                update: Some(proto::chat_update_message::Update::SimpleUpdate(proto::SimpleChatUpdate {
+                    type_: proto::simple_chat_update::Type::JOINED_SIGNAL.into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..proto::ChatItem::test_data()
+        })
+    } => Err(ChatItemError::RevisionWithMismatchedDirection(DirectionDiscriminants::Incoming, DirectionDiscriminants::Directionless)); "revision mismatched direction")]
+    #[test_case(|x| {
+        x.revisions.push(proto::ChatItem {
+            revisions: vec![proto::ChatItem::test_data()],
+            ..proto::ChatItem::test_data()
+        })
+    } => Err(ChatItemError::RevisionContainsRevisions); "revision recursion")]
+    fn chat_item(modifier: fn(&mut proto::ChatItem)) -> Result<(), ChatItemError> {
         let mut message = proto::ChatItem::test_data();
         modifier(&mut message);
 
-        let result = message
+        message
             .try_into_with(&TestContext::default())
-            .map(|_: ChatItemData<Store>| ());
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn valid_reaction() {
-        assert_eq!(
-            proto::Reaction::test_data().try_into_with(&TestContext::default()),
-            Ok(Reaction::from_proto_test_data())
-        )
-    }
-
-    fn invalid_author_id(input: &mut proto::Reaction) {
-        input.authorId = proto::Recipient::TEST_ID + 2;
-    }
-
-    fn no_received_timestamp(input: &mut proto::Reaction) {
-        input.receivedTimestamp = None;
-    }
-
-    #[test_case(invalid_author_id, Err(ReactionError::AuthorNotFound(RecipientId(proto::Recipient::TEST_ID + 2))))]
-    #[test_case(no_received_timestamp, Ok(()))]
-    fn reaction(modifier: fn(&mut proto::Reaction), expected: Result<(), ReactionError>) {
-        let mut reaction = proto::Reaction::test_data();
-        modifier(&mut reaction);
-
-        let result = reaction
-            .try_into_with(&TestContext::default())
-            .map(|_: Reaction| ());
-        assert_eq!(result, expected);
+            .map(|_: ChatItemData<Store>| ())
     }
 
     #[test_case(Purpose::DeviceTransfer, 3600, Ok(()))]
@@ -894,19 +1040,24 @@ mod test {
         let meta = BackupMeta {
             backup_time,
             purpose: backup_purpose,
+            media_root_backup_key: libsignal_account_keys::BackupKey(
+                [0; libsignal_account_keys::BACKUP_KEY_LEN],
+            ),
             version: 0,
         };
 
         let mut item = proto::ChatItem::test_data();
 
-        item.expireStartDate = received_at
-            .into_inner()
-            .duration_since(UNIX_EPOCH)
-            .expect("valid")
-            .as_millis()
-            .try_into()
-            .unwrap();
-        item.expiresInMs = until_expiration_ms;
+        item.expireStartDate = Some(
+            received_at
+                .into_inner()
+                .duration_since(UNIX_EPOCH)
+                .expect("valid")
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        );
+        item.expiresInMs = Some(until_expiration_ms);
 
         let result = ChatItemData::<Store>::try_from_with(item, &TestContext(meta))
             .map(|_| ())
@@ -915,14 +1066,88 @@ mod test {
     }
 
     #[test]
-    fn mismatch_between_expiration_start_and_duration_presence() {
+    fn expiration_start_without_duration() {
         let mut item = proto::ChatItem::test_data();
-        assert_ne!(item.expireStartDate, 0);
-        item.expiresInMs = 0;
+        assert!(item.expireStartDate.is_some());
+        item.expiresInMs = None;
 
         assert_matches!(
             ChatItemData::<Store>::try_from_with(item, &TestContext::default()),
             Err(ChatItemError::ExpirationMismatch)
+        );
+    }
+
+    #[test]
+    fn expiration_duration_without_start() {
+        let mut item = proto::ChatItem::test_data();
+        assert!(item.expiresInMs.is_some());
+        item.expireStartDate = None;
+
+        // This one is okay, it's an expiring message that hasn't been viewed yet.
+        assert_matches!(
+            ChatItemData::<Store>::try_from_with(item.clone(), &TestContext::default()),
+            Ok(_)
+        );
+
+        // But not once it's been viewed.
+        let incoming = assert_matches!(
+            &mut item.directionalDetails,
+            Some(proto::chat_item::DirectionalDetails::Incoming(incoming)) => incoming,
+            "ChatItem::test_data is an unread incoming message"
+        );
+        incoming.read = true;
+        assert_matches!(
+            ChatItemData::<Store>::try_from_with(item.clone(), &TestContext::default()),
+            Err(ChatItemError::ExpirationNotStarted)
+        );
+
+        // And if it's outgoing, it's okay as long as a recipient is Pending...
+        item.authorId = TestContext::SELF_ID.0;
+        item.directionalDetails =
+            Some(proto::chat_item::OutgoingMessageDetails::test_data().into());
+        assert_matches!(
+            ChatItemData::<Store>::try_from_with(item.clone(), &TestContext::default()),
+            Ok(_)
+        );
+
+        // ...but not if sent.
+        let outgoing = assert_matches!(
+            &mut item.directionalDetails,
+            Some(proto::chat_item::DirectionalDetails::Outgoing(outgoing)) => outgoing,
+            "just set to an Outgoing message"
+        );
+        assert!(
+            outgoing.sendStatus[0].has_pending(),
+            "OutgoingMessageDetails::test_data is Pending by default"
+        );
+        outgoing.sendStatus[0].set_sent(proto::send_status::Sent::default());
+        assert_matches!(
+            ChatItemData::<Store>::try_from_with(item, &TestContext::default()),
+            Err(ChatItemError::ExpirationNotStarted)
+        );
+    }
+
+    #[test]
+    fn outgoing_sends_are_sorted_when_serialized() {
+        let send1 = OutgoingSend {
+            recipient: RecipientId(1),
+            status: DeliveryStatus::Pending,
+            last_status_update: Timestamp::test_value(),
+        };
+        let send2 = OutgoingSend {
+            recipient: RecipientId(2),
+            status: DeliveryStatus::Sent {
+                sealed_sender: true,
+            },
+            last_status_update: Timestamp::test_value(),
+        };
+
+        let message1 = Direction::Outgoing(vec![send1.clone(), send2.clone()].into());
+        let message2 = Direction::Outgoing(vec![send2, send1].into());
+
+        assert_eq!(
+            serde_json::to_string_pretty(&message1).expect("valid"),
+            serde_json::to_string_pretty(&message2).expect("valid"),
         );
     }
 }

@@ -5,29 +5,15 @@
 use std::time::SystemTime;
 
 use hmac::{Hmac, Mac};
+use libsignal_net_infra::utils::basic_authorization;
+use libsignal_net_infra::AsHttpHeader;
 use sha2::Sha256;
-
-use crate::infra::HttpRequestDecorator;
-use crate::utils::basic_authorization;
-
-pub trait HttpBasicAuth {
-    fn username(&self) -> &str;
-    fn password(&self) -> &str;
-}
-
-impl<T: HttpBasicAuth> From<T> for HttpRequestDecorator {
-    fn from(value: T) -> Self {
-        HttpRequestDecorator::Header(
-            http::header::AUTHORIZATION,
-            basic_authorization(value.username(), value.password()),
-        )
-    }
-}
 
 /// username and password as returned by the chat server's /auth endpoints.
 /// - username is a "hex(uid)"
 /// - password is a "timestamp:hex(otp(uid, timestamp, secret))"
 #[derive(Clone)]
+#[cfg_attr(feature = "test-util", derive(Default))]
 pub struct Auth {
     pub username: String,
     pub password: String,
@@ -59,12 +45,10 @@ impl Auth {
     }
 }
 
-impl HttpBasicAuth for Auth {
-    fn username(&self) -> &str {
-        &self.username
-    }
-
-    fn password(&self) -> &str {
-        &self.password
+impl AsHttpHeader for Auth {
+    const HEADER_NAME: http::HeaderName = http::header::AUTHORIZATION;
+    fn header_value(&self) -> http::HeaderValue {
+        let Self { username, password } = self;
+        basic_authorization(username, password)
     }
 }
