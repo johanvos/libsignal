@@ -55,7 +55,7 @@ jobs:
       if: ${{ matrix.additional-rust-target != '' }}
 
     - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      uses: arduino/setup-protoc@v3
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -156,9 +156,8 @@ jobs:
         merge-multiple: true
 
     - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      uses: arduino/setup-protoc@v3
       with:
-        version: '3.x'
         repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - run: make
