@@ -20,7 +20,7 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync","rt","rt-multi-thread"] }
 tokio-stream = { workspace = true }
-tonic = { version = "0.11.0", features = [ "tls", "tls-webpki-roots" ] }
+tonic = { version = "0.12.3", features = [ "tls", "tls-webpki-roots" ] }
 
 [build-dependencies]
-tonic-build = "0.11.0"
+tonic-build = "0.12.3"

@@ -27,8 +27,8 @@ impl<'a> JniGrpcReplyListener<'a> {
 }
 
 impl<'a> JniGrpcReplyListener<'a> {
-    fn do_on_reply(&mut self, reply: GrpcReply) -> Result<(), BridgeLayerError> {
-        self.env.borrow_mut().with_local_frame(8, |env| {
+    fn do_on_reply(&mut self, reply: GrpcReply) -> SignalJniResult<()> {
+        self.env.borrow_mut().with_local_frame(8, "on_reply", |env| {
             let jni_reply = reply.convert_into(env)?;
             let callback_args = jni_args!((
                 jni_reply => org.signal.libsignal.grpc.SignalRpcReply,
@@ -39,9 +39,9 @@ impl<'a> JniGrpcReplyListener<'a> {
         })
     }
 
-    fn do_on_error(&mut self, error: String) -> Result<(), BridgeLayerError> {
-        self.env.borrow_mut().with_local_frame(8, |env| {
-            let message = env.new_string(error.to_string())?;
+    fn do_on_error(&mut self, error: String) -> SignalJniResult<()> {
+        self.env.borrow_mut().with_local_frame(8, "on_error", |env| {
+            let message = env.new_string(error.to_string()).check_exceptions(env, "on_error")?;
             let callback_args = jni_args!((
                 message => java.lang.String,
             ) -> void);

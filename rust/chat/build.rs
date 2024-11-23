@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     tonic_build::configure()
         .build_server(false)
-        .compile(&protos, &["../../proto"])?;
+        .compile_protos(&protos, &["../../proto"])?;
     for proto in &protos {
         println!("cargo:rerun-if-changed={}", proto);
     }

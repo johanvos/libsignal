@@ -27,9 +27,9 @@ impl<'a> JniQuicCallbackListener<'a> {
 }
 
 impl<'a> JniQuicCallbackListener<'a> {
-    fn do_on_data(&mut self, data: Vec<u8>) -> Result<(), BridgeLayerError> {
-        self.env.borrow_mut().with_local_frame(8, |env| {
-            let bytes = env.byte_array_from_slice(&data)?;
+    fn do_on_data(&mut self, data: Vec<u8>) -> SignalJniResult<()> {
+        self.env.borrow_mut().with_local_frame(8, "on_data", |env| {
+            let bytes = env.byte_array_from_slice(&data).check_exceptions(env, "on_data")?;
             let callback_args = jni_args!((
                 bytes => [byte],
             ) -> void);
