@@ -4,9 +4,10 @@
 //
 
 use std::future::Future;
-use std::panic::{self, RefUnwindSafe};
+use std::panic::{self, RefUnwindSafe, UnwindSafe};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atomic_take::AtomicTake;
 use futures_util::stream::BoxStream;
@@ -16,8 +17,12 @@ use http::uri::{InvalidUri, PathAndQuery};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use libsignal_net::auth::Auth;
 use libsignal_net::chat::{
-    self, ChatServiceError, DebugInfo as ChatServiceDebugInfo, Response as ChatResponse,
+    self, ChatConnection, ChatServiceError, DebugInfo as ChatServiceDebugInfo, Request,
+    Response as ChatResponse,
 };
+use libsignal_net::infra::route::{ConnectionProxyConfig, DirectOrProxyProvider};
+use libsignal_net::infra::tcp_ssl::InvalidProxyConfig;
+use libsignal_net::infra::{Connection, ConnectionInfo};
 use libsignal_protocol::Timestamp;
 use tokio::sync::{mpsc, oneshot};
 
@@ -213,6 +218,226 @@ impl Chat<UnauthChatService> {
 pub type UnauthChat = Chat<UnauthChatService>;
 pub type AuthChat = Chat<AuthChatService>;
 
+pub struct UnauthenticatedChatConnection {
+    /// The possibly-still-being-constructed [`ChatConnection`].
+    ///
+    /// See [`AuthenticatedChatConnection::inner`] for rationale around lack of
+    /// reader/writer contention.
+    inner: tokio::sync::RwLock<MaybeChatConnection>,
+}
+bridge_as_handle!(UnauthenticatedChatConnection);
+impl UnwindSafe for UnauthenticatedChatConnection {}
+impl RefUnwindSafe for UnauthenticatedChatConnection {}
+
+pub struct AuthenticatedChatConnection {
+    /// The possibly-still-being-constructed [`ChatConnection`].
+    ///
+    /// This is a `RwLock` so that bridging functions can always take a
+    /// `&AuthenticatedChatConnection`, even when finishing construction of the
+    /// `ChatConnection`. The lock will only be held in writer mode once, when
+    /// finishing construction, and after that will be held in read mode, so
+    /// there won't be any contention.
+    inner: tokio::sync::RwLock<MaybeChatConnection>,
+}
+bridge_as_handle!(AuthenticatedChatConnection);
+impl UnwindSafe for AuthenticatedChatConnection {}
+impl RefUnwindSafe for AuthenticatedChatConnection {}
+
+enum MaybeChatConnection {
+    Running(ChatConnection),
+    WaitingForListener(tokio::runtime::Handle, chat::PendingChatConnection),
+    TemporarilyEvicted,
+}
+
+impl UnauthenticatedChatConnection {
+    pub async fn connect(connection_manager: &ConnectionManager) -> Result<Self, ChatServiceError> {
+        let inner = establish_chat_connection(connection_manager, None).await?;
+        log::info!("connected unauthenticated chat");
+        Ok(Self {
+            inner: MaybeChatConnection::WaitingForListener(
+                tokio::runtime::Handle::current(),
+                inner,
+            )
+            .into(),
+        })
+    }
+}
+impl AuthenticatedChatConnection {
+    pub async fn connect(
+        connection_manager: &ConnectionManager,
+        auth: Auth,
+        receive_stories: bool,
+    ) -> Result<Self, ChatServiceError> {
+        let pending = establish_chat_connection(
+            connection_manager,
+            Some(chat::AuthenticatedChatHeaders {
+                auth,
+                receive_stories: receive_stories.into(),
+            }),
+        )
+        .await?;
+        log::info!("connected authenticated chat");
+        Ok(Self {
+            inner: MaybeChatConnection::WaitingForListener(
+                tokio::runtime::Handle::current(),
+                pending,
+            )
+            .into(),
+        })
+    }
+}
+
+impl AsRef<tokio::sync::RwLock<MaybeChatConnection>> for AuthenticatedChatConnection {
+    fn as_ref(&self) -> &tokio::sync::RwLock<MaybeChatConnection> {
+        &self.inner
+    }
+}
+
+impl AsRef<tokio::sync::RwLock<MaybeChatConnection>> for UnauthenticatedChatConnection {
+    fn as_ref(&self) -> &tokio::sync::RwLock<MaybeChatConnection> {
+        &self.inner
+    }
+}
+
+pub trait BridgeChatConnection {
+    fn init_listener(&self, listener: Box<dyn ChatListener>);
+
+    fn send(
+        &self,
+        message: Request,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<ChatResponse, ChatServiceError>> + Send;
+
+    fn disconnect(&self) -> impl Future<Output = ()> + Send;
+
+    fn info(&self) -> ConnectionInfo;
+}
+
+impl<C: AsRef<tokio::sync::RwLock<MaybeChatConnection>> + Sync> BridgeChatConnection for C {
+    fn init_listener(&self, listener: Box<dyn ChatListener>) {
+        init_listener(&mut self.as_ref().blocking_write(), listener)
+    }
+
+    async fn send(
+        &self,
+        message: Request,
+        timeout: Duration,
+    ) -> Result<ChatResponse, ChatServiceError> {
+        let guard = self.as_ref().read().await;
+        let MaybeChatConnection::Running(inner) = &*guard else {
+            panic!("listener was not set")
+        };
+        inner.send(message, timeout).await
+    }
+
+    async fn disconnect(&self) {
+        let guard = self.as_ref().read().await;
+        let MaybeChatConnection::Running(inner) = &*guard else {
+            panic!("listener was not set")
+        };
+        inner.disconect().await
+    }
+
+    fn info(&self) -> ConnectionInfo {
+        let guard = self.as_ref().blocking_read();
+        match &*guard {
+            MaybeChatConnection::Running(chat_connection) => chat_connection.connection_info(),
+            MaybeChatConnection::WaitingForListener(_, pending_chat_connection) => {
+                pending_chat_connection.connection_info()
+            }
+            MaybeChatConnection::TemporarilyEvicted => unreachable!("unobservable state"),
+        }
+    }
+}
+
+fn init_listener(connection: &mut MaybeChatConnection, listener: Box<dyn ChatListener>) {
+    let (tokio_runtime, pending) =
+        match std::mem::replace(connection, MaybeChatConnection::TemporarilyEvicted) {
+            MaybeChatConnection::Running(chat_connection) => {
+                *connection = MaybeChatConnection::Running(chat_connection);
+                panic!("listener already set")
+            }
+            MaybeChatConnection::WaitingForListener(tokio_runtime, pending_chat_connection) => {
+                (tokio_runtime, pending_chat_connection)
+            }
+            MaybeChatConnection::TemporarilyEvicted => panic!("should be a temporary state"),
+        };
+
+    *connection = MaybeChatConnection::Running(ChatConnection::finish_connect(
+        tokio_runtime,
+        pending,
+        listener.into_event_listener(),
+    ))
+}
+
+impl Connection for UnauthenticatedChatConnection {
+    fn connection_info(&self) -> ConnectionInfo {
+        BridgeChatConnection::info(self)
+    }
+}
+
+impl Connection for AuthenticatedChatConnection {
+    fn connection_info(&self) -> ConnectionInfo {
+        BridgeChatConnection::info(self)
+    }
+}
+
+async fn establish_chat_connection(
+    connection_manager: &ConnectionManager,
+    auth: Option<chat::AuthenticatedChatHeaders>,
+) -> Result<chat::PendingChatConnection, ChatServiceError> {
+    let ConnectionManager {
+        env,
+        dns_resolver,
+        connect,
+        user_agent,
+        transport_connector,
+        endpoints,
+        ..
+    } = connection_manager;
+
+    let proxy_config: Option<ConnectionProxyConfig> =
+        (&*transport_connector.lock().expect("not poisoned"))
+            .try_into()
+            .map_err(|InvalidProxyConfig| ChatServiceError::ServiceUnavailable)?;
+
+    let (ws_config, enable_domain_fronting) = {
+        let endpoints_guard = endpoints.lock().expect("not poisoned");
+        (
+            endpoints_guard.chat.config.ws2_config(),
+            endpoints_guard.enable_fronting,
+        )
+    };
+
+    let libsignal_net::infra::ws2::Config {
+        local_idle_timeout,
+        remote_idle_disconnect_timeout,
+        ..
+    } = ws_config;
+
+    let chat_connect = &env.chat_domain_config.connect;
+
+    ChatConnection::start_connect_with(
+        connect,
+        dns_resolver,
+        DirectOrProxyProvider::maybe_proxied(
+            chat_connect.route_provider(enable_domain_fronting),
+            proxy_config,
+        ),
+        chat_connect
+            .confirmation_header_name
+            .map(HeaderName::from_static),
+        user_agent,
+        libsignal_net::chat::ws2::Config {
+            local_idle_timeout,
+            remote_idle_timeout: remote_idle_disconnect_timeout,
+            initial_request_id: 0,
+        },
+        auth,
+    )
+    .await
+}
+
 pub struct HttpRequest {
     pub method: http::Method,
     pub path: PathAndQuery,
@@ -321,7 +546,7 @@ impl dyn ChatListener {
     /// Consumes `self`. Returns the remaining request stream, in case another listener will be set
     /// later.
     async fn start_listening(
-        self: Box<dyn ChatListener>,
+        self: Box<Self>,
         request_stream_future: impl Future<
             Output = Result<
                 BoxStream<'static, chat::server_requests::ServerEvent>,
@@ -378,6 +603,19 @@ impl dyn ChatListener {
         // Pass the stream along to the next listener, if there is one.
         request_stream
     }
+
+    fn into_event_listener(mut self: Box<Self>) -> Box<dyn FnMut(chat::ws2::ListenerEvent) + Send> {
+        Box::new(move |event| {
+            let event: chat::server_requests::ServerEvent = match event.try_into() {
+                Ok(event) => event,
+                Err(err) => {
+                    log::error!("{err}");
+                    return;
+                }
+            };
+            self.received_server_request(event);
+        })
+    }
 }
 
 /// Wraps a named type and a single-use guard around [`chat::server_requests::AckEnvelopeFuture`].
@@ -403,3 +641,5 @@ bridge_as_handle!(ServerMessageAck);
 // makes it `!RefUnwindSafe`. We're putting that back; because we only manipulate the `AtomicTake`
 // using its atomic operations, it can never be in an invalid state.
 impl std::panic::RefUnwindSafe for ServerMessageAck {}
+
+bridge_as_handle!(ConnectionInfo);

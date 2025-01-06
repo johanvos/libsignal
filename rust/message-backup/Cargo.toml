@@ -15,6 +15,8 @@ workspace = true
 [features]
 # Enables code to allow conversion of backups to and from JSON.
 json = ["dep:serde_json", "dep:protobuf-json-mapping"]
+scramble = ["dep:rand"]
+test-util = []
 
 [[example]]
 name = "json_to_binproto"
@@ -23,6 +25,15 @@ required-features = ["json"]
 [[example]]
 name = "binproto_to_json"
 required-features = ["json"]
+
+[[example]]
+name = "scramble"
+required-features = ["scramble"]
+
+[[bench]]
+name = "validation"
+harness = false
+required-features = ["test-util"]
 
 [dependencies]
 libsignal-account-keys = { workspace = true }
@@ -48,6 +59,9 @@ futures = { workspace = true }
 hex = { workspace = true, features = ["serde"] }
 hkdf = { workspace = true }
 hmac = { workspace = true }
+# The main branch of intmap supports allocation-less empty maps.
+# When there's a release for this, we can remove the pin.
+intmap = { version = "2.0.0", git = 'https://github.com/JesperAxelsson/rust-intmap', rev = "e7edd6e8fb452506ca2570e91f62b14dc29a950c" }
 itertools = { workspace = true }
 log = { workspace = true }
 macro_rules_attribute = "0.2.0"
@@ -55,6 +69,7 @@ mediasan-common = { workspace = true }
 num_enum = { workspace = true }
 protobuf = "3.3.0"
 protobuf-json-mapping = { version = "3.3.0", optional = true }
+rand = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, optional = true, features = ["preserve_order"] }
 sha2 = { workspace = true }
@@ -66,14 +81,16 @@ strum_macros = { version = "0.26.4" }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
+visibility = { workspace = true }
 
 [dev-dependencies]
-libsignal-message-backup = { path = "./", features = ["json"] }
+libsignal-message-backup = { path = "./", features = ["json", "scramble", "test-util"] }
 signal-crypto = { workspace = true }
 
 array-concat = { workspace = true }
 assert_cmd = "2.0.13"
 assert_matches = { workspace = true }
+criterion = { workspace = true }
 dir-test = "0.2.0"
 futures = { workspace = true, features = ["executor"] }
 hex-literal = { workspace = true }
@@ -83,7 +100,21 @@ once_cell = { workspace = true }
 pretty_assertions = { workspace = true }
 test-case = { workspace = true }
 test-log = "0.2.14"
+uuid = { workspace = true, features = ["v4"] }
 
 [build-dependencies]
 protobuf = "3.3.0"
 protobuf-codegen = "3.3.0"
+
+# Enable sha2 asm for local builds (there is a similar block in libsignal-bridge-types).
+[target.'cfg(not(any(windows, target_arch = "x86")))'.dev-dependencies]
+# sha2's asm implementation uses standalone .S files that aren't compiled correctly on Windows,
+# and aren't linked correctly on x86 Android.
+# This will be fixed in sha2 0.11, which also removes the "asm" feature and turns it on by default.
+# So when sha2 0.11 is released, this section will go away.
+sha2 = { workspace = true, features = ["asm"] }
+
+# Prefer the system zlib for Android.
+# We'd probably prefer to use this everywhere, but some of our tests depend on exact output.
+[target.'cfg(target_os = "android")'.dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["zlib"] }

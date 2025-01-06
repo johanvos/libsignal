@@ -9,7 +9,6 @@
 #![allow(clippy::manual_non_exhaustive)]
 
 use std::fmt::Debug;
-use std::hash::Hash;
 use std::num::NonZeroU32;
 
 use derive_where::derive_where;
@@ -22,7 +21,9 @@ use crate::backup::recipient::DestinationKind;
 use crate::backup::serialize::{SerializeOrder, UnorderedList};
 use crate::backup::sticker::MessageStickerError;
 use crate::backup::time::{Duration, ReportUnusualTimestamp, Timestamp, TimestampOrForever};
-use crate::backup::{BackupMeta, CallError, ReferencedTypes, TryFromWith, TryIntoWith as _};
+use crate::backup::{
+    likely_empty, BackupMeta, CallError, ReferencedTypes, TryFromWith, TryIntoWith as _,
+};
 use crate::proto::backup as proto;
 
 mod contact_message;
@@ -77,8 +78,11 @@ pub enum ChatError {
     InvalidRecipient(RecipientId, DestinationKind),
     /// chat with {0:?} has an expirationTimerMs but no expireTimerVersion
     MissingExpireTimerVersion(RecipientId),
-    /// chat item: {0}
-    ChatItem(#[from] ChatItemError),
+    /// chat item {raw_timestamp}: {error}
+    ChatItem {
+        raw_timestamp: u64,
+        error: ChatItemError,
+    },
     /// {0:?} already appeared
     DuplicatePinnedOrder(PinOrder),
     /// style error: {0}
@@ -467,9 +471,8 @@ impl<
             (_, _) => Ok(()),
         }?;
 
-        let revisions: Vec<_> = revisions
-            .into_iter()
-            .map(|rev| {
+        let revisions: Vec<_> = likely_empty(revisions, |iter| {
+            iter.map(|rev| {
                 // We have to test this on the raw IDs because RecipientReference isn't necessarily
                 // comparable.
                 if author_id.0 != rev.authorId {
@@ -518,7 +521,8 @@ impl<
                 }
                 Ok(item)
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+        })?;
 
         let sent_at = Timestamp::from_millis(dateSent, "ChatItem.dateSent", context);
         let expire_start = expireStartDate
@@ -1044,6 +1048,8 @@ mod test {
                 [0; libsignal_account_keys::BACKUP_KEY_LEN],
             ),
             version: 0,
+            current_app_version: "".into(),
+            first_app_version: "".into(),
         };
 
         let mut item = proto::ChatItem::test_data();

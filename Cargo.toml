@@ -75,9 +75,9 @@ signal-neon-futures = { path = "rust/bridge/node/futures" }
 # Our forks of some dependencies, accessible as xxx_signal so that usages of them are obvious in source code. Crates
 # that want to use the real things can depend on those directly.
 
-boring-signal = { git = "https://github.com/signalapp/boring", tag = "signal-v4.9.0b", package = "boring", default-features = false }
+boring-signal = { git = "https://github.com/signalapp/boring", tag = "signal-v4.13.0", package = "boring", default-features = false }
 curve25519-dalek-signal = { git = 'https://github.com/signalapp/curve25519-dalek', package = "curve25519-dalek", tag = 'signal-curve25519-4.1.3' }
-tokio-boring-signal = { git = "https://github.com/signalapp/boring", package = "tokio-boring", tag = "signal-v4.9.0b" }
+tokio-boring-signal = { git = "https://github.com/signalapp/boring", package = "tokio-boring", tag = "signal-v4.13.0" }
 
 aes = "0.8.3"
 aes-gcm-siv = "0.11.1"
@@ -147,7 +147,7 @@ sha2 = "0.10"
 snow = { version = "0.9.6", default-features = false, features = ["hfs"] }
 static_assertions = "1.1"
 strum = "0.26"
-subtle = "2.5"
+subtle = "2.6"
 syn = "2.0"
 syn-mid = "0.6"
 test-case = "3.3"
@@ -156,13 +156,14 @@ thiserror = "1.0.57"
 tokio = "1"
 tokio-stream = "0.1.14"
 uuid = "1.1.2"
+visibility = "0.1.1"
 x25519-dalek = "2.0.0"
 zerocopy = "0.7.34"
 
 [patch.crates-io]
 # When building libsignal, just use our forks so we don't end up with two different versions of the libraries.
 
-boring = { git = 'https://github.com/signalapp/boring', tag = 'signal-v4.9.0b' }
+boring = { git = 'https://github.com/signalapp/boring', tag = 'signal-v4.13.0' }
 curve25519-dalek = { git = 'https://github.com/signalapp/curve25519-dalek', tag = 'signal-curve25519-4.1.3' }
 
 [profile.dev.package.argon2]

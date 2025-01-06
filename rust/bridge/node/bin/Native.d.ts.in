@@ -11,50 +11,53 @@ type Uuid = Buffer;
 /// what's important is that it's an integer less than Number.MAX_SAFE_INTEGER.
 type Timestamp = number;
 
-interface LookupResponse {
+// Rust code produces or consumes values that conform to these interface
+// definitions. They must be kept in sync to prevent bridging errors.
+
+type LookupResponse = {
   entries: Map<string, LookupResponseEntry>;
   debugPermitsUsed: number;
-}
+};
 
-interface LookupResponseEntry {
+type LookupResponseEntry = {
   readonly aci: string | undefined;
   readonly pni: string | undefined;
-}
+};
 
-interface ChatResponse {
+type ChatResponse = {
   status: number;
   message: string | undefined;
   headers: ReadonlyArray<[string, string]>;
   body: Buffer | undefined;
-}
+};
 
-interface ChatServiceDebugInfo {
+type ChatServiceDebugInfo = {
   ipType: number;
   durationMillis: number;
   connectionInfo: string;
-}
+};
 
-interface ResponseAndDebugInfo {
+type ResponseAndDebugInfo = {
   response: ChatResponse;
   debugInfo: ChatServiceDebugInfo;
-}
+};
 
-interface SealedSenderMultiRecipientMessageRecipient {
+type SealedSenderMultiRecipientMessageRecipient = {
   deviceIds: number[];
   registrationIds: number[];
   rangeOffset: number;
   rangeLen: number;
-}
+};
 
-interface SealedSenderMultiRecipientMessage {
+type SealedSenderMultiRecipientMessage = {
   recipientMap: {
     [serviceId: string]: SealedSenderMultiRecipientMessageRecipient;
   };
   excludedRecipients: string[];
   offsetOfSharedData: number;
-}
+};
 
-export abstract class IdentityKeyStore {
+type IdentityKeyStore = {
   _getIdentityKey(): Promise<PrivateKey>;
   _getLocalRegistrationId(): Promise<number>;
   _saveIdentity(name: ProtocolAddress, key: PublicKey): Promise<boolean>;
@@ -64,37 +67,37 @@ export abstract class IdentityKeyStore {
     sending: boolean
   ): Promise<boolean>;
   _getIdentity(name: ProtocolAddress): Promise<PublicKey | null>;
-}
+};
 
-export abstract class SessionStore {
+type SessionStore = {
   _saveSession(addr: ProtocolAddress, record: SessionRecord): Promise<void>;
   _getSession(addr: ProtocolAddress): Promise<SessionRecord | null>;
-}
+};
 
-export abstract class PreKeyStore {
+type PreKeyStore = {
   _savePreKey(preKeyId: number, record: PreKeyRecord): Promise<void>;
   _getPreKey(preKeyId: number): Promise<PreKeyRecord>;
   _removePreKey(preKeyId: number): Promise<void>;
-}
+};
 
-export abstract class SignedPreKeyStore {
+type SignedPreKeyStore = {
   _saveSignedPreKey(
     signedPreKeyId: number,
     record: SignedPreKeyRecord
   ): Promise<void>;
   _getSignedPreKey(signedPreKeyId: number): Promise<SignedPreKeyRecord>;
-}
+};
 
-export abstract class KyberPreKeyStore {
+type KyberPreKeyStore = {
   _saveKyberPreKey(
     kyberPreKeyId: number,
     record: KyberPreKeyRecord
   ): Promise<void>;
   _getKyberPreKey(kyberPreKeyId: number): Promise<KyberPreKeyRecord>;
   _markKyberPreKeyUsed(kyberPreKeyId: number): Promise<void>;
-}
+};
 
-export abstract class SenderKeyStore {
+type SenderKeyStore = {
   _saveSenderKey(
     sender: ProtocolAddress,
     distributionId: Uuid,
@@ -104,16 +107,16 @@ export abstract class SenderKeyStore {
     sender: ProtocolAddress,
     distributionId: Uuid
   ): Promise<SenderKeyRecord | null>;
-}
+};
 
-export abstract class InputStream {
+type InputStream = {
   _read(amount: number): Promise<Buffer>;
   _skip(amount: number): Promise<void>;
-}
+};
 
-export abstract class SyncInputStream extends Buffer {}
+type SyncInputStream = Buffer;
 
-export abstract class ChatListener {
+type ChatListener = {
   _incoming_message(
     envelope: Buffer,
     timestamp: number,
@@ -124,16 +127,20 @@ export abstract class ChatListener {
     // A LibSignalError or null, but not naming the type to avoid circular import dependencies.
     reason: Error | null
   ): void;
-}
+};
 
 type Wrapper<T> = Readonly<{
   _nativeHandle: T;
 }>;
 
-interface MessageBackupValidationOutcome {
+type MessageBackupValidationOutcome = {
   errorMessage: string | null;
   unknownFieldMessages: Array<string>;
-}
+};
+
+type CancellablePromise<T> = Promise<T> & {
+  _cancellationToken: bigint;
+};
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 type Serialized<T> = Buffer;

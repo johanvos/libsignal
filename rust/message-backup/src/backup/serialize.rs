@@ -14,8 +14,10 @@ use crate::backup::call::AdHocCall;
 use crate::backup::chat::group::Invitee;
 use crate::backup::chat::text::{TextEffect, TextRange};
 use crate::backup::chat::{ChatData, OutgoingSend};
+use crate::backup::chat_folder::ChatFolder;
 use crate::backup::frame::RecipientId;
 use crate::backup::method::Store;
+use crate::backup::notification_profile::NotificationProfile;
 use crate::backup::recipient::{DistributionListItem, FullRecipientData};
 use crate::backup::sticker::{PackId as StickerPackId, StickerPack};
 use crate::backup::{BackupMeta, ChatsData, CompletedBackup};
@@ -34,6 +36,8 @@ pub struct Backup {
     ad_hoc_calls: UnorderedList<AdHocCall<FullRecipientData>>,
     pinned_chats: Vec<FullRecipientData>,
     sticker_packs: UnorderedList<(StickerPackId, StickerPack<Store>)>,
+    notification_profiles: UnorderedList<NotificationProfile<FullRecipientData>>,
+    chat_folders: Vec<ChatFolder<FullRecipientData>>,
 }
 
 impl Backup {
@@ -57,6 +61,8 @@ impl From<CompletedBackup<Store>> for Backup {
                 },
             ad_hoc_calls,
             sticker_packs,
+            notification_profiles,
+            chat_folders,
         } = value;
         Self {
             meta,
@@ -66,6 +72,8 @@ impl From<CompletedBackup<Store>> for Backup {
             ad_hoc_calls: ad_hoc_calls.into_iter().collect(),
             pinned_chats: pinned.into_iter().map(|(_, data)| data).collect(),
             sticker_packs: sticker_packs.into_iter().collect(),
+            notification_profiles,
+            chat_folders,
         }
     }
 }
@@ -399,6 +407,8 @@ mod test {
                 version: 1,
                 backupTimeMs: 1715636551000,
                 mediaRootBackupKey: vec![0xab; libsignal_account_keys::BACKUP_KEY_LEN],
+                currentAppVersion: "libsignal-testing 0.0.2".into(),
+                firstAppVersion: "libsignal-testing 0.0.1".into(),
                 special_fields: Default::default(),
             }
         }
@@ -428,6 +438,8 @@ mod test {
                 media_root_backup_key: libsignal_account_keys::BackupKey(
                     [0xab; libsignal_account_keys::BACKUP_KEY_LEN],
                 ),
+                current_app_version: "libsignal-testing 0.0.2".into(),
+                first_app_version: "libsignal-testing 0.0.1".into(),
             },
             account_data: AccountData::from_proto_test_data(),
             recipients: UnorderedList::default(),
@@ -435,6 +447,8 @@ mod test {
             ad_hoc_calls: UnorderedList::default(),
             pinned_chats: Vec::default(),
             sticker_packs: UnorderedList::default(),
+            notification_profiles: UnorderedList::default(),
+            chat_folders: Vec::default(),
         };
 
         const EXPECTED_JSON: &str = include_str!("expected_serialized_backup.json");

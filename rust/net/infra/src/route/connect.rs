@@ -15,7 +15,8 @@ use tokio_util::either::Either;
 use crate::errors::TransportConnectError;
 use crate::route::{
     ConnectionProxyRoute, DirectOrProxyRoute, HttpRouteFragment, HttpsTlsRoute, TcpRoute, TlsRoute,
-    TlsRouteFragment, WebSocketRoute, WebSocketRouteFragment, WebSocketServiceRoute,
+    TlsRouteFragment, TransportRoute, WebSocketRoute, WebSocketRouteFragment,
+    WebSocketServiceRoute,
 };
 use crate::ws::WebSocketConnectError;
 
@@ -79,9 +80,9 @@ pub struct ComposedConnector<Outer, Inner, Error> {
     _error: PhantomData<Error>,
 }
 
-/// Stateless connector that connects [`WebSocketServiceRoute<IpAddr>`]s.
+/// Stateless connector that connects [`WebSocketServiceRoute`]s.
 pub type StatelessWebSocketConnector = WebSocketHttpConnector;
-/// Stateless connector that connects [`TlsTransportRoute<IpAddr>`](super::TlsTransportRoute)s.
+/// Stateless connector that connects [`TransportRoute`]s.
 pub type StatelessTransportConnector = TransportConnector;
 
 type TcpConnector = crate::tcp_ssl::StatelessDirect;
@@ -100,11 +101,8 @@ const _: () = {
         DirectProxyConnector,
         DirectOrProxyRoute<TcpRoute<IpAddr>, ConnectionProxyRoute<IpAddr>>,
     >();
-    assert_is_connector::<
-        TransportConnector,
-        TlsRoute<DirectOrProxyRoute<TcpRoute<IpAddr>, ConnectionProxyRoute<IpAddr>>>,
-    >();
-    assert_is_connector::<WebSocketHttpConnector, WebSocketServiceRoute<IpAddr>>();
+    assert_is_connector::<TransportConnector, TransportRoute>();
+    assert_is_connector::<WebSocketHttpConnector, WebSocketServiceRoute>();
 };
 
 impl<O, I, E> ComposedConnector<O, I, E> {
@@ -251,8 +249,51 @@ where
     }
 }
 
+impl<C: Connector<R, Inner>, R, Inner> Connector<R, Inner> for &C {
+    type Connection = C::Connection;
+
+    type Error = C::Error;
+
+    fn connect_over(
+        &self,
+        over: Inner,
+        route: R,
+    ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
+        (*self).connect_over(over, route)
+    }
+}
+
 impl From<std::io::Error> for WebSocketConnectError {
     fn from(value: std::io::Error) -> Self {
         Self::WebSocketError(value.into())
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub mod testutils {
+    use super::*;
+
+    /// [`Connector`] impl that wraps a [`Fn`].
+    ///
+    /// Using unnamed functions as Connector impls isn't great for readability,
+    /// so only allow it in test code.
+    pub struct ConnectFn<F>(pub F);
+
+    impl<R, Inner, Fut, F, C, E> Connector<R, Inner> for ConnectFn<F>
+    where
+        F: Fn(Inner, R) -> Fut,
+        Fut: Future<Output = Result<C, E>> + Send,
+    {
+        type Connection = C;
+
+        type Error = E;
+
+        fn connect_over(
+            &self,
+            over: Inner,
+            route: R,
+        ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
+            self.0(over, route)
+        }
     }
 }

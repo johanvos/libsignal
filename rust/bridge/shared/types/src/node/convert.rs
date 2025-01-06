@@ -668,6 +668,22 @@ impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context> for Box<dyn C
     }
 }
 
+impl<'a> AsyncArgTypeInfo<'a> for Box<dyn ChatListener> {
+    type ArgType = JsObject;
+    type StoredType = NodeChatListener;
+
+    fn save_async_arg(
+        cx: &mut FunctionContext,
+        foreign: Handle<Self::ArgType>,
+    ) -> NeonResult<Self::StoredType> {
+        NodeChatListener::new(cx, foreign)
+    }
+
+    fn load_async_arg(stored: &'a mut Self::StoredType) -> Self {
+        stored.make_listener()
+    }
+}
+
 impl<'storage, 'context: 'storage> ArgTypeInfo<'storage, 'context>
     for &'storage mut dyn SyncInputStream
 {
@@ -984,7 +1000,7 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::DebugInfo {
         } = self;
         let obj = JsObject::new(cx);
 
-        let ip_type = cx.number(ip_type as u8);
+        let ip_type = cx.number(ip_type.map_or(0, |i| i as u8));
         let duration = cx.number(duration.as_millis().try_into().unwrap_or(u32::MAX));
         let connection_info = cx.string(connection_info);
 
@@ -1169,7 +1185,7 @@ pub(crate) const NATIVE_HANDLE_PROPERTY: &str = "_nativeHandle";
 /// operations that might differ across types have been factored into the [`BridgeHandleStrategy`]
 /// trait. The [`bridge_as_handle`](crate::support::bridge_as_handle) macro will automatically choose the
 /// correct strategy.
-pub trait BridgeHandle: Send + Sync + Sized + 'static {
+pub trait BridgeHandle: Send + Sized + 'static {
     /// Factors out operations that differ between mutable and immutable bridge handles.
     type Strategy: BridgeHandleStrategy<Self>;
 }
@@ -1321,7 +1337,7 @@ pub struct PersistentBorrowedJsBoxedBridgeHandle<T: Send + Sync + 'static> {
     value_ref: &'static T,
 }
 
-impl<T: BridgeHandle<Strategy = Immutable<T>>> PersistentBorrowedJsBoxedBridgeHandle<T> {
+impl<T: BridgeHandle<Strategy = Immutable<T>> + Sync> PersistentBorrowedJsBoxedBridgeHandle<T> {
     /// Persists `wrapper`, assuming it does in fact reference a boxed Rust value under the
     /// `_nativeHandle` property.
     ///
@@ -1370,7 +1386,9 @@ pub struct PersistentArrayOfBorrowedJsBoxedBridgeHandles<T: Send + Sync + 'stati
     value_refs: Vec<&'static T>,
 }
 
-impl<T: BridgeHandle<Strategy = Immutable<T>>> PersistentArrayOfBorrowedJsBoxedBridgeHandles<T> {
+impl<T: BridgeHandle<Strategy = Immutable<T>> + Sync>
+    PersistentArrayOfBorrowedJsBoxedBridgeHandles<T>
+{
     /// Persists `array`, assuming it does in fact contain an array of objects referencing a boxed
     /// Rust value under the `_nativeHandle` property.
     ///
@@ -1410,7 +1428,7 @@ impl<T: Send + Sync + 'static> Finalize for PersistentArrayOfBorrowedJsBoxedBrid
     }
 }
 
-impl<'storage, T: BridgeHandle<Strategy = Immutable<T>>> AsyncArgTypeInfo<'storage>
+impl<'storage, T: BridgeHandle<Strategy = Immutable<T>> + Sync> AsyncArgTypeInfo<'storage>
     for &'storage [&'storage T]
 {
     type ArgType = JsArray;

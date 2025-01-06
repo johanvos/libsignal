@@ -7,7 +7,7 @@ plugins {
 }
 
 allprojects {
-    version = "0.62.0-gluon-1"
+    version = "0.64.1-gluon-1"
     group   = "org.signal"
 }
 

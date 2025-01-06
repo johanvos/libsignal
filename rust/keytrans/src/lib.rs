@@ -11,24 +11,25 @@ mod implicit;
 mod left_balanced;
 mod log;
 mod prefix;
+mod proto;
 mod verify;
 mod vrf;
-mod wire;
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 
 pub use ed25519_dalek::VerifyingKey;
+pub use proto::{
+    ChatMonitorResponse, CondensedTreeSearchResponse,
+    DistinguishedResponse as ChatDistinguishedResponse, FullTreeHead, MonitorKey, MonitorProof,
+    MonitorRequest, MonitorResponse, SearchResponse as ChatSearchResponse, StoredAccountData,
+    StoredMonitoringData, StoredTreeHead, TreeHead, UpdateRequest, UpdateResponse,
+};
 pub use verify::Error;
 use verify::{
     truncate_search_response, verify_distinguished, verify_monitor, verify_search, verify_update,
 };
 pub use vrf::PublicKey as VrfPublicKey;
-pub use wire::{
-    ChatDistinguishedResponse, ChatSearchResponse, CondensedTreeSearchResponse, FullTreeHead,
-    MonitorRequest, MonitorResponse, SearchRequest, SearchResponse, StoredMonitoringData,
-    StoredTreeHead, TreeHead, UpdateRequest, UpdateResponse,
-};
 
 /// DeploymentMode specifies the way that a transparency log is deployed.
 #[derive(PartialEq, Clone, Copy)]
@@ -76,21 +77,38 @@ impl From<LastTreeHead> for StoredTreeHead {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct SearchContext {
-    pub last_tree_head: Option<LastTreeHead>,
+pub struct SearchContext<'a> {
+    pub last_tree_head: Option<&'a LastTreeHead>,
     pub data: Option<MonitoringData>,
 }
 
 #[derive(Default, Debug)]
 pub struct MonitorContext {
-    last_tree_head: Option<LastTreeHead>,
-    data: HashMap<Vec<u8>, MonitoringData>,
+    pub last_tree_head: Option<LastTreeHead>,
+    pub data: HashMap<Vec<u8>, MonitoringData>,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerifiedSearchResult {
-    pub value: Option<Vec<u8>>,
-    pub state_update: LocalStateUpdate,
+    pub value: Vec<u8>,
+    pub state_update: SearchStateUpdate,
+}
+
+impl VerifiedSearchResult {
+    pub fn tree_root(&self) -> &TreeRoot {
+        &self.state_update.tree_root
+    }
+
+    pub fn are_all_roots_equal<'b>(
+        &self,
+        tail: impl IntoIterator<Item = Option<&'b Self>>,
+    ) -> bool {
+        let mut all_roots_are_equal = true;
+        for other in tail.into_iter().flatten() {
+            all_roots_are_equal &= self.tree_root() == other.tree_root();
+        }
+        all_roots_are_equal
+    }
 }
 
 /// A collection of updates needed to be performed on a local state following
@@ -98,27 +116,14 @@ pub struct VerifiedSearchResult {
 ///
 /// The data field may be empty if no local data needs updating.
 #[derive(Clone, Debug)]
-pub struct LocalStateUpdate {
+pub struct LocalStateUpdate<T> {
     pub tree_head: TreeHead,
     pub tree_root: TreeRoot,
-    pub monitors: Vec<(Vec<u8>, MonitoringData)>,
+    pub monitoring_data: T,
 }
 
-impl LocalStateUpdate {
-    /// Merges two updates by accumulating monitors and picking the most recent tree head.
-    pub fn merge(&mut self, other: &LocalStateUpdate) {
-        let LocalStateUpdate {
-            tree_head,
-            tree_root,
-            monitors,
-        } = other;
-
-        // Only updates with the same tree head and root are merge-able
-        assert_eq!(self.tree_head.timestamp, tree_head.timestamp);
-        assert_eq!(tree_root, &other.tree_root);
-        self.monitors.extend_from_slice(monitors);
-    }
-}
+pub type SearchStateUpdate = LocalStateUpdate<Option<MonitoringData>>;
+pub type MonitorStateUpdate = LocalStateUpdate<HashMap<Vec<u8>, MonitoringData>>;
 
 /// PublicConfig wraps the cryptographic keys needed to interact with a
 /// transparency tree.
@@ -145,16 +150,22 @@ impl SlimSearchRequest {
     }
 }
 
-impl From<SearchRequest> for SlimSearchRequest {
-    fn from(request: SearchRequest) -> Self {
-        let SearchRequest {
-            search_key,
-            version,
-            ..
-        } = request;
+/// Self-sufficient key transparency search response.
+///
+/// In order to produce a consistent result chat server returns three [`CondensedTreeSearchResponse`]
+/// with a single [`FullTreeHead`], however each such response is individually verifiable. This type
+/// re-creates the original self-sufficient search response.
+#[derive(Clone, Debug)]
+pub struct FullSearchResponse<'a> {
+    pub condensed: CondensedTreeSearchResponse,
+    pub tree_head: &'a FullTreeHead,
+}
+
+impl<'a> FullSearchResponse<'a> {
+    pub fn new(condensed: CondensedTreeSearchResponse, tree_head: &'a FullTreeHead) -> Self {
         Self {
-            search_key,
-            version,
+            condensed,
+            tree_head,
         }
     }
 }
@@ -172,17 +183,17 @@ impl KeyTransparency {
     pub fn verify_search(
         &self,
         request: SlimSearchRequest,
-        response: SearchResponse,
+        response: FullSearchResponse,
         context: SearchContext,
         force_monitor: bool,
         now: SystemTime,
     ) -> Result<VerifiedSearchResult, verify::Error> {
-        let unverified_value = response.value.as_ref().map(|v| v.value.clone());
+        let unverified_value = response.condensed.value.as_ref().map(|v| v.value.clone());
         let state_update =
             verify_search(&self.config, request, response, context, force_monitor, now)?;
         Ok(VerifiedSearchResult {
             // the value has now been verified
-            value: unverified_value,
+            value: unverified_value.ok_or(Error::RequiredFieldMissing)?,
             state_update,
         })
     }
@@ -210,8 +221,8 @@ impl KeyTransparency {
     /// Most validation is skipped so the SearchResponse MUST already be verified.
     pub fn truncate_search_response(
         &self,
-        request: &SearchRequest,
-        response: &SearchResponse,
+        request: &SlimSearchRequest,
+        response: &FullSearchResponse,
     ) -> Result<(u64, [u8; 32]), verify::Error> {
         truncate_search_response(&self.config, request, response)
     }
@@ -224,7 +235,7 @@ impl KeyTransparency {
         response: &'a MonitorResponse,
         context: MonitorContext,
         now: SystemTime,
-    ) -> Result<LocalStateUpdate, verify::Error> {
+    ) -> Result<MonitorStateUpdate, verify::Error> {
         verify_monitor(&self.config, request, response, context, now)
     }
 
@@ -236,7 +247,7 @@ impl KeyTransparency {
         response: &UpdateResponse,
         context: SearchContext,
         now: SystemTime,
-    ) -> Result<LocalStateUpdate, verify::Error> {
+    ) -> Result<SearchStateUpdate, verify::Error> {
         verify_update(&self.config, request, response, context, now)
     }
 }
@@ -287,6 +298,56 @@ impl From<StoredMonitoringData> for MonitoringData {
             pos: value.pos,
             ptrs: value.ptrs,
             owned: value.owned,
+        }
+    }
+}
+
+// An in-memory representation of the StoredAccountData with correct optionality of the fields
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountData {
+    pub aci: MonitoringData,
+    pub e164: Option<MonitoringData>,
+    pub username_hash: Option<MonitoringData>,
+    pub last_tree_head: LastTreeHead,
+}
+
+impl TryFrom<StoredAccountData> for AccountData {
+    type Error = Error;
+
+    fn try_from(stored: StoredAccountData) -> Result<Self, Self::Error> {
+        let StoredAccountData {
+            aci,
+            e164,
+            username_hash,
+            last_tree_head,
+        } = stored;
+        let last_tree_head = last_tree_head.ok_or(Error::RequiredFieldMissing)?;
+        Ok(Self {
+            aci: aci
+                .map(MonitoringData::from)
+                .ok_or(Error::RequiredFieldMissing)?,
+            e164: e164.map(MonitoringData::from),
+            username_hash: username_hash.map(MonitoringData::from),
+            last_tree_head: last_tree_head
+                .into_last_tree_head()
+                .expect("valid tree head"),
+        })
+    }
+}
+
+impl From<AccountData> for StoredAccountData {
+    fn from(acc: AccountData) -> Self {
+        let AccountData {
+            aci,
+            e164,
+            username_hash,
+            last_tree_head,
+        } = acc;
+        Self {
+            aci: Some(aci.into()),
+            e164: e164.map(StoredMonitoringData::from),
+            username_hash: username_hash.map(StoredMonitoringData::from),
+            last_tree_head: Some(last_tree_head.into()),
         }
     }
 }

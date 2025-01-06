@@ -6,10 +6,12 @@
 use std::default::Default;
 
 use futures_util::TryFutureExt as _;
-use http::StatusCode;
+use http::{HeaderName, StatusCode};
 use libsignal_core::{Aci, Pni, E164};
 use libsignal_net_infra::connection_manager::ConnectionManager;
+use libsignal_net_infra::dns::DnsResolver;
 use libsignal_net_infra::errors::{LogSafeDisplay, TransportConnectError};
+use libsignal_net_infra::route::{RouteProvider, UnresolvedWebsocketServiceRoute};
 use libsignal_net_infra::ws::{NextOrClose, WebSocketConnectError, WebSocketServiceError};
 use libsignal_net_infra::ws2::attested::{
     AttestedConnection, AttestedConnectionError, AttestedProtocolError,
@@ -22,7 +24,8 @@ use tungstenite::protocol::CloseFrame;
 use uuid::Uuid;
 
 use crate::auth::Auth;
-use crate::enclave::{Cdsi, EnclaveEndpointConnection};
+use crate::connect_state::ConnectState;
+use crate::enclave::{Cdsi, EnclaveEndpointConnection, EndpointParams, NewHandshake as _};
 use crate::proto::cds2::{ClientRequest, ClientResponse};
 use crate::ws::WebSocketServiceConnectError;
 
@@ -85,7 +88,6 @@ pub struct LookupRequest {
     pub new_e164s: Vec<E164>,
     pub prev_e164s: Vec<E164>,
     pub acis_and_access_keys: Vec<AciAndAccessKey>,
-    pub return_acis_without_uaks: bool,
     pub token: Box<[u8]>,
 }
 
@@ -95,7 +97,6 @@ impl LookupRequest {
             new_e164s,
             prev_e164s,
             acis_and_access_keys,
-            return_acis_without_uaks,
             token,
         } = self;
 
@@ -107,7 +108,6 @@ impl LookupRequest {
             aci_uak_pairs,
             new_e164s,
             prev_e164s,
-            return_acis_without_uaks,
             token: token.into_vec(),
             token_ack: false,
             // TODO: use these for supporting non-desktop client requirements.
@@ -347,6 +347,28 @@ impl CdsiConnection {
         Ok(Self(connection))
     }
 
+    pub async fn connect_with(
+        connect: &tokio::sync::RwLock<ConnectState>,
+        resolver: &DnsResolver,
+        route_provider: impl RouteProvider<Route = UnresolvedWebsocketServiceRoute>,
+        confirmation_header_name: Option<HeaderName>,
+        ws_config: crate::infra::ws2::Config,
+        params: &EndpointParams<'_, Cdsi>,
+        auth: Auth,
+    ) -> Result<Self, LookupError> {
+        let connection = ConnectState::connect_attested_ws(
+            connect,
+            route_provider,
+            auth,
+            resolver,
+            confirmation_header_name,
+            ws_config,
+            move |attestation_message| Cdsi::new_handshake(params, attestation_message),
+        )
+        .await?;
+        Ok(Self(connection))
+    }
+
     pub async fn send_request(
         mut self,
         request: LookupRequest,
@@ -414,7 +436,6 @@ struct LookupRequestDebugInfo {
     new_e164s: usize,
     prev_e164s: usize,
     acis_and_access_keys: usize,
-    return_acis_without_uaks: bool,
     token: usize,
 }
 
@@ -424,7 +445,6 @@ impl std::fmt::Display for LookupRequestDebugInfo {
             .field("new_e164s", &self.new_e164s)
             .field("prev_e164s", &self.prev_e164s)
             .field("acis_and_access_keys", &self.acis_and_access_keys)
-            .field("return_acis_without_uaks", &self.return_acis_without_uaks)
             .field("token", &self.token)
             .finish()
     }
@@ -438,14 +458,12 @@ impl From<&LookupRequest> for LookupRequestDebugInfo {
             new_e164s,
             prev_e164s,
             acis_and_access_keys,
-            return_acis_without_uaks,
             token,
         } = value;
         Self {
             new_e164s: new_e164s.len(),
             prev_e164s: prev_e164s.len(),
             acis_and_access_keys: acis_and_access_keys.len(),
-            return_acis_without_uaks: *return_acis_without_uaks,
             token: token.len(),
         }
     }

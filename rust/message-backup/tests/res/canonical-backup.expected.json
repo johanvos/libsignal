@@ -2,6 +2,7 @@
   "meta": {
     "version": 1,
     "media_root_backup_key": "abababababababababababababababababababababababababababababababab",
+    "first_app_version": "",
     "purpose": "RemoteBackup"
   },
   "account_data": {
@@ -73,5 +74,7 @@
   "chats": [],
   "ad_hoc_calls": [],
   "pinned_chats": [],
-  "sticker_packs": []
+  "sticker_packs": [],
+  "notification_profiles": [],
+  "chat_folders": []
 }
