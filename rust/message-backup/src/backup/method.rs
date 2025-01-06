@@ -1,3 +1,8 @@
+//
+// Copyright (C) 2024 Signal Messenger, LLC.
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -32,7 +37,7 @@ where
 // implement `serde::Serialize`. That's not correct in this case but it's
 // simpler to just roll with it since the no-op implementations can be trivially
 // derived.
-pub trait Method: serde::Serialize {
+pub trait Method: serde::Serialize + 'static {
     type Value<T: Debug + serde::Serialize>: Debug + serde::Serialize;
     type BoxedValue<T: Debug + serde::Serialize>: Debug + serde::Serialize;
     type List<T: Debug>: Extend<T> + Default + Debug;

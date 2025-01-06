@@ -16,12 +16,16 @@ pub(crate) use crate::backup::account_data::{AccountData, AccountDataError};
 use crate::backup::call::{AdHocCall, CallError};
 use crate::backup::chat::chat_style::{CustomChatColor, CustomColorId};
 use crate::backup::chat::{ChatData, ChatError, ChatItemData, ChatItemError, PinOrder};
+use crate::backup::chat_folder::{ChatFolder, ChatFolderError};
 use crate::backup::frame::{ChatId, RecipientId};
-use crate::backup::method::{Lookup, LookupPair, Method, Store, ValidateOnly};
+use crate::backup::map::IntMap;
+use crate::backup::method::{Lookup, LookupPair, Method};
+pub use crate::backup::method::{Store, ValidateOnly};
+use crate::backup::notification_profile::{NotificationProfile, NotificationProfileError};
 use crate::backup::recipient::{
     DestinationKind, FullRecipientData, MinimalRecipientData, RecipientError,
 };
-use crate::backup::serialize::{backup_key_as_hex, SerializeOrder};
+use crate::backup::serialize::{backup_key_as_hex, SerializeOrder, UnorderedList};
 use crate::backup::sticker::{PackId as StickerPackId, StickerPack, StickerPackError};
 use crate::backup::time::{
     ReportUnusualTimestamp, Timestamp, TimestampIssue, UnusualTimestampTracker,
@@ -32,9 +36,12 @@ use crate::proto::backup::frame::Item as FrameItem;
 mod account_data;
 mod call;
 mod chat;
+mod chat_folder;
 mod file;
 mod frame;
+mod map;
 pub(crate) mod method;
+mod notification_profile;
 mod recipient;
 pub mod serialize;
 mod sticker;
@@ -42,6 +49,9 @@ mod time;
 
 #[cfg(test)]
 mod testutil;
+
+#[cfg(feature = "scramble")]
+pub(crate) use crate::backup::recipient::MY_STORY_UUID;
 
 pub trait ReferencedTypes {
     /// Recorded information from a [`proto::Recipient`].
@@ -84,10 +94,12 @@ pub trait ReferencedTypes {
 pub struct PartialBackup<M: Method + ReferencedTypes> {
     meta: BackupMeta,
     account_data: Option<AccountData<M>>,
-    recipients: HashMap<RecipientId, M::RecipientData>,
+    recipients: IntMap<RecipientId, M::RecipientData>,
     chats: ChatsData<M>,
     ad_hoc_calls: M::List<AdHocCall<M::RecipientReference>>,
     sticker_packs: HashMap<StickerPackId, StickerPack<M>>,
+    notification_profiles: UnorderedList<NotificationProfile<M::RecipientReference>>,
+    chat_folders: Vec<ChatFolder<M::RecipientReference>>,
     /// Stored here so PartialBackup can be the only context necessary for processing backup frames.
     unusual_timestamp_tracker: RefCell<UnusualTimestampTracker>,
 }
@@ -96,17 +108,19 @@ pub struct PartialBackup<M: Method + ReferencedTypes> {
 pub struct CompletedBackup<M: Method + ReferencedTypes> {
     meta: BackupMeta,
     account_data: AccountData<M>,
-    recipients: HashMap<RecipientId, M::RecipientData>,
+    recipients: IntMap<RecipientId, M::RecipientData>,
     chats: ChatsData<M>,
     ad_hoc_calls: M::List<AdHocCall<M::RecipientReference>>,
     sticker_packs: HashMap<StickerPackId, StickerPack<M>>,
+    notification_profiles: UnorderedList<NotificationProfile<M::RecipientReference>>,
+    chat_folders: Vec<ChatFolder<M::RecipientReference>>,
 }
 
 pub type Backup = CompletedBackup<Store>;
 
 #[derive_where(Debug, Default)]
 struct ChatsData<M: Method + ReferencedTypes> {
-    items: HashMap<ChatId, ChatData<M>>,
+    items: IntMap<ChatId, ChatData<M>>,
     pinned: Vec<(PinOrder, M::RecipientReference)>,
     /// Count of the total number of chat items held across all values in `items`.
     pub chat_items_count: usize,
@@ -124,6 +138,13 @@ pub struct BackupMeta {
     /// The key used to encrypt and upload media associated with this backup.
     #[serde(serialize_with = "backup_key_as_hex")]
     pub media_root_backup_key: libsignal_account_keys::BackupKey,
+    /// The app version that made the backup.
+    ///
+    /// Omitted from the canonical backup string, so that subsequent backups can be compared.
+    #[serde(skip)]
+    pub current_app_version: String,
+    /// The app version the user first registered on.
+    pub first_app_version: String,
     /// What purpose the backup was intended for.
     pub purpose: Purpose,
 }
@@ -161,6 +182,10 @@ pub enum Purpose {
 pub enum CompletionError {
     /// no AccountData frames found
     MissingAccountData,
+    /// no ALL ChatFolder found
+    MissingAllChatFolder,
+    /// multiple ALL ChatFolders found
+    DuplicateAllChatFolder,
 }
 
 impl<M: Method + ReferencedTypes> TryFrom<PartialBackup<M>> for CompletedBackup<M> {
@@ -174,10 +199,24 @@ impl<M: Method + ReferencedTypes> TryFrom<PartialBackup<M>> for CompletedBackup<
             chats,
             ad_hoc_calls,
             sticker_packs,
+            notification_profiles,
+            chat_folders,
             unusual_timestamp_tracker: _,
         } = value;
 
         let account_data = account_data.ok_or(CompletionError::MissingAccountData)?;
+
+        if !chat_folders.is_empty() {
+            match chat_folders
+                .iter()
+                .filter(|folder| matches!(folder, ChatFolder::All))
+                .count()
+            {
+                0 => Err(CompletionError::MissingAllChatFolder),
+                1 => Ok(()),
+                _ => Err(CompletionError::DuplicateAllChatFolder),
+            }?;
+        }
 
         Ok(CompletedBackup {
             meta,
@@ -186,6 +225,8 @@ impl<M: Method + ReferencedTypes> TryFrom<PartialBackup<M>> for CompletedBackup<
             chats,
             ad_hoc_calls,
             sticker_packs,
+            notification_profiles,
+            chat_folders,
         })
     }
 }
@@ -208,6 +249,10 @@ pub enum ValidationError {
     CallError(#[from] CallFrameError),
     /// {0}
     StickerError(#[from] StickerError),
+    /// {0}
+    NotificationProfileError(#[from] NotificationProfileError),
+    /// {0}
+    ChatFolderError(#[from] ChatFolderError),
 }
 
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
@@ -365,6 +410,8 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
             version,
             backupTimeMs,
             mediaRootBackupKey,
+            currentAppVersion,
+            firstAppVersion,
             special_fields: _,
         } = value;
 
@@ -385,6 +432,8 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
                 &unusual_timestamp_tracker,
             ),
             media_root_backup_key,
+            current_app_version: currentAppVersion,
+            first_app_version: firstAppVersion,
             purpose,
         };
 
@@ -394,7 +443,9 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
             recipients: Default::default(),
             chats: Default::default(),
             ad_hoc_calls: Default::default(),
-            sticker_packs: HashMap::new(),
+            sticker_packs: Default::default(),
+            notification_profiles: Default::default(),
+            chat_folders: Default::default(),
             unusual_timestamp_tracker,
         })
     }
@@ -413,6 +464,12 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
                 self.add_sticker_pack(sticker_pack).map_err(Into::into)
             }
             FrameItem::AdHocCall(call) => self.add_ad_hoc_call(call).map_err(Into::into),
+            FrameItem::NotificationProfile(notification_profile) => self
+                .add_notification_profile(notification_profile)
+                .map_err(Into::into),
+            FrameItem::ChatFolder(chat_folder) => {
+                self.add_chat_folder(chat_folder).map_err(Into::into)
+            }
         }
     }
 
@@ -445,8 +502,8 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
         let err_with_id = |e| RecipientFrameError(id, e);
         let recipient = M::try_convert_recipient(recipient, self).map_err(err_with_id)?;
         match self.recipients.entry(id) {
-            hash_map::Entry::Occupied(_) => Err(err_with_id(RecipientError::DuplicateRecipient)),
-            hash_map::Entry::Vacant(v) => {
+            intmap::Entry::Occupied(_) => Err(err_with_id(RecipientError::DuplicateRecipient)),
+            intmap::Entry::Vacant(v) => {
                 let _ = v.insert(recipient);
                 Ok(())
             }
@@ -466,10 +523,19 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
 
     fn add_chat_item(&mut self, chat_item: proto::ChatItem) -> Result<(), ValidationError> {
         let chat_id = ChatId(chat_item.chatId);
+        let raw_timestamp = chat_item.dateSent;
 
         let chat_item_data = chat_item
             .try_into_with(self)
-            .map_err(|e: ChatItemError| ChatFrameError(chat_id, e.into()))?;
+            .map_err(|error: ChatItemError| {
+                ChatFrameError(
+                    chat_id,
+                    ChatError::ChatItem {
+                        raw_timestamp,
+                        error,
+                    },
+                )
+            })?;
 
         Ok(self.chats.add_chat_item(chat_id, chat_item_data)?)
     }
@@ -491,6 +557,21 @@ impl<M: Method + ReferencedTypes> PartialBackup<M> {
             }
         }
     }
+
+    fn add_notification_profile(
+        &mut self,
+        notification_profile: proto::NotificationProfile,
+    ) -> Result<(), ValidationError> {
+        let profile = notification_profile.try_into_with(self)?;
+        self.notification_profiles.0.push(profile);
+        Ok(())
+    }
+
+    fn add_chat_folder(&mut self, chat_folder: proto::ChatFolder) -> Result<(), ValidationError> {
+        let folder = chat_folder.try_into_with(self)?;
+        self.chat_folders.push(folder);
+        Ok(())
+    }
 }
 
 impl<M: Method + ReferencedTypes> ChatsData<M> {
@@ -502,8 +583,8 @@ impl<M: Method + ReferencedTypes> ChatsData<M> {
         } = self;
 
         match items.entry(id) {
-            hash_map::Entry::Occupied(_) => Err(ChatFrameError(id, ChatError::DuplicateId)),
-            hash_map::Entry::Vacant(v) => {
+            intmap::Entry::Occupied(_) => Err(ChatFrameError(id, ChatError::DuplicateId)),
+            intmap::Entry::Vacant(v) => {
                 if let Some(pin) = chat.pinned_order {
                     pinned.push((pin, chat.recipient.clone()));
                 }
@@ -524,9 +605,15 @@ impl<M: Method + ReferencedTypes> ChatsData<M> {
             pinned: _,
         } = self;
 
-        let chat_data = items
-            .get_mut(&chat_id)
-            .ok_or(ChatFrameError(chat_id, ChatItemError::NoChatForItem.into()))?;
+        let chat_data = items.get_mut(&chat_id).ok_or_else(|| {
+            ChatFrameError(
+                chat_id,
+                ChatError::ChatItem {
+                    raw_timestamp: item.sent_at.as_millis(),
+                    error: ChatItemError::NoChatForItem,
+                },
+            )
+        })?;
 
         item.total_chat_item_order_index = *chat_items_count;
 
@@ -669,6 +756,26 @@ pub async fn convert_to_json(
     Ok(array)
 }
 
+pub enum ColorError {
+    NotOpaque(u32),
+}
+
+#[derive(Copy, Clone, Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
+#[serde(transparent)]
+pub struct Color(u32);
+
+impl TryFrom<u32> for Color {
+    type Error = ColorError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if value >> 24 != 0xFF {
+            return Err(ColorError::NotOpaque(value));
+        }
+        Ok(Self(value))
+    }
+}
+
 struct InvalidAci;
 
 fn uuid_bytes_to_aci(bytes: Vec<u8>) -> Result<Aci, InvalidAci> {
@@ -678,8 +785,25 @@ fn uuid_bytes_to_aci(bytes: Vec<u8>) -> Result<Aci, InvalidAci> {
         .map_err(|_| InvalidAci)
 }
 
+/// Hint for processing a collection that's usually empty.
+///
+/// This saves a small amount of time by not setting up an iteration loop in `collect` only to throw
+/// it away.
+fn likely_empty<I, T: Default, E>(
+    input: Vec<I>,
+    process: impl FnOnce(std::vec::IntoIter<I>) -> Result<T, E>,
+) -> Result<T, E> {
+    if input.is_empty() {
+        Ok(T::default())
+    } else {
+        process(input.into_iter())
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
     use assert_matches::assert_matches;
     use test_case::{test_case, test_matrix};
 
@@ -786,6 +910,66 @@ mod test {
         );
     }
 
+    #[test_case(ValidateOnly::empty())]
+    #[test_case(Store::empty())]
+    fn rejects_missing_account_data<M: Method + ReferencedTypes>(partial: PartialBackup<M>) {
+        assert_matches!(
+            CompletedBackup::try_from(partial),
+            Err(CompletionError::MissingAccountData)
+        );
+    }
+
+    #[test_case(ValidateOnly::empty())]
+    #[test_case(Store::empty())]
+    fn rejects_missing_all_folder<M: Method + ReferencedTypes>(mut partial: PartialBackup<M>) {
+        partial
+            .add_frame_item(proto::AccountData::test_data().into())
+            .expect("accepts AccountData");
+        partial
+            .add_frame_item(proto::Recipient::test_data_contact().into())
+            .expect("accepts Contact");
+        partial
+            .add_frame_item(FrameItem::ChatFolder(proto::ChatFolder::test_data()))
+            .expect("accepts ChatFolder");
+
+        assert_matches!(
+            CompletedBackup::try_from(partial),
+            Err(CompletionError::MissingAllChatFolder)
+        );
+    }
+
+    #[test_case(ValidateOnly::empty())]
+    #[test_case(Store::empty())]
+    fn allows_lone_all_folder<M: Method + ReferencedTypes>(mut partial: PartialBackup<M>) {
+        partial
+            .add_frame_item(proto::AccountData::test_data().into())
+            .expect("accepts AccountData");
+        partial
+            .add_frame_item(FrameItem::ChatFolder(proto::ChatFolder::all_folder_data()))
+            .expect("accepts ChatFolder");
+
+        assert_matches!(CompletedBackup::try_from(partial), Ok(_));
+    }
+
+    #[test_case(ValidateOnly::empty())]
+    #[test_case(Store::empty())]
+    fn rejects_duplicate_all_folder<M: Method + ReferencedTypes>(mut partial: PartialBackup<M>) {
+        partial
+            .add_frame_item(proto::AccountData::test_data().into())
+            .expect("accepts AccountData");
+        partial
+            .add_frame_item(FrameItem::ChatFolder(proto::ChatFolder::all_folder_data()))
+            .expect("accepts ChatFolder");
+        partial
+            .add_frame_item(FrameItem::ChatFolder(proto::ChatFolder::all_folder_data()))
+            .expect("accepts ChatFolder");
+
+        assert_matches!(
+            CompletedBackup::try_from(partial),
+            Err(CompletionError::DuplicateAllChatFolder)
+        );
+    }
+
     #[test]
     fn chat_item_order() {
         let mut partial = Store::empty();
@@ -826,10 +1010,10 @@ mod test {
             .expect("valid completed backup")
             .chats
             .items
-            .into_iter()
-            .map(|(chat_id, items)| {
+            .into_iter_with_raw_keys()
+            .map(|(raw_chat_id, items)| {
                 (
-                    chat_id,
+                    raw_chat_id,
                     items
                         .items
                         .into_iter()
@@ -837,11 +1021,11 @@ mod test {
                         .collect(),
                 )
             })
-            .collect::<HashMap<ChatId, Vec<usize>>>();
+            .collect::<HashMap<u64, Vec<usize>>>();
 
         assert_eq!(
             chat_order_indices,
-            HashMap::from([(ChatId(1), vec![0, 2, 4]), (ChatId(2), vec![1, 3, 5])])
+            HashMap::from([(1, vec![0, 2, 4]), (2, vec![1, 3, 5])])
         );
     }
 }

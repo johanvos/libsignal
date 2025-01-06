@@ -6,40 +6,72 @@
 
 use std::time::Duration;
 
+use clap::Parser;
+use http::HeaderName;
 use libsignal_net::auth::Auth;
 use libsignal_net::cdsi::{CdsiConnection, LookupError, LookupRequest, LookupResponse};
-use libsignal_net::enclave::{Cdsi, EnclaveEndpointConnection};
-use libsignal_net::infra::connection_manager::ConnectionManager;
+use libsignal_net::connect_state::ConnectState;
+use libsignal_net::enclave::EnclaveEndpointConnection;
 use libsignal_net::infra::dns::DnsResolver;
-use libsignal_net::infra::tcp_ssl::DirectConnector as TcpSslTransportConnector;
 use libsignal_net::infra::utils::ObservableEvent;
-use libsignal_net::infra::TransportConnector;
+use libsignal_net_infra::route::{ConnectionOutcomeParams, DirectOrProxyProvider};
+use libsignal_net_infra::tcp_ssl::DirectConnector;
+use libsignal_net_infra::EnableDomainFronting;
 use tokio::io::AsyncBufReadExt as _;
 
 async fn cdsi_lookup(
-    auth: Auth,
-    endpoint: &EnclaveEndpointConnection<Cdsi, impl ConnectionManager>,
-    transport_connector: impl TransportConnector,
+    cdsi: CdsiConnection,
     request: LookupRequest,
     timeout: Duration,
 ) -> Result<LookupResponse, LookupError> {
-    let connected = CdsiConnection::connect(endpoint, transport_connector, auth).await?;
     let (_token, remaining_response) = libsignal_net::infra::utils::timeout(
         timeout,
         LookupError::ConnectionTimedOut,
-        connected.send_request(request),
+        cdsi.send_request(request),
     )
     .await?;
 
     remaining_response.collect().await
 }
 
+#[derive(clap::Parser)]
+struct CliArgs {
+    #[arg(long, default_value_t = false)]
+    use_routes: bool,
+    #[arg(long, default_value_t = std::env::var("USERNAME").unwrap())]
+    username: String,
+    #[arg(long, default_value_t = std::env::var("PASSWORD").unwrap())]
+    password: String,
+}
+
+const CONNECT_PARAMS: ConnectionOutcomeParams = {
+    ConnectionOutcomeParams {
+        age_cutoff: Duration::from_secs(5 * 60),
+        cooldown_growth_factor: 10.0,
+        max_count: 5,
+        max_delay: Duration::from_secs(30),
+        count_growth_factor: 10.0,
+    }
+};
+
+const WS2_CONFIG: libsignal_net_infra::ws2::Config = libsignal_net_infra::ws2::Config {
+    local_idle_timeout: Duration::from_secs(10),
+    remote_idle_ping_timeout: Duration::from_secs(10),
+    remote_idle_disconnect_timeout: Duration::from_secs(30),
+};
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
-    let username = std::env::var("USERNAME").unwrap();
-    let password = std::env::var("PASSWORD").unwrap();
+    let CliArgs {
+        use_routes,
+        username,
+        password,
+    } = CliArgs::parse();
+
+    let auth = Auth { username, password };
+
     let mut new_e164s = vec![];
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
 
@@ -50,24 +82,48 @@ async fn main() {
     let request = LookupRequest {
         new_e164s,
         acis_and_access_keys: vec![],
-        return_acis_without_uaks: true,
         ..Default::default()
     };
-    let env = libsignal_net::env::PROD;
+
+    let cdsi_env = libsignal_net::env::PROD.cdsi;
     let network_change_event = ObservableEvent::default();
-    let endpoint_connection =
-        EnclaveEndpointConnection::new(&env.cdsi, Duration::from_secs(10), &network_change_event);
-    let transport_connection =
-        TcpSslTransportConnector::new(DnsResolver::new(&network_change_event));
-    let cdsi_response = cdsi_lookup(
-        Auth { username, password },
-        &endpoint_connection,
-        transport_connection,
-        request,
-        Duration::from_secs(10),
-    )
-    .await
+    let resolver = DnsResolver::new(&network_change_event);
+
+    let connected = if use_routes {
+        let confirmation_header = cdsi_env
+            .domain_config
+            .connect
+            .confirmation_header_name
+            .map(HeaderName::from_static);
+        let connect_state = ConnectState::new(CONNECT_PARAMS);
+
+        CdsiConnection::connect_with(
+            &connect_state,
+            &resolver,
+            DirectOrProxyProvider::maybe_proxied(
+                cdsi_env.route_provider(EnableDomainFronting(false)),
+                None,
+            ),
+            confirmation_header,
+            WS2_CONFIG,
+            &cdsi_env.params,
+            auth,
+        )
+        .await
+    } else {
+        let endpoint_connection = EnclaveEndpointConnection::new(
+            &cdsi_env,
+            Duration::from_secs(10),
+            &network_change_event,
+        );
+        let transport_connection = DirectConnector::new(resolver);
+        CdsiConnection::connect(&endpoint_connection, transport_connection, auth).await
+    }
     .unwrap();
+
+    let cdsi_response = cdsi_lookup(connected, request, Duration::from_secs(10))
+        .await
+        .unwrap();
 
     println!("{:?}", cdsi_response);
 }

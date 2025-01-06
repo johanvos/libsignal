@@ -15,7 +15,7 @@ use crate::backup::method::LookupPair;
 use crate::backup::recipient::DestinationKind;
 use crate::backup::serialize::SerializeOrder;
 use crate::backup::time::ReportUnusualTimestamp;
-use crate::backup::{TryFromWith, TryIntoWith as _};
+use crate::backup::{likely_empty, TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::StandardMessage`].
@@ -55,12 +55,24 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
             .map(|q| q.try_into_with(context))
             .transpose()?;
 
-        let text = text.into_option().map(MessageText::try_from).transpose()?;
+        let text = match text.into_option() {
+            None => None,
+            // Fast-path for a message with no body-ranges.
+            Some(proto::Text {
+                body,
+                bodyRanges,
+                special_fields: _,
+            }) if bodyRanges.is_empty() => Some(MessageText {
+                text: body,
+                ranges: Default::default(),
+            }),
+            Some(text) => Some(text.try_into()?),
+        };
 
-        let link_previews = linkPreview
-            .into_iter()
-            .map(|preview| LinkPreview::try_from_with(preview, context))
-            .collect::<Result<_, _>>()?;
+        let link_previews = likely_empty(linkPreview, |iter| {
+            iter.map(|preview| LinkPreview::try_from_with(preview, context))
+                .collect::<Result<_, _>>()
+        })?;
 
         let long_text = longText
             .into_option()
@@ -68,10 +80,10 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
             .transpose()
             .map_err(ChatItemError::LongText)?;
 
-        let attachments = attachments
-            .into_iter()
-            .map(|attachment| MessageAttachment::try_from_with(attachment, context))
-            .collect::<Result<_, _>>()?;
+        let attachments = likely_empty(attachments, |iter| {
+            iter.map(|attachment| MessageAttachment::try_from_with(attachment, context))
+                .collect::<Result<_, _>>()
+        })?;
 
         Ok(Self {
             text,
