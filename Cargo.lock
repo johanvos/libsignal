@@ -2080,8 +2080,8 @@ version = "2.0.0"
 source = "git+https://github.com/JesperAxelsson/rust-intmap?rev=e7edd6e8fb452506ca2570e91f62b14dc29a950c#e7edd6e8fb452506ca2570e91f62b14dc29a950c"
 
 [[package]]
-name = "ipnet"
-version = "2.10.0"
+name = "intrusive-collections"
+version = "0.9.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
 dependencies = [
@@ -3270,7 +3270,7 @@ checksum = "a948666b637a0f465e8564c73e89d4dde00d72d4d473cc972f390fc3dcee7d9c"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.77",
+ "syn 2.0.89",
 ]
 
 [[package]]
@@ -5367,7 +5367,7 @@ checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.77",
+ "syn 2.0.89",
 ]
 
 [[package]]
