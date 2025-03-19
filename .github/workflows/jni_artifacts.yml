@@ -21,12 +21,14 @@ jobs:
 
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
         include:
           - os: windows-latest
           - os: macos-latest
             additional-rust-target: x86_64-apple-darwin
-        # Ubuntu binaries are built using Docker, below
+          - os: ubuntu-latest
+            additional-rust-target: aarch64-unknown-linux-gnu
+        # Ubuntu binaries for x86_64 are built using Docker, below
 
     timeout-minutes: 45
 
@@ -54,6 +56,10 @@ jobs:
     - run: rustup target add ${{ matrix.additional-rust-target }}
       if: ${{ matrix.additional-rust-target != '' }}
 
+    # install cross compiler tools for linux aarch64
+    - run: sudo apt-get update && sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      if: ${{ matrix.os == 'ubuntu-latest' && matrix.additional-rust-target != '' }}
+
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -73,21 +79,23 @@ jobs:
 
     - name: Build client for host
       run: java/build_jni.sh desktop
+      if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
       shell: bash
 
     - name: Build server for host
       run: java/build_jni.sh server
+      if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
       shell: bash
 
     - name: Build client for alternate target
       run: java/build_jni.sh desktop
-      if: matrix.os == 'macos-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
     - name: Build server for alternate target
       run: java/build_jni.sh server
-      if: matrix.os == 'macos-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
@@ -98,6 +106,7 @@ jobs:
         path: |
           java/client/src/main/resources/*.dll
           java/client/src/main/resources/*.dylib
+          java/client/src/main/resources/*.so
 
     - name: Upload server libraries
       uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
@@ -106,6 +115,7 @@ jobs:
         path: |
           java/server/src/main/resources/*.dll
           java/server/src/main/resources/*.dylib
+          java/client/src/main/resources/*.so
 
   # verify-rust:
   #   name: Verify JNI bindings
