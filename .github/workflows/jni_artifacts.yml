@@ -57,7 +57,7 @@ jobs:
       if: ${{ matrix.additional-rust-target != '' }}
 
     # install cross compiler tools for linux aarch64
-    - run: sudo apt-get gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+    - run: sudo apt-get update && sudo apt-get install gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       if: ${{ matrix.os == 'ubuntu-latest' && matrix.additional-rust-target != '' }}
 
     - name: Install Protoc
