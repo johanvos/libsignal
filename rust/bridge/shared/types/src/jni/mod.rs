@@ -2,6 +2,7 @@
 // Copyright 2020-2021 Signal Messenger, LLC.
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+use std::convert::{TryFrom, TryInto};
 use std::error::Error;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -22,7 +23,10 @@ use libsignal_net::infra::errors::RetryLater;
 use libsignal_net::infra::ws::WebSocketServiceError;
 use libsignal_net::keytrans::Error as KeyTransNetError;
 use libsignal_protocol::*;
+use signal_chat::Error as SignalChatError;
 use signal_crypto::Error as SignalCryptoError;
+use signal_grpc::{Error as GrpcError, GrpcReply, GrpcReplyListener};
+use signal_quic::{Error as QuicError, QuicCallbackListener};
 use usernames::{UsernameError, UsernameLinkError};
 
 use crate::net::cdsi::CdsiError;
@@ -47,8 +51,14 @@ pub use error::*;
 mod futures;
 pub use futures::*;
 
+mod grpc;
+pub use grpc::*;
+
 mod io;
 pub use io::*;
+
+mod quic;
+pub use quic::*;
 
 mod storage;
 pub use storage::*;
@@ -357,7 +367,10 @@ impl<'env> ConsumableException<'env> {
                 (ClassName("java.lang.NullPointerException"), error)
             }
 
-            SignalJniError::Protocol(SignalProtocolError::InvalidState(_, _)) => {
+            SignalJniError::Protocol(SignalProtocolError::InvalidState(_, _))
+            | SignalJniError::SignalChat(SignalChatError::StreamNotOpened())
+            | SignalJniError::Grpc(GrpcError::StreamNotOpened())
+            | SignalJniError::Quic(QuicError::StreamNotOpened()) => {
                 (ClassName("java.lang.IllegalStateException"), error)
             }
 
@@ -376,10 +389,18 @@ impl<'env> ConsumableException<'env> {
             | SignalJniError::Protocol(SignalProtocolError::ApplicationCallbackError(_, _))
             | SignalJniError::Protocol(SignalProtocolError::FfiBindingError(_))
             | SignalJniError::DeviceTransfer(DeviceTransferError::InternalError(_))
-            | SignalJniError::DeviceTransfer(DeviceTransferError::KeyDecodingFailed) => {
+            | SignalJniError::DeviceTransfer(DeviceTransferError::KeyDecodingFailed)
+            | SignalJniError::SignalChat(SignalChatError::InvalidArgument(_))
+            | SignalJniError::Grpc(GrpcError::InvalidArgument(_))
+            | SignalJniError::Quic(QuicError::InvalidArgument(_)) => {
                 (ClassName("java.lang.RuntimeException"), error)
             }
 
+            SignalJniError::Quic(QuicError::RecvFailed(_))
+            | SignalJniError::Quic(QuicError::SendFailed(_)) => {
+                (ClassName("java.io.IOException"), error)
+            }
+    
             SignalJniError::Protocol(SignalProtocolError::DuplicatedMessage(_, _)) => (
                 ClassName("org.signal.libsignal.protocol.DuplicateMessageException"),
                 error,

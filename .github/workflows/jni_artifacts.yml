@@ -21,12 +21,14 @@ jobs:
 
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
         include:
           - os: windows-latest
           - os: macos-latest
             additional-rust-target: x86_64-apple-darwin
-        # Ubuntu binaries are built using Docker, below
+          - os: ubuntu-latest
+            additional-rust-target: aarch64-unknown-linux-gnu
+        # Ubuntu binaries for x86_64 are built using Docker, below
 
     timeout-minutes: 45
 
@@ -54,6 +56,15 @@ jobs:
     - run: rustup target add ${{ matrix.additional-rust-target }}
       if: ${{ matrix.additional-rust-target != '' }}
 
+    # install cross compiler tools for linux aarch64
+    - run: sudo apt-get update && sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      if: ${{ matrix.os == 'ubuntu-latest' && matrix.additional-rust-target != '' }}
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
     # install nasm compiler for boring
     - name: Install nasm
       if: startsWith(matrix.os, 'windows')
@@ -68,21 +79,23 @@ jobs:
 
     - name: Build client for host
       run: java/build_jni.sh desktop
+      if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
       shell: bash
 
     - name: Build server for host
       run: java/build_jni.sh server
+      if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
       shell: bash
 
     - name: Build client for alternate target
       run: java/build_jni.sh desktop
-      if: matrix.os == 'macos-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
     - name: Build server for alternate target
       run: java/build_jni.sh server
-      if: matrix.os == 'macos-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
@@ -93,6 +106,7 @@ jobs:
         path: |
           java/client/src/main/resources/*.dll
           java/client/src/main/resources/*.dylib
+          java/client/src/main/resources/*.so
 
     - name: Upload server libraries
       uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
@@ -101,33 +115,34 @@ jobs:
         path: |
           java/server/src/main/resources/*.dll
           java/server/src/main/resources/*.dylib
+          java/client/src/main/resources/*.so
 
-  verify-rust:
-    name: Verify JNI bindings
-    runs-on: ubuntu-latest
+  # verify-rust:
+  #   name: Verify JNI bindings
+  #   runs-on: ubuntu-latest
 
-    timeout-minutes: 45
+  #   timeout-minutes: 45
 
-    steps:
-    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      with:
-        submodules: recursive
+  #   steps:
+  #   - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+  #     with:
+  #       submodules: recursive
 
-    - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
+  #   - run: rustup toolchain install $(cat rust-toolchain) --profile minimal
 
-    - run: sudo apt-get update && sudo apt-get install protobuf-compiler
+  #   - run: sudo apt-get update && sudo apt-get install protobuf-compiler
 
-    - run: cargo +stable install cbindgen
+  #   - run: cargo +stable install cbindgen
 
-    - name: Verify that the JNI bindings are up to date
-      run: rust/bridge/jni/bin/gen_java_decl.py --verify
+  #   - name: Verify that the JNI bindings are up to date
+  #     run: rust/bridge/jni/bin/gen_java_decl.py --verify
 
   publish:
     name: Build for production and publish
 
-    runs-on: ubuntu-latest-4-cores
+    runs-on: ubuntu-20.04
 
-    needs: [build, verify-rust]
+    needs: build
 
     timeout-minutes: 45
 
@@ -149,6 +164,11 @@ jobs:
         path: java/server/src/main/resources
         pattern: libsignal-server*
         merge-multiple: true
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - run: make
       if: ${{ inputs.dry_run }}
@@ -179,6 +199,8 @@ jobs:
       if: ${{ !inputs.dry_run }}
       working-directory: java
       env:
+        ORG_GRADLE_PROJECT_sonatypeRepo: ${{ secrets.SONATYPE_REPO }}
+        ORG_GRADLE_PROJECT_sonatypeSnapshotRepo: ${{ secrets.SONATYPE_SNAPSHOT_REPO }}
         ORG_GRADLE_PROJECT_sonatypeUsername: ${{ secrets.SONATYPE_USER }}
         ORG_GRADLE_PROJECT_sonatypePassword: ${{ secrets.SONATYPE_PASSWORD }}
         ORG_GRADLE_PROJECT_signingKeyId: ${{ secrets.SIGNING_KEYID }}

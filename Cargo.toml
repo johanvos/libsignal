@@ -2,8 +2,10 @@
 # When adding new members, consider updating the log filter in rust/bridge/shared/src/logging.rs.
 members = [
     "rust/attest",
+    "rust/chat",
     "rust/crypto",
     "rust/device-transfer",
+    "rust/grpc",
     "rust/keytrans",
     "rust/media",
     "rust/message-backup",
@@ -11,6 +13,7 @@ members = [
     "rust/account-keys",
     "rust/poksho",
     "rust/protocol",
+    "rust/quic",
     "rust/usernames",
     "rust/zkcredential",
     "rust/zkgroup",
@@ -59,8 +62,11 @@ libsignal-message-backup = { path = "rust/message-backup" }
 libsignal-net = { path = "rust/net" }
 libsignal-protocol = { path = "rust/protocol" }
 poksho = { path = "rust/poksho" }
+signal-chat = { path = "rust/chat" }
 signal-crypto = { path = "rust/crypto" }
+signal-grpc = { path = "rust/grpc" }
 signal-media = { path = "rust/media" }
+signal-quic = { path = "rust/quic" }
 usernames = { path = "rust/usernames" }
 zkcredential = { path = "rust/zkcredential" }
 zkgroup = { path = "rust/zkgroup" }

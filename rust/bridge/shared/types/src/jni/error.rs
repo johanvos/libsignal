@@ -14,7 +14,10 @@ use libsignal_account_keys::Error as PinError;
 use libsignal_net::cdsi::CdsiProtocolError;
 use libsignal_net::infra::ws::WebSocketServiceError;
 use libsignal_protocol::*;
+use signal_chat::Error as SignalChatError;
 use signal_crypto::Error as SignalCryptoError;
+use signal_grpc::Error as GrpcError;
+use signal_quic::Error as QuicError;
 use usernames::{UsernameError, UsernameLinkError};
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
@@ -27,6 +30,9 @@ use crate::support::describe_panic;
 pub enum SignalJniError {
     Protocol(SignalProtocolError),
     DeviceTransfer(DeviceTransferError),
+    SignalChat(SignalChatError),
+    Grpc(GrpcError),
+    Quic(QuicError),
     SignalCrypto(SignalCryptoError),
     HsmEnclave(HsmEnclaveError),
     Enclave(EnclaveError),
@@ -79,6 +85,9 @@ impl fmt::Display for SignalJniError {
         match self {
             SignalJniError::Protocol(s) => write!(f, "{}", s),
             SignalJniError::DeviceTransfer(s) => write!(f, "{}", s),
+            SignalJniError::SignalChat(e) => write!(f, "{}", e),
+            SignalJniError::Grpc(e) => write!(f, "{}", e),
+            SignalJniError::Quic(e) => write!(f, "{}", e),
             SignalJniError::HsmEnclave(e) => write!(f, "{}", e),
             SignalJniError::Enclave(e) => write!(f, "{}", e),
             SignalJniError::Pin(e) => write!(f, "{}", e),
