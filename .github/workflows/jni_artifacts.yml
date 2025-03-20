@@ -21,12 +21,12 @@ jobs:
 
     strategy:
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        os: [windows-latest, macos-latest, ubuntu-20.04]
         include:
           - os: windows-latest
           - os: macos-latest
             additional-rust-target: x86_64-apple-darwin
-          - os: ubuntu-latest
+          - os: ubuntu-20.04
             additional-rust-target: aarch64-unknown-linux-gnu
         # Ubuntu binaries for x86_64 are built using Docker, below
 
@@ -58,7 +58,7 @@ jobs:
 
     # install cross compiler tools for linux aarch64
     - run: sudo apt-get update && sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
-      if: ${{ matrix.os == 'ubuntu-latest' && matrix.additional-rust-target != '' }}
+      if: ${{ matrix.os == 'ubuntu-20.04' && matrix.additional-rust-target != '' }}
 
     - name: Install Protoc
       uses: arduino/setup-protoc@v3
@@ -89,13 +89,13 @@ jobs:
 
     - name: Build client for alternate target
       run: java/build_jni.sh desktop
-      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-20.04'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
     - name: Build server for alternate target
       run: java/build_jni.sh server
-      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-latest'
+      if: matrix.os == 'macos-latest' || matrix.os == 'ubuntu-20.04'
       env:
         CARGO_BUILD_TARGET: ${{ matrix.additional-rust-target }}
 
