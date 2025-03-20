@@ -71,9 +71,10 @@ build_desktop_for_arch () {
         fi
     fi
 
-    echo_then_run cargo build -p libsignal-jni -p libsignal-jni-testing --release ${FEATURES:+--features "${FEATURES[*]}"} --target "$1"
+    echo_then_run cargo build -p libsignal-jni --release ${FEATURES:+--features "${FEATURES[*]}"} --target "$1"
+#    echo_then_run cargo build -p libsignal-jni -p libsignal-jni-testing --release ${FEATURES:+--features "${FEATURES[*]}"} --target "$1"
     copy_built_library "target/${1}/release" signal_jni "$lib_dir" "signal_jni_${suffix}"
-    copy_built_library "target/${1}/release" signal_jni_testing "$lib_dir" "signal_jni_testing_${suffix}"
+#    copy_built_library "target/${1}/release" signal_jni_testing "$lib_dir" "signal_jni_testing_${suffix}"
 }
 
 android_abis=()
