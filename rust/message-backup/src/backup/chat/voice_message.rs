@@ -10,7 +10,7 @@ use crate::backup::chat::{ReactionError, ReactionSet};
 use crate::backup::file::{MessageAttachment, MessageAttachmentError};
 use crate::backup::frame::RecipientId;
 use crate::backup::method::LookupPair;
-use crate::backup::recipient::DestinationKind;
+use crate::backup::recipient::MinimalRecipientData;
 use crate::backup::serialize::SerializeOrder;
 use crate::backup::time::ReportUnusualTimestamp;
 use crate::backup::{TryFromWith, TryIntoWith as _};
@@ -23,7 +23,7 @@ pub struct VoiceMessage<Recipient> {
     pub quote: Option<Quote<Recipient>>,
     #[serde(bound(serialize = "Recipient: serde::Serialize + SerializeOrder"))]
     pub reactions: ReactionSet<Recipient>,
-    pub attachment: MessageAttachment,
+    pub attachment: Box<MessageAttachment>,
     _limit_construction_to_module: (),
 }
 
@@ -44,7 +44,7 @@ pub enum VoiceMessageError {
     Reaction(#[from] ReactionError),
 }
 
-impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
     TryFromWith<proto::StandardMessage, C> for VoiceMessage<R>
 {
     type Error = VoiceMessageError;
@@ -87,7 +87,7 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
         Ok(Self {
             reactions,
             quote,
-            attachment,
+            attachment: Box::new(attachment),
             _limit_construction_to_module: (),
         })
     }
@@ -109,11 +109,8 @@ mod test {
                 .try_into_with(&TestContext::default()),
             Ok(VoiceMessage {
                 quote: Some(Quote::from_proto_test_data()),
-                reactions: ReactionSet::from_iter([(
-                    TestContext::SELF_ID,
-                    Reaction::from_proto_test_data(),
-                )]),
-                attachment: MessageAttachment::from_proto_voice_message_data(),
+                reactions: ReactionSet::from_iter([Reaction::from_proto_test_data()]),
+                attachment: Box::new(MessageAttachment::from_proto_voice_message_data()),
                 _limit_construction_to_module: ()
             })
         )

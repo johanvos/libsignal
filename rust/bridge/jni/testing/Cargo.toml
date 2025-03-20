@@ -5,10 +5,10 @@
 
 [package]
 name = "libsignal-jni-testing"
-version = "0.64.1"
-authors = ["Signal Messenger LLC"]
+version.workspace = true
+authors.workspace = true
+license.workspace = true
 edition = "2021"
-license = "AGPL-3.0-only"
 
 [lints]
 workspace = true
@@ -20,6 +20,7 @@ crate-type = ["cdylib"]
 [dependencies]
 libsignal-bridge-testing = { workspace = true, features = ["jni"] }
 libsignal-bridge-types = { workspace = true, features = ["jni"] }
+libsignal-jni-impl = { workspace = true }
 
 jni = { workspace = true }
 log = { workspace = true }

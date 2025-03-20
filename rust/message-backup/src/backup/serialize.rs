@@ -67,8 +67,8 @@ impl From<CompletedBackup<Store>> for Backup {
         Self {
             meta,
             account_data,
-            recipients: recipients.into_values().collect(),
-            chats: items.into_values().collect(),
+            recipients: recipients.into_iter().map(|(_, v)| v).collect(),
+            chats: items.into_iter().map(|(_, v)| v).collect(),
             ad_hoc_calls: ad_hoc_calls.into_iter().collect(),
             pinned_chats: pinned.into_iter().map(|(_, data)| data).collect(),
             sticker_packs: sticker_packs.into_iter().collect(),
@@ -107,6 +107,14 @@ pub(crate) fn enum_as_string<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     format!("{source:?}").serialize(serializer)
+}
+
+/// Serializes [`protobuf::Enum`] types as strings.
+pub(crate) fn optional_enum_as_string<S: Serializer>(
+    source: &Option<impl protobuf::Enum>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    (*source).map(|v| format!("{v:?}")).serialize(serializer)
 }
 
 /// Serializes an optional bytestring as hex.
@@ -216,7 +224,7 @@ impl SerializeOrder for FullRecipientData {
                 (Destination::CallLink(lhs), Destination::CallLink(rhs)) => {
                     lhs.root_key.cmp(&rhs.root_key)
                 }
-                (Destination::Self_, Destination::Self_)
+                (Destination::Self_(_), Destination::Self_(_))
                 | (Destination::ReleaseNotes, Destination::ReleaseNotes) => {
                     std::cmp::Ordering::Equal
                 }
@@ -224,7 +232,7 @@ impl SerializeOrder for FullRecipientData {
             }
         } else {
             let discriminant = |value: &Destination<_>| match value {
-                Destination::Self_ => 0,
+                Destination::Self_(_) => 0,
                 Destination::ReleaseNotes => 1,
                 Destination::Contact(_) => 2,
                 Destination::Group(_) => 3,
@@ -554,6 +562,7 @@ mod test {
     const FIRST_CONTACT_ID: RecipientId = RecipientId(100);
     const SECOND_CONTACT_ID: RecipientId = RecipientId(101);
     const GROUP_ID: RecipientId = RecipientId(102);
+    const SELF_ID: RecipientId = RecipientId(10);
 
     #[test]
     fn shuffled_chats_and_recipient_ids() {
@@ -576,6 +585,11 @@ mod test {
         });
 
         let chat_frames = vec![
+            // Self-recipient
+            make_recipient(
+                SELF_ID,
+                &proto::recipient::Destination::Self_(Default::default()),
+            ),
             // Chat with FIRST_CONTACT
             make_recipient(FIRST_CONTACT_ID, &first_contact),
             make_chat(FIRST_CONTACT_CHAT_ID, FIRST_CONTACT_ID),
@@ -604,6 +618,11 @@ mod test {
             make_chat(
                 FIRST_CONTACT_CHAT_ID.renumbered(),
                 FIRST_CONTACT_ID.renumbered(),
+            ),
+            // Self-recipient is late.
+            make_recipient(
+                SELF_ID.renumbered(),
+                &proto::recipient::Destination::Self_(Default::default()),
             ),
             // The same messages appear in the same global order as above.
             make_chat_item(
@@ -641,6 +660,10 @@ mod test {
                 item: Some(proto::AccountData::test_data().into()),
                 special_fields: Default::default(),
             },
+            make_recipient(
+                SELF_ID,
+                &proto::recipient::Destination::Self_(Default::default()),
+            ),
             make_recipient(FIRST_CONTACT_ID, &first_contact),
             make_chat(FIRST_CONTACT_CHAT_ID, FIRST_CONTACT_ID),
             make_recipient(SECOND_CONTACT_ID, &second_contact),

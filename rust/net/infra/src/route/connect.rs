@@ -3,14 +3,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::fmt::Debug;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use derive_where::derive_where;
-use futures_util::TryFutureExt;
-use tokio_util::either::Either;
+use static_assertions::assert_impl_all;
 
 use crate::errors::TransportConnectError;
 use crate::route::{
@@ -19,6 +16,15 @@ use crate::route::{
     WebSocketServiceRoute,
 };
 use crate::ws::WebSocketConnectError;
+
+mod composed;
+pub use composed::*;
+
+mod direct_or_proxy;
+pub use direct_or_proxy::*;
+
+mod preconnect;
+pub use preconnect::*;
 
 mod throttle;
 pub use throttle::*;
@@ -37,6 +43,7 @@ pub trait Connector<R, Inner> {
         &self,
         over: Inner,
         route: R,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send;
 }
 
@@ -45,39 +52,24 @@ pub trait ConnectorExt<R>: Connector<R, ()> {
     fn connect(
         &self,
         route: R,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        self.connect_over((), route)
+        self.connect_over((), route, log_tag)
     }
 }
 impl<R, C: Connector<R, ()>> ConnectorExt<R> for C {}
 
-/// A [`Connector`] for [`DirectOrProxyRoute`] that delegates to direct or proxy
-/// connectors.
-#[derive_where(Debug; D: Debug, P: Debug)]
-#[derive_where(Default; D: Default, P: Default)]
-pub struct DirectOrProxy<D, P, E> {
-    direct: D,
-    proxy: P,
-    _error: PhantomData<E>,
-}
-
-/// A [`Connector`] that establishes a connection over the transport provided by
-/// an inner connector.
-///
-/// This implements `Connector` for several different types of routes.
-/// Each implementation splits off configuration for a single protocol level,
-/// then uses the outer Connector to establish a connection over the transport
-/// provided by the inner Connector.
-#[derive_where(Debug; Outer: Debug, Inner: Debug)]
-#[derive_where(Default; Outer: Default, Inner: Default)]
-pub struct ComposedConnector<Outer, Inner, Error> {
-    outer: Outer,
-    inner: Inner,
-    /// The type of error returned by [`Connector::connect_over`].
+/// Allows state to be shared across Connectors.
+pub trait ConnectorFactory<R> {
+    /// The connector produced by this factory.
+    type Connector: Connector<R, (), Connection = Self::Connection>;
+    /// The type of connection returned by the connector.
     ///
-    /// This lets us produce an error type that is distinct from the inner and
-    /// outer `Connector` error types.
-    _error: PhantomData<Error>,
+    /// Technically redundant, but useful for constraints.
+    type Connection;
+
+    /// Creates a new connector to use for a particular connection attempt.
+    fn make(&self) -> Self::Connector;
 }
 
 /// Stateless connector that connects [`WebSocketServiceRoute`]s.
@@ -93,27 +85,13 @@ type TransportConnector =
 type WebSocketHttpConnector =
     ComposedConnector<crate::ws::Stateless, TransportConnector, WebSocketConnectError>;
 
-const _: () = {
-    const fn assert_is_connector<C: Connector<R, ()>, R>() {}
-
-    assert_is_connector::<TcpConnector, TcpRoute<IpAddr>>();
-    assert_is_connector::<
-        DirectProxyConnector,
-        DirectOrProxyRoute<TcpRoute<IpAddr>, ConnectionProxyRoute<IpAddr>>,
-    >();
-    assert_is_connector::<TransportConnector, TransportRoute>();
-    assert_is_connector::<WebSocketHttpConnector, WebSocketServiceRoute>();
-};
-
-impl<O, I, E> ComposedConnector<O, I, E> {
-    pub fn new(outer: O, inner: I) -> Self {
-        Self {
-            outer,
-            inner,
-            _error: PhantomData,
-        }
-    }
-}
+assert_impl_all!(TcpConnector: Connector<TcpRoute<IpAddr>, ()>);
+assert_impl_all!(
+    DirectProxyConnector:
+    Connector<DirectOrProxyRoute<TcpRoute<IpAddr>, ConnectionProxyRoute<IpAddr>>, ()>
+);
+assert_impl_all!(TransportConnector: Connector<TransportRoute, ()>);
+assert_impl_all!(WebSocketHttpConnector: Connector<WebSocketServiceRoute, ()>);
 
 /// Establishes a websocket connection over a transport stream.
 ///
@@ -127,10 +105,9 @@ impl<O, I, E> ComposedConnector<O, I, E> {
 impl<A, B, Inner, T, Error> Connector<WebSocketRoute<HttpsTlsRoute<T>>, Inner>
     for ComposedConnector<A, B, Error>
 where
-    A: Connector<(WebSocketRouteFragment, HttpRouteFragment), B::Connection> + Sync,
-    B: Connector<T, Inner> + Sync,
-    A::Error: Into<Error>,
-    B::Error: Into<Error>,
+    A: Connector<(WebSocketRouteFragment, HttpRouteFragment), B::Connection, Error: Into<Error>>
+        + Sync,
+    B: Connector<T, Inner, Error: Into<Error>> + Sync,
     Inner: Send,
     T: Send,
 {
@@ -142,12 +119,8 @@ where
         &self,
         over: Inner,
         route: WebSocketRoute<HttpsTlsRoute<T>>,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let Self {
-            outer,
-            inner,
-            _error,
-        } = self;
         let WebSocketRoute {
             fragment: ws_fragment,
             inner:
@@ -156,26 +129,16 @@ where
                     inner: tls_route,
                 },
         } = route;
-        async move {
-            let inner = inner
-                .connect_over(over, tls_route)
-                .await
-                .map_err(Into::into)?;
-            outer
-                .connect_over(inner, (ws_fragment, http_fragment))
-                .await
-                .map_err(Into::into)
-        }
+
+        self.connect_inner_then_outer(over, tls_route, (ws_fragment, http_fragment), log_tag)
     }
 }
 
 /// Establishes a TLS connection over a transport stream.
 impl<A, B, Inner, T, Error> Connector<TlsRoute<T>, Inner> for ComposedConnector<A, B, Error>
 where
-    A: Connector<TlsRouteFragment, B::Connection> + Sync,
-    B: Connector<T, Inner> + Sync,
-    A::Error: Into<Error>,
-    B::Error: Into<Error>,
+    A: Connector<TlsRouteFragment, B::Connection, Error: Into<Error>> + Sync,
+    B: Connector<T, Inner, Error: Into<Error>> + Sync,
     Inner: Send,
     T: Send,
 {
@@ -187,65 +150,13 @@ where
         &self,
         over: Inner,
         route: TlsRoute<T>,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        let Self {
-            outer,
-            inner,
-            _error,
-        } = self;
         let TlsRoute {
             fragment: tls_fragment,
             inner: tcp_route,
         } = route;
-        async move {
-            let inner = inner
-                .connect_over(over, tcp_route)
-                .await
-                .map_err(Into::into)?;
-            outer
-                .connect_over(inner, tls_fragment)
-                .await
-                .map_err(Into::into)
-        }
-    }
-}
-
-/// Establishes a connection either directly or through a proxy.
-///
-/// Delegates to the respective wrapped connector: [`DirectOrProxy::direct`] for
-/// [`DirectOrProxyRoute::Direct`] and [`DirectOrProxy::proxy`] for
-/// [`DirectOrProxyRoute::Proxy`].
-impl<D, P, DR, PR, Inner, Err> Connector<DirectOrProxyRoute<DR, PR>, Inner>
-    for DirectOrProxy<D, P, Err>
-where
-    D: Connector<DR, Inner>,
-    P: Connector<PR, Inner>,
-    P::Error: Into<Err>,
-    D::Error: Into<Err>,
-{
-    type Connection = Either<D::Connection, P::Connection>;
-
-    type Error = Err;
-
-    fn connect_over(
-        &self,
-        over: Inner,
-        route: DirectOrProxyRoute<DR, PR>,
-    ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        match route {
-            DirectOrProxyRoute::Direct(d) => Either::Left(
-                self.direct
-                    .connect_over(over, d)
-                    .map_ok(Either::Left)
-                    .map_err(Into::into),
-            ),
-            DirectOrProxyRoute::Proxy(p) => Either::Right(
-                self.proxy
-                    .connect_over(over, p)
-                    .map_ok(Either::Right)
-                    .map_err(Into::into),
-            ),
-        }
+        self.connect_inner_then_outer(over, tcp_route, tls_fragment, log_tag)
     }
 }
 
@@ -258,14 +169,9 @@ impl<C: Connector<R, Inner>, R, Inner> Connector<R, Inner> for &C {
         &self,
         over: Inner,
         route: R,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-        (*self).connect_over(over, route)
-    }
-}
-
-impl From<std::io::Error> for WebSocketConnectError {
-    fn from(value: std::io::Error) -> Self {
-        Self::WebSocketError(value.into())
+        (*self).connect_over(over, route, log_tag)
     }
 }
 
@@ -277,11 +183,12 @@ pub mod testutils {
     ///
     /// Using unnamed functions as Connector impls isn't great for readability,
     /// so only allow it in test code.
+    #[derive(Clone)]
     pub struct ConnectFn<F>(pub F);
 
     impl<R, Inner, Fut, F, C, E> Connector<R, Inner> for ConnectFn<F>
     where
-        F: Fn(Inner, R) -> Fut,
+        F: Fn(Inner, R, Arc<str>) -> Fut,
         Fut: Future<Output = Result<C, E>> + Send,
     {
         type Connection = C;
@@ -292,8 +199,21 @@ pub mod testutils {
             &self,
             over: Inner,
             route: R,
+            log_tag: Arc<str>,
         ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
-            self.0(over, route)
+            self.0(over, route, log_tag)
+        }
+    }
+
+    impl<R, F> ConnectorFactory<R> for ConnectFn<F>
+    where
+        ConnectFn<F>: Connector<R, ()> + Clone,
+    {
+        type Connector = Self;
+        type Connection = <Self as Connector<R, ()>>::Connection;
+
+        fn make(&self) -> Self::Connector {
+            self.clone()
         }
     }
 }

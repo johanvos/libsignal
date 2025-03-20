@@ -131,16 +131,16 @@ internal func invokeFnReturningBool(fn: (UnsafeMutablePointer<Bool>?) -> SignalF
     return output
 }
 
-internal func invokeFnReturningNativeHandle<Owner: NativeHandleOwner>(fn: (UnsafeMutablePointer<OpaquePointer?>?) -> SignalFfiErrorRef?) throws -> Owner {
-    var handle: OpaquePointer?
+internal func invokeFnReturningNativeHandle<Owner: NativeHandleOwner<PointerType>, PointerType>(fn: (UnsafeMutablePointer<PointerType>?) -> SignalFfiErrorRef?) throws -> Owner {
+    var handle = PointerType(untyped: nil)
     try checkError(fn(&handle))
-    return Owner(owned: handle!)
+    return Owner(owned: NonNull(handle)!)
 }
 
-internal func invokeFnReturningOptionalNativeHandle<Owner: NativeHandleOwner>(fn: (UnsafeMutablePointer<OpaquePointer?>?) -> SignalFfiErrorRef?) throws -> Owner? {
-    var handle: OpaquePointer?
+internal func invokeFnReturningOptionalNativeHandle<Owner: NativeHandleOwner<PointerType>, PointerType>(fn: (UnsafeMutablePointer<PointerType>?) -> SignalFfiErrorRef?) throws -> Owner? {
+    var handle = PointerType(untyped: nil)
     try checkError(fn(&handle))
-    return handle.map { Owner(owned: $0) }
+    return NonNull<PointerType>(handle).map { Owner(owned: $0) }
 }
 
 extension ContiguousBytes {
@@ -215,5 +215,14 @@ internal func rethrowCallbackErrors<Store, Result>(_ store: Store, _ body: (Unsa
 extension Collection {
     public func split(at index: Self.Index) -> (Self.SubSequence, Self.SubSequence) {
         (self.prefix(upTo: index), self.suffix(from: index))
+    }
+}
+
+extension Optional where Wrapped: StringProtocol {
+    internal func withCString<Result>(_ body: (UnsafePointer<CChar>?) throws -> Result) rethrows -> Result {
+        guard let wrapped = self else {
+            return try body(nil)
+        }
+        return try wrapped.withCString(body)
     }
 }

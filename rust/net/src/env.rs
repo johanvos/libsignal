@@ -29,12 +29,11 @@ use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
 use crate::certs::{PROXY_G_ROOT_CERTIFICATES, SIGNAL_ROOT_CERTIFICATES};
-use crate::enclave::{
-    Cdsi, EnclaveEndpoint, EndpointParams, MrEnclave, Nitro, Sgx, SgxPreQuantum, Tpm2Snp,
-};
+use crate::enclave::{Cdsi, EnclaveEndpoint, EndpointParams, MrEnclave, SgxPreQuantum};
 
 const DEFAULT_HTTPS_PORT: NonZeroU16 = nonzero!(443_u16);
 pub const TIMESTAMP_HEADER_NAME: &str = "x-signal-timestamp";
+pub(crate) const ALERT_HEADER_NAME: &str = "x-signal-alert";
 
 const DOMAIN_CONFIG_CHAT: DomainConfig = DomainConfig {
     ip_v4: &[
@@ -138,96 +137,6 @@ const DOMAIN_CONFIG_SVR2_STAGING: DomainConfig = DomainConfig {
     ip_v6: &[],
 };
 
-const DOMAIN_CONFIG_SVR3_SGX: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend1.svr3.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-sgx",
-            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "40.112.138.96")],
-    ip_v6: &[],
-};
-
-const DOMAIN_CONFIG_SVR3_SGX_STAGING: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend1.svr3.staging.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-sgx-staging",
-            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "13.88.63.29")],
-    ip_v6: &[],
-};
-
-const DOMAIN_CONFIG_SVR3_NITRO: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend2.svr3.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-nitro",
-            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "75.2.91.98")],
-    ip_v6: &[],
-};
-
-const DOMAIN_CONFIG_SVR3_NITRO_STAGING: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend2.svr3.staging.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-nitro-staging",
-            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "75.2.86.85"), ip_addr!(v4, "99.83.239.137")],
-    ip_v6: &[],
-};
-
-pub const DOMAIN_CONFIG_SVR3_TPM2SNP: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend3.svr3.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-tpm2snp",
-            configs: [PROXY_CONFIG_F_PROD, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "34.144.241.251")],
-    ip_v6: &[],
-};
-
-pub const DOMAIN_CONFIG_SVR3_TPM2SNP_STAGING: DomainConfig = DomainConfig {
-    connect: ConnectionConfig {
-        hostname: "backend3.svr3.staging.signal.org",
-        port: DEFAULT_HTTPS_PORT,
-        cert: SIGNAL_ROOT_CERTIFICATES,
-        confirmation_header_name: None,
-        proxy: Some(ConnectionProxyConfig {
-            path_prefix: "/svr3-tpm2snp-staging",
-            configs: [PROXY_CONFIG_F_STAGING, PROXY_CONFIG_G],
-        }),
-    },
-    ip_v4: &[ip_addr!(v4, "13.88.30.76")],
-    ip_v6: &[],
-};
-
 pub const PROXY_CONFIG_F_PROD: ProxyConfig = ProxyConfig {
     route_type: RouteType::ProxyF,
     http_host: "reflector-signal.global.ssl.fastly.net",
@@ -258,7 +167,7 @@ pub const PROXY_CONFIG_G: ProxyConfig = ProxyConfig {
         "android.clients.google.com",
         "clients3.google.com",
         "clients4.google.com",
-        "inbox.google.com",
+        "googlemail.com",
     ],
     certs: PROXY_G_ROOT_CERTIFICATES,
 };
@@ -273,20 +182,6 @@ pub(crate) const ENDPOINT_PARAMS_SVR2_STAGING: EndpointParams<'static, SgxPreQua
         mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_STAGING),
         raft_config: attest::constants::RAFT_CONFIG_SVR2_STAGING,
     };
-pub(crate) const ENDPOINT_PARAMS_SVR3_SGX_STAGING: EndpointParams<'static, Sgx> = EndpointParams {
-    mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_SGX_STAGING),
-    raft_config: attest::constants::RAFT_CONFIG_SVR3_SGX_STAGING,
-};
-pub(crate) const ENDPOINT_PARAMS_SVR3_NITRO_STAGING: EndpointParams<'static, Nitro> =
-    EndpointParams {
-        mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_NITRO_STAGING),
-        raft_config: attest::constants::RAFT_CONFIG_SVR3_NITRO_STAGING,
-    };
-pub(crate) const ENDPOINT_PARAMS_SVR3_TPM2SNP_STAGING: EndpointParams<'static, Tpm2Snp> =
-    EndpointParams {
-        mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_TPM2SNP_STAGING),
-        raft_config: attest::constants::RAFT_CONFIG_SVR3_TPM2SNP_STAGING,
-    };
 
 pub(crate) const ENDPOINT_PARAMS_CDSI_PROD: EndpointParams<'static, Cdsi> = EndpointParams {
     mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_CDSI_STAGING_AND_PROD),
@@ -297,25 +192,12 @@ pub(crate) const ENDPOINT_PARAMS_SVR2_PROD: EndpointParams<'static, SgxPreQuantu
         mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR2_PROD),
         raft_config: attest::constants::RAFT_CONFIG_SVR2_PROD,
     };
-pub(crate) const ENDPOINT_PARAMS_SVR3_SGX_PROD: EndpointParams<'static, Sgx> = EndpointParams {
-    mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_SGX_PROD),
-    raft_config: attest::constants::RAFT_CONFIG_SVR3_SGX_PROD,
-};
-pub(crate) const ENDPOINT_PARAMS_SVR3_NITRO_PROD: EndpointParams<'static, Nitro> = EndpointParams {
-    mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_NITRO_PROD),
-    raft_config: attest::constants::RAFT_CONFIG_SVR3_NITRO_PROD,
-};
-pub(crate) const ENDPOINT_PARAMS_SVR3_TPM2SNP_PROD: EndpointParams<'static, Tpm2Snp> =
-    EndpointParams {
-        mr_enclave: MrEnclave::new(attest::constants::ENCLAVE_ID_SVR3_TPM2SNP_PROD),
-        raft_config: attest::constants::RAFT_CONFIG_SVR3_TPM2SNP_PROD,
-    };
 
-const KEYTRANS_SIGNING_KEY_MATERIAL_STAGING: &[u8; 32] =
-    &hex!("12a21ad60d5a3978e19a3b0baa8c35c55a20e10d45f39e5cb34bf6e1b3cce432");
-const KEYTRANS_VRF_KEY_MATERIAL_STAGING: &[u8; 32] =
-    &hex!("1e71563470c1b8a6e0aadf280b6aa96f8ad064674e69b80292ee46d1ab655fcf");
-const KEYTRANS_AUDITOR_KEY_MATERIAL_STAGING: &[u8; 32] =
+pub(crate) const KEYTRANS_SIGNING_KEY_MATERIAL_STAGING: &[u8; 32] =
+    &hex!("ac0de1fd7f33552bbeb6ebc12b9d4ea10bf5f025c45073d3fb5f5648955a749e");
+pub(crate) const KEYTRANS_VRF_KEY_MATERIAL_STAGING: &[u8; 32] =
+    &hex!("ec3a268237cf5c47115cf222405d5f90cc633ebe05caf82c0dd5acf9d341dadb");
+pub(crate) const KEYTRANS_AUDITOR_KEY_MATERIAL_STAGING: &[u8; 32] =
     &hex!("1123b13ee32479ae6af5739e5d687b51559abf7684120511f68cde7a21a0e755");
 
 /// Configuration for a target network resource, like `chat.signal.org`.
@@ -399,9 +281,7 @@ impl ConnectionConfig {
         let direct = self.direct_connection_params();
         if let Some(proxy) = &self.proxy {
             let mut rng = thread_rng();
-            // TODO use array::each_ref() once MSRV >= 1.77
-            let [params_a, params_b] = &proxy.configs;
-            let [params_a, params_b] = [params_a, params_b].map(|config| {
+            let [params_a, params_b] = proxy.configs.each_ref().map(|config| {
                 config.shuffled_connection_params(
                     proxy.path_prefix,
                     self.confirmation_header_name,
@@ -429,7 +309,7 @@ impl ConnectionConfig {
         } = self;
         let domain_front_configs = proxy
             .as_ref()
-            .and_then(|proxy| enable_domain_fronting.0.then_some(proxy))
+            .filter(|_proxy| !matches!(enable_domain_fronting, EnableDomainFronting::No))
             .map(
                 |ConnectionProxyConfig {
                      path_prefix,
@@ -438,7 +318,7 @@ impl ConnectionConfig {
                     let fronting_path_prefix = Arc::from(*path_prefix);
                     let make_proxy_config = move |config: &ProxyConfig| {
                         let ProxyConfig {
-                            route_type: _,
+                            route_type,
                             http_host,
                             sni_list,
                             certs,
@@ -448,6 +328,11 @@ impl ConnectionConfig {
                             http_host: (*http_host).into(),
                             sni_list: sni_list.iter().map(|sni| (*sni).into()).collect(),
                             path_prefix: Arc::clone(&fronting_path_prefix),
+                            front_name: route_type.into(),
+                            return_routes_with_all_snis: matches!(
+                                enable_domain_fronting,
+                                EnableDomainFronting::AllDomains
+                            ),
                         }
                     };
                     configs.iter().map(make_proxy_config)
@@ -547,6 +432,16 @@ impl ProxyConfig {
             }
         })
     }
+
+    #[cfg(feature = "test-util")]
+    pub fn route_type(&self) -> RouteType {
+        self.route_type
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn hostnames(&self) -> &[&'static str] {
+        self.sni_list
+    }
 }
 
 impl From<KeyTransConfig> for PublicConfig {
@@ -569,68 +464,32 @@ impl From<KeyTransConfig> for PublicConfig {
     }
 }
 
-pub struct Env<'a, Svr3> {
+pub struct Env<'a> {
     pub cdsi: EnclaveEndpoint<'a, Cdsi>,
     pub svr2: EnclaveEndpoint<'a, SgxPreQuantum>,
-    pub svr3: Svr3,
     pub chat_domain_config: DomainConfig,
     // TODO: make non-optional when the public endpoints are up
     pub keytrans_config: Option<KeyTransConfig>,
 }
 
-impl<'a> Env<'a, Svr3Env<'a>> {
+impl<'a> Env<'a> {
     /// Returns a static mapping from hostnames to [`LookupResult`]s.
     pub fn static_fallback(&self) -> HashMap<&'a str, LookupResult> {
         let Self {
             cdsi,
             svr2,
-            svr3,
             chat_domain_config,
             ..
         } = self;
         HashMap::from([
             cdsi.domain_config.static_fallback(),
             svr2.domain_config.static_fallback(),
-            svr3.sgx().domain_config.static_fallback(),
-            svr3.nitro().domain_config.static_fallback(),
-            svr3.tpm2snp().domain_config.static_fallback(),
             chat_domain_config.static_fallback(),
         ])
     }
 }
 
-pub struct Svr3Env<'a>(
-    EnclaveEndpoint<'a, Sgx>,
-    EnclaveEndpoint<'a, Nitro>,
-    EnclaveEndpoint<'a, Tpm2Snp>,
-);
-
-impl<'a> Svr3Env<'a> {
-    pub const fn new(
-        sgx: EnclaveEndpoint<'a, Sgx>,
-        nitro: EnclaveEndpoint<'a, Nitro>,
-        tpm2snp: EnclaveEndpoint<'a, Tpm2Snp>,
-    ) -> Self {
-        Self(sgx, nitro, tpm2snp)
-    }
-
-    #[inline]
-    pub const fn sgx(&self) -> &EnclaveEndpoint<'a, Sgx> {
-        &self.0
-    }
-
-    #[inline]
-    pub const fn nitro(&self) -> &EnclaveEndpoint<'a, Nitro> {
-        &self.1
-    }
-
-    #[inline]
-    pub const fn tpm2snp(&self) -> &EnclaveEndpoint<'a, Tpm2Snp> {
-        &self.2
-    }
-}
-
-pub const STAGING: Env<'static, Svr3Env> = Env {
+pub const STAGING: Env<'static> = Env {
     chat_domain_config: DOMAIN_CONFIG_CHAT_STAGING,
     cdsi: EnclaveEndpoint {
         domain_config: DOMAIN_CONFIG_CDSI_STAGING,
@@ -640,20 +499,6 @@ pub const STAGING: Env<'static, Svr3Env> = Env {
         domain_config: DOMAIN_CONFIG_SVR2_STAGING,
         params: ENDPOINT_PARAMS_SVR2_STAGING,
     },
-    svr3: Svr3Env(
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_SGX_STAGING,
-            params: ENDPOINT_PARAMS_SVR3_SGX_STAGING,
-        },
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_NITRO_STAGING,
-            params: ENDPOINT_PARAMS_SVR3_NITRO_STAGING,
-        },
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_TPM2SNP_STAGING,
-            params: ENDPOINT_PARAMS_SVR3_TPM2SNP_STAGING,
-        },
-    ),
     keytrans_config: Some(KeyTransConfig {
         signing_key_material: KEYTRANS_SIGNING_KEY_MATERIAL_STAGING,
         vrf_key_material: KEYTRANS_VRF_KEY_MATERIAL_STAGING,
@@ -661,7 +506,7 @@ pub const STAGING: Env<'static, Svr3Env> = Env {
     }),
 };
 
-pub const PROD: Env<'static, Svr3Env> = Env {
+pub const PROD: Env<'static> = Env {
     chat_domain_config: DOMAIN_CONFIG_CHAT,
     cdsi: EnclaveEndpoint {
         domain_config: DOMAIN_CONFIG_CDSI,
@@ -671,20 +516,6 @@ pub const PROD: Env<'static, Svr3Env> = Env {
         domain_config: DOMAIN_CONFIG_SVR2,
         params: ENDPOINT_PARAMS_SVR2_PROD,
     },
-    svr3: Svr3Env(
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_SGX,
-            params: ENDPOINT_PARAMS_SVR3_SGX_PROD,
-        },
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_NITRO,
-            params: ENDPOINT_PARAMS_SVR3_NITRO_PROD,
-        },
-        EnclaveEndpoint {
-            domain_config: DOMAIN_CONFIG_SVR3_TPM2SNP,
-            params: ENDPOINT_PARAMS_SVR3_TPM2SNP_PROD,
-        },
-    ),
     keytrans_config: None,
 };
 
@@ -694,11 +525,17 @@ pub mod constants {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use itertools::Itertools as _;
+    use libsignal_net_infra::dns::build_custom_resolver_cloudflare_doh;
+    use libsignal_net_infra::dns::dns_lookup::DnsLookupRequest;
+    use libsignal_net_infra::route::testutils::FakeContext;
     use libsignal_net_infra::route::{
         HttpRouteFragment, HttpsTlsRoute, RouteProvider as _, TcpRoute, TlsRoute, TlsRouteFragment,
         UnresolvedHost,
     };
+    use libsignal_net_infra::utils::ObservableEvent;
     use libsignal_net_infra::Alpn;
     use test_case::test_matrix;
 
@@ -778,14 +615,18 @@ mod test {
                 ],
             }),
         };
-        let route_provider =
-            CONNECT_CONFIG.route_provider(EnableDomainFronting(enable_domain_fronting));
-        let routes = route_provider.routes().collect_vec();
+        let route_provider = CONNECT_CONFIG.route_provider(if enable_domain_fronting {
+            EnableDomainFronting::OneDomainPerProxy
+        } else {
+            EnableDomainFronting::No
+        });
+        let routes = route_provider.routes(&FakeContext::new()).collect_vec();
 
         let expected_direct_route = HttpsTlsRoute {
             fragment: HttpRouteFragment {
                 host_header: "host".into(),
                 path_prefix: "".into(),
+                front_name: None,
             },
             inner: TlsRoute {
                 fragment: TlsRouteFragment {
@@ -802,9 +643,44 @@ mod test {
 
         if enable_domain_fronting {
             assert_eq!(routes.first(), Some(&expected_direct_route));
-            assert_eq!(routes.len(), 5, "{routes:?}");
+            assert_eq!(routes.len(), 3, "{routes:?}");
         } else {
             assert_eq!(routes, [expected_direct_route]);
         };
+    }
+
+    #[tokio::test]
+    #[test_matrix([&DOMAIN_CONFIG_CHAT, &DOMAIN_CONFIG_CHAT_STAGING, &DOMAIN_CONFIG_CDSI, &DOMAIN_CONFIG_CDSI_STAGING])]
+    async fn live_resolve_eq_static_resolution(config: &DomainConfig) {
+        if std::env::var("LIBSIGNAL_TESTING_RUN_NONHERMETIC_TESTS").is_err() {
+            println!("SKIPPED: running test with network activity is not enabled");
+            return;
+        }
+
+        // The point of this test isn't to test the resolver, but to use it to test something else.
+        // So, I directly access the raw CustomDnsResolver::resolve method.
+        // Other usages should use the higher level DnsResolver::lookup instead.
+        let resolver = build_custom_resolver_cloudflare_doh(&ObservableEvent::new());
+
+        let (hostname, static_hardcoded_ips) = config.static_fallback();
+
+        let resolved_ips: Vec<_> = resolver
+            .resolve(DnsLookupRequest {
+                hostname: Arc::from(hostname),
+                ipv6_enabled: true,
+            })
+            .await
+            .unwrap_or_else(|_| panic!("Unable to resolve {hostname}"))
+            .into_iter()
+            .collect();
+
+        let resolved_set = HashSet::<_>::from_iter(resolved_ips);
+        let static_set = HashSet::<_>::from_iter(static_hardcoded_ips);
+
+        assert_eq!(
+            resolved_set, static_set,
+            "Resolved IP addresses do not match static ones for {}",
+            hostname
+        );
     }
 }

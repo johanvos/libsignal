@@ -7,7 +7,7 @@ use crate::backup::chat::group::GroupChatUpdate;
 use crate::backup::chat::ChatItemError;
 use crate::backup::frame::RecipientId;
 use crate::backup::method::LookupPair;
-use crate::backup::recipient::{DestinationKind, E164};
+use crate::backup::recipient::{ChatItemAuthorKind, ChatRecipientKind, MinimalRecipientData, E164};
 use crate::backup::time::{Duration, ReportUnusualTimestamp};
 use crate::backup::{TryFromWith, TryIntoWith as _};
 use crate::proto::backup as proto;
@@ -28,7 +28,7 @@ pub enum UpdateMessage<Recipient> {
 }
 
 /// Validated version of [`proto::simple_chat_update::Type`].
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum SimpleChatUpdate {
     JoinedSignal,
@@ -49,7 +49,7 @@ pub enum SimpleChatUpdate {
     MessageRequestAccepted,
 }
 
-impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R: Clone>
+impl<C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp, R: Clone>
     TryFromWith<proto::ChatUpdateMessage, C> for UpdateMessage<R>
 {
     type Error = ChatItemError;
@@ -130,10 +130,15 @@ impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R:
                 previousName,
                 newName,
                 special_fields: _,
-            }) => UpdateMessage::ProfileChange {
-                previous: previousName,
-                new: newName,
-            },
+            }) => {
+                if previousName.is_empty() || newName.is_empty() {
+                    return Err(ChatItemError::ProfileChangeMissingNames);
+                }
+                UpdateMessage::ProfileChange {
+                    previous: previousName,
+                    new: newName,
+                }
+            }
             Update::ThreadMerge(proto::ThreadMergeChatUpdate {
                 previousE164,
                 special_fields: _,
@@ -161,6 +166,231 @@ impl<C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp, R:
                 previousName.ok_or(ChatItemError::LearnedProfileIsEmpty)?,
             ),
         })
+    }
+}
+
+impl<R> UpdateMessage<R> {
+    // This could be folded into the initial creation of the message,
+    // but then it wouldn't fit the TryFromWith signature (or would require a tuple).
+    pub(super) fn validate_author(&self, author: &ChatItemAuthorKind) -> Result<(), ChatItemError> {
+        match self {
+            UpdateMessage::Simple(
+                update @ (SimpleChatUpdate::JoinedSignal
+                | SimpleChatUpdate::EndSession
+                | SimpleChatUpdate::ChatSessionRefresh
+                | SimpleChatUpdate::IdentityUpdate),
+            ) => {
+                // We allow Self for these, for a few reasons:
+                // - "Note to Self" can have ChatSessionRefresh (and IdentityUpdate, if things go
+                //   very wrong)
+                // - An E164-based thread can get merged into Self if the user takes a phone number
+                //   that formerly belonged to a contact.
+                match author {
+                    ChatItemAuthorKind::Contact { .. } | ChatItemAuthorKind::Self_ => Ok(()),
+                    ChatItemAuthorKind::ReleaseNotes => {
+                        Err(ChatItemError::ChatUpdateNotFromAci(*update))
+                    }
+                }
+            }
+            UpdateMessage::Simple(
+                update @ (SimpleChatUpdate::IdentityDefault
+                | SimpleChatUpdate::IdentityVerified
+                | SimpleChatUpdate::ChangeNumber
+                | SimpleChatUpdate::BadDecrypt
+                | SimpleChatUpdate::UnsupportedProtocolMessage),
+            ) => {
+                // Similar to the above, we allow Self for these too, just not PNIs.
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::ChatUpdateNotFromContact(*update))
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::Simple(
+                update @ (SimpleChatUpdate::PaymentActivationRequest
+                | SimpleChatUpdate::PaymentsActivated),
+            ) => {
+                if !(author.is_contact_with_aci() || matches!(author, ChatItemAuthorKind::Self_)) {
+                    Err(ChatItemError::ChatUpdateNotFromAci(*update))
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::Simple(
+                update @ (SimpleChatUpdate::ReportedSpam
+                | SimpleChatUpdate::Blocked
+                | SimpleChatUpdate::Unblocked
+                | SimpleChatUpdate::MessageRequestAccepted),
+            ) => {
+                if !matches!(author, ChatItemAuthorKind::Self_) {
+                    Err(ChatItemError::ChatUpdateNotFromSelf(*update))
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::Simple(SimpleChatUpdate::ReleaseChannelDonationRequest) => {
+                if !matches!(author, ChatItemAuthorKind::ReleaseNotes) {
+                    Err(ChatItemError::DonationRequestNotFromReleaseNotesRecipient)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::GroupChange { .. } => {
+                // For GV2 this could be limited to ACIs only, but GV1 messages still exist.
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::GroupUpdateNotFromContact)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::ExpirationTimerChange { .. } => {
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::ExpirationTimerChangeNotFromContact)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::ProfileChange { .. } => {
+                // Another case where this *shouldn't* happen for Self, but could if the user takes
+                // a phone number that formerly belonged to a contact.
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::ProfileChangeNotFromContact)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::ThreadMerge { .. } => {
+                if !author.is_contact_with_aci() {
+                    Err(ChatItemError::ThreadMergeNotFromAci)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::SessionSwitchover { .. } => {
+                if !author.is_contact_with_aci() {
+                    Err(ChatItemError::SessionSwitchoverNotFromAci)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::IndividualCall(_) | UpdateMessage::GroupCall(_) => {
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::CallNotFromContact)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::LearnedProfileUpdate(_) => {
+                // Another case where this *shouldn't* happen for Self, but could if the user takes
+                // a phone number that formerly belonged to a contact.
+                if !author.is_valid_sender_account() {
+                    Err(ChatItemError::LearnedProfileUpdateNotFromContact)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub(super) fn validate_chat_recipient(
+        &self,
+        chat: &ChatRecipientKind,
+    ) -> Result<(), ChatItemError> {
+        match self {
+            UpdateMessage::Simple(
+                update @ (SimpleChatUpdate::JoinedSignal
+                | SimpleChatUpdate::EndSession
+                | SimpleChatUpdate::ChatSessionRefresh
+                | SimpleChatUpdate::PaymentActivationRequest
+                | SimpleChatUpdate::PaymentsActivated),
+            ) => {
+                // We allow Self for these, for a few reasons:
+                // - "Note to Self" can have ChatSessionRefresh (and IdentityUpdate, if things go
+                //   very wrong)
+                // - An E164-based thread can get merged into Self if the user takes a phone number
+                //   that formerly belonged to a contact.
+                if !chat.is_individual() {
+                    Err(ChatItemError::ChatUpdateNotInContactThread(*update))
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::Simple(
+                SimpleChatUpdate::IdentityDefault
+                | SimpleChatUpdate::IdentityVerified
+                | SimpleChatUpdate::IdentityUpdate
+                | SimpleChatUpdate::ChangeNumber
+                | SimpleChatUpdate::BadDecrypt
+                | SimpleChatUpdate::UnsupportedProtocolMessage
+                | SimpleChatUpdate::ReportedSpam
+                | SimpleChatUpdate::Blocked
+                | SimpleChatUpdate::Unblocked
+                | SimpleChatUpdate::MessageRequestAccepted,
+            )
+            | UpdateMessage::ProfileChange { .. }
+            | UpdateMessage::LearnedProfileUpdate(_) => {
+                match chat {
+                    ChatRecipientKind::Contact { .. } | ChatRecipientKind::Group => Ok(()),
+                    ChatRecipientKind::Self_ => {
+                        // Again, Self is allowed because of possible past thread merging.
+                        // See above.
+                        Ok(())
+                    }
+                    ChatRecipientKind::ReleaseNotes => {
+                        Err(ChatItemError::UnexpectedUpdateInReleaseNotes)
+                    }
+                }
+            }
+            UpdateMessage::Simple(SimpleChatUpdate::ReleaseChannelDonationRequest) => {
+                if !matches!(chat, ChatRecipientKind::ReleaseNotes) {
+                    Err(ChatItemError::DonationRequestNotInReleaseNotesChat)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::GroupChange { .. } => {
+                if !matches!(chat, ChatRecipientKind::Group) {
+                    Err(ChatItemError::GroupUpdateNotInGroupThread)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::ExpirationTimerChange { .. } => {
+                if !chat.is_individual() {
+                    Err(ChatItemError::ExpirationTimerChangeNotInContactThread)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::ThreadMerge { .. } => {
+                if !chat.is_contact_with_aci() {
+                    Err(ChatItemError::ThreadMergeNotInContactThread)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::SessionSwitchover { .. } => {
+                if !chat.is_contact_with_aci() {
+                    Err(ChatItemError::SessionSwitchoverNotInContactThread)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::IndividualCall(_) => {
+                if !chat.is_individual() {
+                    Err(ChatItemError::IndividualCallNotInContactThread)
+                } else {
+                    Ok(())
+                }
+            }
+            UpdateMessage::GroupCall(_) => {
+                if !matches!(chat, ChatRecipientKind::Group) {
+                    Err(ChatItemError::GroupCallNotInGroupThread)
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -236,7 +466,32 @@ mod test {
 
     #[test_case(proto::SimpleChatUpdate::test_data(), Ok(()))]
     #[test_case(proto::ExpirationTimerChatUpdate::default(), Ok(()))]
-    #[test_case(proto::ProfileChangeChatUpdate::default(), Ok(()))]
+    #[test_case(
+        proto::ProfileChangeChatUpdate::default(),
+        Err(ChatItemError::ProfileChangeMissingNames)
+    )]
+    #[test_case(
+        proto::ProfileChangeChatUpdate {
+            previousName: "Kon".into(),
+            ..Default::default()
+        },
+        Err(ChatItemError::ProfileChangeMissingNames)
+    )]
+    #[test_case(
+        proto::ProfileChangeChatUpdate {
+            newName: "Bak".into(),
+            ..Default::default()
+        },
+        Err(ChatItemError::ProfileChangeMissingNames)
+    )]
+    #[test_case(
+        proto::ProfileChangeChatUpdate {
+            previousName: "Kon".into(),
+            newName: "Bak".into(),
+            ..Default::default()
+        },
+        Ok(())
+    )]
     #[test_case(
         proto::ThreadMergeChatUpdate::default(),
         Err(ChatItemError::InvalidE164)

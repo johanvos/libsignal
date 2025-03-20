@@ -158,9 +158,10 @@ pub fn run_future_on_runtime<'local, R, F, O>(
 ) -> SignalJniResult<JavaCompletableFuture<'local, <O as ResultTypeInfo<'local>>::ResultType>>
 where
     R: AsyncRuntime<F>,
-    F: Future + std::panic::UnwindSafe + 'static,
+    F: Future<Output: ResultReporter<Receiver = FutureCompleter<O>>>
+        + std::panic::UnwindSafe
+        + 'static,
     O: for<'a> ResultTypeInfo<'a> + std::panic::UnwindSafe + 'static,
-    F::Output: ResultReporter<Receiver = FutureCompleter<O>>,
 {
     let java_future = new_instance(
         env,
@@ -172,7 +173,7 @@ where
     Ok(java_future.into())
 }
 
-/// Catches panics that occur in `future` and converts them to [`SignalJniError::UnexpectedPanic`].
+/// Catches panics that occur in `future` and converts them to [`BridgeLayerError::UnexpectedPanic`].
 pub fn catch_unwind<'a, O>(
     future: impl Future<Output = SignalJniResult<O>> + Send + std::panic::UnwindSafe + 'a,
 ) -> impl Future<Output = SignalJniResult<O>> + Send + std::panic::UnwindSafe + 'a {

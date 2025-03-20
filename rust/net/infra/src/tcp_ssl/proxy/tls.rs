@@ -15,7 +15,6 @@ use crate::certs::RootCertificates;
 use crate::dns::DnsResolver;
 use crate::errors::TransportConnectError;
 use crate::host::Host;
-use crate::route::ConnectionProxyConfig;
 use crate::tcp_ssl::{connect_tcp, connect_tls, ssl_config};
 use crate::{
     Alpn, RouteType, ServiceConnectionInfo, StreamAndInfo, TransportConnectionParams,
@@ -25,12 +24,12 @@ use crate::{
 /// A [`TransportConnector`] that proxies through a TLS server.
 ///
 /// The proxy server should expose a listening port. If `use_tls_for_proxy` is
-/// [`ShouldUseTls::Yes`], the port should accept TLS client connections;
+/// `ShouldUseTls::Yes`, the port should accept TLS client connections;
 /// otherwise unencrypted. The proxy will transparently proxy TLS traffic by
 /// examining the SNI of incoming connections to determine the destination host.
 ///
 /// An example implementation of such a target service can be found at
-/// https://github.com/signalapp/Signal-TLS-Proxy.
+/// <https://github.com/signalapp/Signal-TLS-Proxy>.
 #[derive(Clone, Debug)]
 pub struct TlsProxyConnector {
     pub dns_resolver: DnsResolver,
@@ -55,11 +54,13 @@ impl TransportConnector for TlsProxyConnector {
         connection_params: &TransportConnectionParams,
         alpn: Alpn,
     ) -> Result<StreamAndInfo<Self::Stream>, TransportConnectError> {
+        let log_tag: Arc<str> = "TlsProxyConnector".into();
         let StreamAndInfo(tcp_stream, remote_address) = connect_tcp(
             &self.dns_resolver,
             RouteType::TlsProxy,
             self.proxy_host.as_deref(),
             self.proxy_port,
+            log_tag.clone(),
         )
         .await?;
 
@@ -92,7 +93,7 @@ impl TransportConnector for TlsProxyConnector {
             }
         };
 
-        let tls_stream = connect_tls(inner_stream, connection_params, alpn).await?;
+        let tls_stream = connect_tls(inner_stream, connection_params, alpn, log_tag).await?;
 
         Ok(StreamAndInfo(
             tls_stream,
@@ -124,6 +125,12 @@ impl TlsProxyConnector {
         }
     }
 
+    pub(crate) fn new_tcp(dns_resolver: DnsResolver, proxy: (Host<Arc<str>>, NonZeroU16)) -> Self {
+        let mut connector = Self::new(dns_resolver, proxy);
+        connector.use_tls_for_proxy = ShouldUseTls::No;
+        connector
+    }
+
     pub fn set_proxy(&mut self, (host, port): (Host<Arc<str>>, NonZeroU16)) {
         let (use_tls_for_proxy, actual_host) = Self::parse_host_for_tls_opt_out(host);
 
@@ -140,27 +147,6 @@ impl TlsProxyConnector {
         }
 
         (ShouldUseTls::Yes, proxy_host)
-    }
-
-    pub(crate) fn as_route_config(&self) -> ConnectionProxyConfig {
-        let Self {
-            dns_resolver: _,
-            proxy_host,
-            proxy_port,
-            proxy_certs,
-            use_tls_for_proxy,
-        } = self;
-        match use_tls_for_proxy {
-            ShouldUseTls::Yes => ConnectionProxyConfig::TlsProxy {
-                proxy_host: proxy_host.clone(),
-                proxy_port: *proxy_port,
-                proxy_certs: proxy_certs.clone(),
-            },
-            ShouldUseTls::No => ConnectionProxyConfig::TcpProxy {
-                proxy_host: proxy_host.clone(),
-                proxy_port: *proxy_port,
-            },
-        }
     }
 }
 

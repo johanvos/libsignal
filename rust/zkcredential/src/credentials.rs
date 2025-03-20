@@ -5,9 +5,10 @@
 
 //! Types used in both the issuance and presentation of credentials
 
+use std::sync::LazyLock;
+
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
-use lazy_static::lazy_static;
 use partial_default::PartialDefault;
 use poksho::{ShoApi, ShoHmacSha256, ShoSha256};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ use crate::RANDOMNESS_LEN;
 ///
 /// Defined in Chase-Perrin-Zaverucha section 3.1.
 #[derive(Clone, Serialize, Deserialize, PartialDefault)]
+// This type intentionally does not implement `Copy` to make it harder to
+// accidentally duplicate these values.
 pub struct Credential {
     pub(crate) t: Scalar,
     pub(crate) U: RistrettoPoint,
@@ -177,9 +180,7 @@ impl Serialize for CredentialKeyPair {
     }
 }
 
-lazy_static! {
-    static ref SYSTEM_PARAMS: SystemParams = SystemParams::generate();
-}
+static SYSTEM_PARAMS: LazyLock<SystemParams> = LazyLock::new(SystemParams::generate);
 
 pub(crate) const NUM_SUPPORTED_ATTRS: usize = 7; // 1 aggregate public, 3 two-point private
 

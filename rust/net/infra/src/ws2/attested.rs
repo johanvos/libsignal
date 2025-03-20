@@ -4,21 +4,20 @@
 //
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use attest::client_connection::ClientConnection;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::WebSocketStream;
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::CloseFrame;
 
 use crate::ws::error::{ProtocolError, SpaceError, UnexpectedCloseError};
-use crate::ws::{NextOrClose, TextOrBinary, WebSocketServiceError};
+use crate::ws::{NextOrClose, TextOrBinary, WebSocketServiceError, WebSocketStreamLike};
 use crate::ws2::{
     FinishReason, MessageEvent, NextEventError, Outcome, TungsteniteReceiveError,
     TungsteniteSendError,
 };
-use crate::AsyncDuplexStream;
 
 /// Encrypted connection to an attested host.
 #[derive(Debug)]
@@ -37,23 +36,11 @@ pub enum AttestedProtocolError {
     UnexpectedClose(UnexpectedCloseError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, derive_more::From)]
 pub enum AttestedConnectionError {
     Protocol(AttestedProtocolError),
     Attestation(attest::enclave::Error),
     WebSocket(WebSocketServiceError),
-}
-
-impl From<attest::enclave::Error> for AttestedConnectionError {
-    fn from(value: attest::enclave::Error) -> Self {
-        Self::Attestation(value)
-    }
-}
-
-impl From<WebSocketServiceError> for AttestedConnectionError {
-    fn from(value: WebSocketServiceError) -> Self {
-        Self::WebSocket(value)
-    }
 }
 
 impl From<attest::client_connection::Error> for AttestedConnectionError {
@@ -80,12 +67,16 @@ impl AttestedConnection {
     /// Perform a handshake over the provided websocket stream with the given
     /// handshake function. If the handshake succeeds, return the established
     /// connection.
-    pub async fn connect<S: AsyncDuplexStream + 'static>(
-        ws: WebSocketStream<S>,
+    pub async fn connect<WS>(
+        ws: WS,
         ws_config: crate::ws2::Config,
+        log_tag: Arc<str>,
         new_handshake: impl FnOnce(&[u8]) -> attest::enclave::Result<attest::enclave::Handshake>,
-    ) -> Result<Self, AttestedConnectionError> {
-        let mut ws_client = WsClient::new(ws, ws_config);
+    ) -> Result<Self, AttestedConnectionError>
+    where
+        WS: WebSocketStreamLike + Send + 'static,
+    {
+        let mut ws_client = WsClient::new(ws, ws_config, log_tag);
 
         let client_connection = authenticate(&mut ws_client, new_handshake).await?;
 
@@ -172,14 +163,20 @@ struct WsClient {
 }
 
 impl WsClient {
-    fn new<S: AsyncDuplexStream + 'static>(
-        ws: WebSocketStream<S>,
-        ws_config: crate::ws2::Config,
-    ) -> Self {
+    fn new<WS>(ws: WS, ws_config: crate::ws2::Config, log_tag: Arc<str>) -> Self
+    where
+        WS: WebSocketStreamLike + Send + 'static,
+    {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(WS_MESSAGE_BUFFER);
         let (incoming_tx, incoming_rx) = mpsc::channel(WS_MESSAGE_BUFFER);
 
-        let _task = tokio::spawn(spawned_task_body(ws, outgoing_rx, incoming_tx, ws_config));
+        let _task = tokio::spawn(spawned_task_body(
+            ws,
+            outgoing_rx,
+            incoming_tx,
+            ws_config,
+            log_tag,
+        ));
 
         Self {
             outgoing_tx,
@@ -248,13 +245,18 @@ enum TaskExitError {
 }
 
 async fn spawned_task_body(
-    stream: WebSocketStream<impl AsyncDuplexStream>,
+    stream: impl WebSocketStreamLike,
     outgoing_rx: mpsc::Receiver<(TextOrBinary, oneshot::Sender<Result<(), SendError>>)>,
     incoming_tx: mpsc::Sender<Result<NextOrClose<TextOrBinary>, ReceiveError>>,
     config: crate::ws2::Config,
+    log_tag: Arc<str>,
 ) -> Result<(), TaskExitError> {
-    let mut connection =
-        crate::ws2::Connection::new(stream, ReceiverStream::new(outgoing_rx), config);
+    let mut connection = crate::ws2::Connection::new(
+        stream,
+        ReceiverStream::new(outgoing_rx),
+        config,
+        log_tag.clone(),
+    );
     let mut connection = std::pin::pin!(connection);
 
     loop {
@@ -262,7 +264,9 @@ async fn spawned_task_body(
             Outcome::Continue(event) => match event {
                 MessageEvent::SentMessage(response_sender) => {
                     if response_sender.send(Ok(())).is_err() {
-                        log::debug!("failed to signal send because the sender was dropped");
+                        log::debug!(
+                            "[{log_tag}] failed to signal send because the sender was dropped"
+                        );
                     }
                 }
                 MessageEvent::SendFailed(response_sender, tungstenite_send_error) => {
@@ -271,7 +275,7 @@ async fn spawned_task_body(
                         .send(Err(tungstenite_send_error.into()))
                         .is_err()
                     {
-                        log::debug!("failed to signal send error because the sender was dropped");
+                        log::debug!("[{log_tag}] failed to signal send error because the sender was dropped");
                     }
                     return Err(task_err);
                 }
@@ -282,7 +286,7 @@ async fn spawned_task_body(
                         .is_err()
                     {
                         log::debug!(
-                            "failed to forward received message because the receiver was dropped"
+                            "[{log_tag}] failed to forward received message because the receiver was dropped"
                         );
                         // The receiver has been dropped, so we should exit.
                         return Ok(());
@@ -296,7 +300,9 @@ async fn spawned_task_body(
                     .await
                     .is_err()
                 {
-                    log::debug!("failed to send close event because the receiver was dropped")
+                    log::debug!(
+                        "[{log_tag}] failed to send close event because the receiver was dropped"
+                    )
                 }
                 return Ok(());
             }
@@ -315,7 +321,7 @@ async fn spawned_task_body(
                             .await
                             .is_err()
                         {
-                            log::debug!("failed to send abnormal close event because the receiver was dropped");
+                            log::debug!("[{log_tag}] failed to send abnormal close event because the receiver was dropped");
                         }
                         return Err(TaskExitError::AbnormalServerClose { code });
                     }
@@ -341,7 +347,9 @@ async fn spawned_task_body(
                     ),
                 };
                 if incoming_tx.send(Err(tx_error)).await.is_err() {
-                    log::debug!("failed to signal send error because the receiver was dropped")
+                    log::debug!(
+                        "[{log_tag}] failed to signal send error because the receiver was dropped"
+                    )
                 }
                 return Err(exit_error);
             }
@@ -578,18 +586,19 @@ pub mod testutil {
 
         websocket.send(message.into()).await.unwrap();
 
-        let mut server_transport = server_hs.into_transport_mode().unwrap();
+        // The type is poorly named but works here since it just wraps an
+        // already-established connection.
+        let mut server_connection = ClientConnection {
+            handshake_hash: server_hs.get_handshake_hash().to_vec(),
+            transport: server_hs.into_transport_mode().unwrap(),
+        };
 
         while let Ok(incoming) = websocket.receive().await {
             let received = match incoming {
                 NextOrClose::Close(close) => NextOrClose::Close(close),
                 NextOrClose::Next(incoming) => {
                     let incoming = incoming.try_into_binary().unwrap();
-                    let mut payload = vec![0; incoming.len()];
-                    let read = server_transport
-                        .read_message(&incoming, &mut payload)
-                        .unwrap();
-                    payload.truncate(read);
+                    let payload = server_connection.recv(&incoming).unwrap();
 
                     NextOrClose::Next(payload)
                 }
@@ -601,11 +610,7 @@ pub mod testutil {
             } = on_message(received);
 
             if let Some(payload) = message {
-                let mut outgoing = vec![0; payload.len() + 16 /* snow tag len */];
-                let written = server_transport
-                    .write_message(&payload, &mut outgoing)
-                    .unwrap();
-                outgoing.truncate(written);
+                let outgoing = server_connection.send(&payload).unwrap();
                 websocket.send(outgoing.into()).await.unwrap();
             }
 
@@ -622,12 +627,14 @@ mod test {
     use std::time::Duration;
 
     use assert_matches::assert_matches;
+    use tokio_tungstenite::WebSocketStream;
 
     use super::*;
     use crate::ws::testutil::fake_websocket;
     use crate::ws2::attested::testutil::{
         run_attested_server, AttestedServerOutput, FAKE_ATTESTATION,
     };
+    use crate::AsyncDuplexStream;
 
     const ECHO_BYTES: &[u8] = b"two nibbles to a byte";
 
@@ -662,13 +669,17 @@ mod test {
             attest::sgx_session::testutil::private_key(),
         ));
 
-        let mut connection =
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
+        let mut connection = AttestedConnection::connect(
+            client,
+            FAKE_WS_CONFIG,
+            "test".into(),
+            |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         connection.send(Vec::from(ECHO_BYTES)).await.unwrap();
         let response: Vec<u8> = connection.receive().await.unwrap().unwrap_next();
@@ -693,7 +704,8 @@ mod test {
         }
 
         assert_matches!(
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, fail_to_handshake).await,
+            AttestedConnection::connect(client, FAKE_WS_CONFIG, "test".into(), fail_to_handshake)
+                .await,
             Err(_)
         );
     }
@@ -707,13 +719,17 @@ mod test {
             attest::sgx_session::testutil::private_key(),
         ));
 
-        let mut connection =
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
+        let mut connection = AttestedConnection::connect(
+            client,
+            FAKE_WS_CONFIG,
+            "test".into(),
+            |fake_attestation| {
                 assert_eq!(fake_attestation, FAKE_ATTESTATION);
                 attest::sgx_session::testutil::handshake_from_tests_data()
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
 
         connection.send(Vec::from(ECHO_BYTES)).await.unwrap();
         // Decoding a vec as a 32-bit float shouldn't work.

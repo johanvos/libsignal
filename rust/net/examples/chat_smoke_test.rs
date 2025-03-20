@@ -3,31 +3,31 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
+use std::collections::HashSet;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, ValueEnum};
-use libsignal_net::auth::Auth;
-use libsignal_net::chat::test_support::simple_chat_service;
-use libsignal_net::chat::ChatServiceError;
-use libsignal_net::env::Svr3Env;
-use libsignal_net::infra::{ConnectionParams, RouteType};
+use clap::{Parser, ValueEnum};
+use futures_util::{FutureExt, StreamExt};
+use libsignal_net::chat::ConnectError;
+use libsignal_net_infra::host::Host;
+use libsignal_net_infra::EnableDomainFronting;
+use strum::IntoEnumIterator as _;
 
 #[derive(Parser)]
 struct Config {
-    #[clap(flatten)]
-    route: Option<Route>,
     env: Environment,
+    #[arg(long)]
+    limit_to_routes: Vec<RouteType>,
     #[arg(long)]
     try_all_routes: bool,
 }
 
-#[derive(Args)]
-#[group(multiple = false)]
-struct Route {
-    #[arg(long)]
-    proxy_g: bool,
-    #[arg(long)]
-    proxy_f: bool,
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, strum::EnumString, strum::EnumIter)]
+#[strum(serialize_all = "lowercase")]
+enum RouteType {
+    Direct,
+    ProxyF,
+    ProxyG,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -44,64 +44,102 @@ async fn main() -> ExitCode {
         .parse_default_env()
         .init();
 
-    let config = Config::parse();
-    let env = match config.env {
+    let Config {
+        env,
+        limit_to_routes,
+        try_all_routes,
+    } = Config::parse();
+    let env = match env {
         Environment::Staging => libsignal_net::env::STAGING,
         Environment::Production => libsignal_net::env::PROD,
     };
 
-    let mut connection_params = env
-        .chat_domain_config
-        .connect
-        .connection_params_with_fallback();
-    match config.route {
-        Some(Route { proxy_g: true, .. }) => {
-            connection_params.retain(|c| c.route_type == RouteType::ProxyG)
-        }
-        Some(Route { proxy_f: true, .. }) => {
-            connection_params.retain(|c| c.route_type == RouteType::ProxyF)
-        }
-        _ if config.try_all_routes => {
-            // Retain every route, including the direct one.
-        }
-        _ => connection_params.retain(|c| c.route_type == RouteType::Direct),
+    let allowed_route_types = if limit_to_routes.is_empty() {
+        RouteType::iter().collect()
+    } else {
+        limit_to_routes
     };
 
-    let mut any_failures = false;
-    if config.try_all_routes {
-        for route in connection_params {
-            log::info!("trying {} ({})", route.transport.sni, route.route_type);
-            test_connection(&env, vec![route])
-                .await
-                .unwrap_or_else(|e| {
-                    any_failures = true;
-                    log::error!("failed to connect: {e}")
-                });
-        }
-    } else {
-        test_connection(&env, connection_params)
-            .await
-            .unwrap_or_else(|e| {
-                any_failures = true;
-                log::error!("failed to connect: {e}")
-            });
-    }
+    let snis = allowed_route_types.iter().flat_map(|route_type| {
+        let (index, libsignal_net_type) = match route_type {
+            RouteType::Direct => {
+                return std::slice::from_ref(&env.chat_domain_config.connect.hostname)
+            }
+            RouteType::ProxyF => (0, libsignal_net_infra::RouteType::ProxyF),
+            RouteType::ProxyG => (1, libsignal_net_infra::RouteType::ProxyG),
+        };
+        let config = &env
+            .chat_domain_config
+            .connect
+            .proxy
+            .as_ref()
+            .expect("configured")
+            .configs[index];
+        assert_eq!(
+            config.route_type(),
+            libsignal_net_type,
+            "wrong index for {route_type:?}"
+        );
+        config.hostnames()
+    });
 
-    if any_failures {
-        ExitCode::FAILURE
+    let success = if try_all_routes {
+        futures_util::stream::iter(snis)
+            .then(|&sni| {
+                log::info!("## Trying {sni} ##");
+                // We use AllDomains mode to generate every route, then filter for the specific one
+                // we're trying to test.
+                test_connection(&env, HashSet::from([sni]), EnableDomainFronting::AllDomains).map(
+                    |result| match result {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::error!("failed to connect: {e}");
+                            false
+                        }
+                    },
+                )
+            })
+            .fold(true, |a, b| std::future::ready(a && b))
+            .await
     } else {
+        let domain_fronting = if allowed_route_types == [RouteType::Direct] {
+            EnableDomainFronting::No
+        } else {
+            EnableDomainFronting::OneDomainPerProxy
+        };
+        match test_connection(&env, snis.copied().collect(), domain_fronting).await {
+            Ok(()) => true,
+            Err(e) => {
+                log::error!("failed to connect: {e}");
+                false
+            }
+        }
+    };
+
+    if success {
         ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
 async fn test_connection(
-    env: &libsignal_net::env::Env<'static, Svr3Env<'static>>,
-    connection_params: Vec<ConnectionParams>,
-) -> Result<(), ChatServiceError> {
-    let chat = simple_chat_service(env, Auth::default(), connection_params);
+    env: &libsignal_net::env::Env<'static>,
+    snis: HashSet<&str>,
+    domain_fronting: EnableDomainFronting,
+) -> Result<(), ConnectError> {
+    use libsignal_net::chat::test_support::simple_chat_connection;
+    let chat_connection = simple_chat_connection(env, domain_fronting, |route| {
+        match &route.inner.fragment.sni {
+            Host::Domain(domain) => snis.contains(&domain[..]),
+            Host::Ip(_) => panic!("unexpected IP address as a chat SNI"),
+        }
+    })
+    .await?;
 
-    chat.connect_unauthenticated().await?;
-    chat.disconnect().await;
+    // Disconnect immediately to confirm connection and disconnection works.
+    chat_connection.disconnect().await;
+
     log::info!("completed successfully");
     Ok(())
 }

@@ -51,8 +51,7 @@ message SearchProof {
 // UpdateValue wraps the new value for a key with an optional signature from the
 // service provider.
 message UpdateValue {
-  // optional bytes signature = 1; TODO
-  bytes value = 2;
+  bytes value = 1;
 }
 
 // Consistency specifies the parameters of the consistency proof(s) that should
@@ -104,7 +103,9 @@ message UpdateResponse {
 // MonitorKey is a single key that the user would like to monitor.
 message MonitorKey {
   bytes search_key = 1;
-  repeated uint64 entries = 2;
+  // The position of the last log entry verified by the client
+  // to be in the direct path to the identifier
+  uint64 entry_position = 2;
   // the commitment index for the search key
   bytes commitment_index = 3;
 }

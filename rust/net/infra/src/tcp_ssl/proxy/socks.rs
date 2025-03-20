@@ -11,12 +11,12 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use auto_enums::enum_derive;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_boring_signal::SslStream;
 use tokio_socks::tcp::{Socks4Stream, Socks5Stream};
 use tokio_socks::TargetAddr;
-use tokio_util::either::Either;
 
 use crate::dns::lookup_result::LookupResult;
 use crate::dns::DnsResolver;
@@ -50,11 +50,16 @@ pub enum Protocol {
     },
 }
 
-pub type SocksStream = Either<Socks5Stream<TcpStream>, Socks4Stream<TcpStream>>;
+#[derive(Debug, derive_more::From)]
+#[enum_derive(tokio1::AsyncRead, tokio1::AsyncWrite)]
+pub enum SocksStream<S> {
+    Socks4(Socks4Stream<S>),
+    Socks5(Socks5Stream<S>),
+}
 
 #[async_trait]
 impl TransportConnector for SocksConnector {
-    type Stream = SslStream<SocksStream>;
+    type Stream = SslStream<SocksStream<TcpStream>>;
 
     async fn connect(
         &self,
@@ -79,11 +84,14 @@ impl TransportConnector for SocksConnector {
         log::info!("connecting to {which_protocol:?} proxy over TCP");
         log::debug!("connecting to {which_protocol:?} proxy at {proxy_host}:{proxy_port} over TCP");
 
+        let log_tag: Arc<str> = "SocksConnector".into();
+
         let StreamAndInfo(tcp_stream, remote_address) = crate::tcp_ssl::connect_tcp(
             dns_resolver,
             RouteType::SocksProxy,
             proxy_host.as_deref(),
             *proxy_port,
+            log_tag.clone(),
         )
         .await?;
         let is_ipv6 = tcp_stream
@@ -135,7 +143,8 @@ impl TransportConnector for SocksConnector {
             })?;
 
         log::debug!("connecting TLS through proxy");
-        let stream = crate::tcp_ssl::connect_tls(socks_stream, connection_params, alpn).await?;
+        let stream =
+            crate::tcp_ssl::connect_tls(socks_stream, connection_params, alpn, log_tag).await?;
 
         log::info!("connection through SOCKS proxy established successfully");
         Ok(StreamAndInfo(
@@ -150,7 +159,7 @@ impl TransportConnector for SocksConnector {
 }
 
 impl Connector<SocksRoute<IpAddr>, ()> for super::StatelessProxied {
-    type Connection = SocksStream;
+    type Connection = SocksStream<TcpStream>;
 
     type Error = TransportConnectError;
 
@@ -158,6 +167,7 @@ impl Connector<SocksRoute<IpAddr>, ()> for super::StatelessProxied {
         &self,
         (): (),
         route: SocksRoute<IpAddr>,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
         let SocksRoute {
             protocol,
@@ -167,31 +177,33 @@ impl Connector<SocksRoute<IpAddr>, ()> for super::StatelessProxied {
         } = route;
 
         async move {
-            log::info!("establishing connection to host over SOCKS proxy");
+            log::info!("[{log_tag}] establishing connection to host over SOCKS proxy");
             log::debug!(
-                "establishing connection to {:?} over SOCKS proxy",
+                "[{log_tag}] establishing connection to {:?} over SOCKS proxy",
                 target_addr
             );
 
-            log::info!("connecting to {protocol:?} proxy over TCP");
+            log::info!("[{log_tag}] connecting to {protocol:?} proxy over TCP");
             let TcpRoute {
                 address: proxy_host,
                 port: proxy_port,
             } = &proxy;
-            log::debug!("connecting to {protocol:?} proxy at {proxy_host}:{proxy_port} over TCP");
+            log::debug!("[{log_tag}] connecting to {protocol:?} proxy at {proxy_host}:{proxy_port} over TCP");
 
             let target = match &target_addr {
-                crate::route::SocksTarget::ResolvedLocally(ip) => {
+                crate::route::ProxyTarget::ResolvedLocally(ip) => {
                     TargetAddr::Ip((*ip, target_port.get()).into())
                 }
-                crate::route::SocksTarget::ResolvedRemotely { name } => {
+                crate::route::ProxyTarget::ResolvedRemotely { name } => {
                     TargetAddr::Domain(Cow::Borrowed(name), target_port.get())
                 }
             };
 
-            let stream = super::super::StatelessDirect.connect(proxy).await?;
-            log::info!("performing proxy handshake");
-            log::debug!("performing proxy handshake with {target:?}");
+            let stream = super::super::StatelessDirect
+                .connect(proxy, log_tag.clone())
+                .await?;
+            log::info!("[{log_tag}] performing proxy handshake");
+            log::debug!("[{log_tag}] performing proxy handshake with {target:?}");
             protocol
                 .connect_to_proxy(stream, target)
                 .await
@@ -201,14 +213,23 @@ impl Connector<SocksRoute<IpAddr>, ()> for super::StatelessProxied {
 }
 
 impl Connection for Socks4Stream<TcpStream> {
-    fn connection_info(&self) -> crate::ConnectionInfo {
-        (**self).connection_info()
+    fn transport_info(&self) -> crate::TransportInfo {
+        (**self).transport_info()
     }
 }
 
 impl Connection for Socks5Stream<TcpStream> {
-    fn connection_info(&self) -> crate::ConnectionInfo {
-        (**self).connection_info()
+    fn transport_info(&self) -> crate::TransportInfo {
+        (**self).transport_info()
+    }
+}
+
+impl Connection for SocksStream<TcpStream> {
+    fn transport_info(&self) -> crate::TransportInfo {
+        match self {
+            SocksStream::Socks4(stream) => stream.transport_info(),
+            SocksStream::Socks5(stream) => stream.transport_info(),
+        }
     }
 }
 
@@ -217,7 +238,7 @@ impl Protocol {
         &self,
         stream: S,
         target: TargetAddr<'_>,
-    ) -> Result<Either<Socks5Stream<S>, Socks4Stream<S>>, tokio_socks::Error> {
+    ) -> Result<SocksStream<S>, tokio_socks::Error> {
         match self {
             Protocol::Socks5 { username_password } => match username_password {
                 Some((username, password)) => {
@@ -228,14 +249,14 @@ impl Protocol {
                 }
                 None => Socks5Stream::connect_with_socket(stream, target).await,
             }
-            .map(Either::Left),
+            .map(Into::into),
             Protocol::Socks4 { user_id } => match user_id {
                 Some(user_id) => {
                     Socks4Stream::connect_with_userid_and_socket(stream, target, user_id).await
                 }
                 None => Socks4Stream::connect_with_socket(stream, target).await,
             }
-            .map(Either::Right),
+            .map(Into::into),
         }
     }
 }

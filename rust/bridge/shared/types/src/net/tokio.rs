@@ -34,6 +34,10 @@ impl TokioAsyncContext {
             next_raw_cancellation_id: AtomicU64::new(1),
         }
     }
+
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
+    }
 }
 
 /// Assert [`TokioAsyncContext`] is unwind-safe.
@@ -91,9 +95,7 @@ impl AsyncRuntimeBase for TokioAsyncContext {
 
 impl<F> AsyncRuntime<F> for TokioAsyncContext
 where
-    F: Future + Send + 'static,
-    F::Output: ResultReporter + Send,
-    <F::Output as ResultReporter>::Receiver: Send,
+    F: Future<Output: ResultReporter<Receiver: Send> + Send> + Send + 'static,
 {
     type Cancellation = TokioContextCancellation;
 

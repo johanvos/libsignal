@@ -9,19 +9,19 @@ use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boring_signal::ssl::{ConnectConfiguration, SslConnector, SslMethod};
+use auto_enums::enum_derive;
+use boring_signal::ssl::{ConnectConfiguration, SslConnector, SslMethod, SslSignatureAlgorithm};
 use futures_util::TryFutureExt;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_boring_signal::SslStream;
-use tokio_util::either::Either;
 
 use crate::certs::RootCertificates;
 use crate::dns::DnsResolver;
 use crate::errors::TransportConnectError;
 use crate::host::Host;
 use crate::route::{
-    ConnectionProxyConfig, Connector, ConnectorExt as _, TcpRoute, TlsRouteFragment,
+    ConnectionProxyConfig, Connector, ConnectorExt as _, TcpProxy, TcpRoute, TlsProxy,
+    TlsRouteFragment,
 };
 use crate::tcp_ssl::proxy::tls::TlsProxyConnector;
 use crate::timeouts::TCP_CONNECTION_ATTEMPT_DELAY;
@@ -37,47 +37,63 @@ use crate::{
 pub mod proxy;
 
 #[derive(Clone, Debug)]
-pub enum TcpSslConnector {
-    Direct(DirectConnector),
-    Proxied(TlsProxyConnector),
-    /// Used when configuring one of the other kinds of connector isn't possible, perhaps because
-    /// invalid configuration options were provided.
-    Invalid(DnsResolver),
+pub struct TcpSslConnector {
+    dns_resolver: DnsResolver,
+    proxy: Result<Option<ConnectionProxyConfig>, InvalidProxyConfig>,
 }
 
 impl TcpSslConnector {
+    pub fn new_direct(dns_resolver: DnsResolver) -> Self {
+        Self {
+            dns_resolver,
+            proxy: Ok(None),
+        }
+    }
+
     pub fn set_ipv6_enabled(&mut self, ipv6_enabled: bool) {
-        let dns_resolver = match self {
-            TcpSslConnector::Direct(c) => &mut c.dns_resolver,
-            TcpSslConnector::Proxied(c) => &mut c.dns_resolver,
-            TcpSslConnector::Invalid(resolver) => resolver,
-        };
-        dns_resolver.set_ipv6_enabled(ipv6_enabled);
+        self.dns_resolver.set_ipv6_enabled(ipv6_enabled);
+    }
+
+    pub fn set_proxy(&mut self, proxy: ConnectionProxyConfig) {
+        self.proxy = Ok(Some(proxy));
+    }
+
+    pub fn set_invalid(&mut self) {
+        self.proxy = Err(InvalidProxyConfig)
+    }
+
+    pub fn clear_proxy(&mut self) {
+        self.proxy = Ok(None);
+    }
+
+    pub fn proxy(&self) -> Result<Option<&ConnectionProxyConfig>, InvalidProxyConfig> {
+        self.proxy
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(InvalidProxyConfig::clone)
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct InvalidProxyConfig;
 
 impl TryFrom<&TcpSslConnector> for Option<ConnectionProxyConfig> {
     type Error = InvalidProxyConfig;
 
     fn try_from(value: &TcpSslConnector) -> Result<Self, Self::Error> {
-        match value {
-            TcpSslConnector::Direct(_) => Ok(None),
-            TcpSslConnector::Proxied(tls_proxy_connector) => {
-                Ok(Some(tls_proxy_connector.as_route_config()))
-            }
-            TcpSslConnector::Invalid(_) => Err(InvalidProxyConfig),
-        }
+        let TcpSslConnector {
+            dns_resolver: _,
+            proxy,
+        } = value;
+        proxy.clone()
     }
 }
 
-pub struct TcpSslConnectorStream(
-    Either<
-        <DirectConnector as TransportConnector>::Stream,
-        <TlsProxyConnector as TransportConnector>::Stream,
-    >,
-);
+#[enum_derive(tokio1::AsyncRead, tokio1::AsyncWrite)]
+pub enum TcpSslConnectorStream {
+    Direct(<DirectConnector as TransportConnector>::Stream),
+    Proxy(<TlsProxyConnector as TransportConnector>::Stream),
+}
 
 #[derive(Clone, Debug)]
 pub struct DirectConnector {
@@ -96,15 +112,17 @@ impl TransportConnector for DirectConnector {
         connection_params: &TransportConnectionParams,
         alpn: Alpn,
     ) -> Result<StreamAndInfo<Self::Stream>, TransportConnectError> {
+        let log_tag: Arc<str> = "DirectConnector".into();
         let StreamAndInfo(tcp_stream, remote_address) = connect_tcp(
             &self.dns_resolver,
             RouteType::Direct,
             connection_params.tcp_host.as_deref(),
             connection_params.port,
+            log_tag.clone(),
         )
         .await?;
 
-        let ssl_stream = connect_tls(tcp_stream, connection_params, alpn).await?;
+        let ssl_stream = connect_tls(tcp_stream, connection_params, alpn, log_tag).await?;
 
         Ok(StreamAndInfo(ssl_stream, remote_address))
     }
@@ -130,6 +148,7 @@ impl Connector<TcpRoute<IpAddr>, ()> for StatelessDirect {
         &self,
         (): (),
         route: TcpRoute<IpAddr>,
+        _log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> {
         let TcpRoute { address, port } = route;
 
@@ -150,6 +169,7 @@ where
         &self,
         inner: Inner,
         fragment: TlsRouteFragment,
+        _log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
         let TlsRouteFragment {
             root_certs,
@@ -158,8 +178,7 @@ where
         } = fragment;
         let host = sni;
 
-        let ssl_config =
-            ssl_config(&root_certs, host.as_deref(), alpn).map_err(TransportConnectError::from);
+        let ssl_config = ssl_config(&root_certs, host.as_deref(), alpn);
 
         async move {
             let domain = match &host {
@@ -176,8 +195,8 @@ where
 }
 
 impl<S: Connection> Connection for SslStream<S> {
-    fn connection_info(&self) -> crate::ConnectionInfo {
-        self.get_ref().connection_info()
+    fn transport_info(&self) -> crate::TransportInfo {
+        self.get_ref().transport_info()
     }
 }
 
@@ -191,6 +210,19 @@ fn ssl_config(
     if let Some(alpn) = alpn {
         ssl.set_alpn_protos(alpn.as_ref())?;
     }
+
+    // This is just the default Boring TLS supported signature scheme list
+    //   with ed25519 added at the top of the preference order.
+    // We can't be any more specific because of the fallback proxies.
+    ssl.set_verify_algorithm_prefs(&[
+        SslSignatureAlgorithm::ED25519,
+        SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256,
+        SslSignatureAlgorithm::RSA_PKCS1_SHA256,
+        SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256,
+        SslSignatureAlgorithm::RSA_PKCS1_SHA1,
+        SslSignatureAlgorithm::ECDSA_SHA1,
+    ])?;
+
     // Uncomment and build with the feature "dev-util" to enable NSS-standard
     //   debugging support for e.g. Wireshark.
     // This is already built into BoringSSL and RustTLS, so there is no added risk here,
@@ -206,6 +238,7 @@ async fn connect_tls<S: AsyncDuplexStream>(
     transport: S,
     connection_params: &TransportConnectionParams,
     alpn: Alpn,
+    log_tag: Arc<str>,
 ) -> Result<SslStream<S>, TransportConnectError> {
     let route = TlsRouteFragment {
         root_certs: connection_params.certs.clone(),
@@ -213,7 +246,9 @@ async fn connect_tls<S: AsyncDuplexStream>(
         alpn: Some(alpn),
     };
 
-    StatelessDirect.connect_over(transport, route).await
+    StatelessDirect
+        .connect_over(transport, route, log_tag)
+        .await
 }
 
 async fn connect_tcp(
@@ -221,6 +256,7 @@ async fn connect_tcp(
     route_type: RouteType,
     host: Host<&str>,
     port: NonZeroU16,
+    log_tag: Arc<str>,
 ) -> Result<StreamAndInfo<TcpStream>, TransportConnectError> {
     let dns_lookup = match host {
         Host::Ip(ip) => {
@@ -258,13 +294,14 @@ async fn connect_tcp(
     let staggered_futures = dns_lookup.into_iter().enumerate().map(|(idx, ip)| {
         let delay = TCP_CONNECTION_ATTEMPT_DELAY * idx.try_into().unwrap();
         let connector = &connector;
+        let log_tag = log_tag.clone();
         async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
             let route = TcpRoute { address: ip, port };
             connector
-                .connect(route)
+                .connect(route, log_tag)
                 .inspect_err(|e| {
                     log::debug!("failed to connect to IP [{ip}] with an error: {e:?}");
                 })
@@ -288,40 +325,6 @@ async fn connect_tcp(
         .ok_or(TransportConnectError::TcpConnectionFailed)
 }
 
-impl AsyncRead for TcpSslConnectorStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for TcpSslConnectorStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
-    }
-}
-
 #[async_trait]
 impl TransportConnector for TcpSslConnector {
     type Stream = TcpSslConnectorStream;
@@ -331,30 +334,53 @@ impl TransportConnector for TcpSslConnector {
         connection_params: &TransportConnectionParams,
         alpn: Alpn,
     ) -> Result<StreamAndInfo<Self::Stream>, TransportConnectError> {
-        match self {
-            Self::Direct(direct) => direct
-                .connect(connection_params, alpn)
-                .await
-                .map(|s| s.map_stream(Either::Left)),
-            Self::Proxied(proxied) => proxied
-                .connect(connection_params, alpn)
-                .await
-                .map(|s| s.map_stream(Either::Right)),
-            Self::Invalid(_) => Err(TransportConnectError::InvalidConfiguration),
-        }
-        .map(|s| s.map_stream(TcpSslConnectorStream))
-    }
-}
+        let Self {
+            dns_resolver,
+            proxy,
+        } = self;
+        let proxy = proxy
+            .as_ref()
+            .map_err(|InvalidProxyConfig| TransportConnectError::InvalidConfiguration)?;
 
-impl From<DirectConnector> for TcpSslConnector {
-    fn from(value: DirectConnector) -> Self {
-        Self::Direct(value)
-    }
-}
+        let stream_and_info = match proxy {
+            None => {
+                let stream_and_info = DirectConnector {
+                    dns_resolver: dns_resolver.clone(),
+                }
+                .connect(connection_params, alpn)
+                .await?;
 
-impl From<TlsProxyConnector> for TcpSslConnector {
-    fn from(value: TlsProxyConnector) -> Self {
-        Self::Proxied(value)
+                stream_and_info.map_stream(TcpSslConnectorStream::Direct)
+            }
+            Some(ConnectionProxyConfig::Tcp(TcpProxy {
+                proxy_host,
+                proxy_port,
+            })) => {
+                let connector = TlsProxyConnector::new_tcp(
+                    dns_resolver.clone(),
+                    (proxy_host.clone(), *proxy_port),
+                );
+                let stream_and_info = connector.connect(connection_params, alpn).await?;
+                stream_and_info.map_stream(TcpSslConnectorStream::Proxy)
+            }
+            Some(ConnectionProxyConfig::Tls(TlsProxy {
+                proxy_host,
+                proxy_port,
+                proxy_certs,
+            })) => {
+                let mut connector =
+                    TlsProxyConnector::new(dns_resolver.clone(), (proxy_host.clone(), *proxy_port));
+                connector.proxy_certs = proxy_certs.clone();
+                let stream_and_info = connector.connect(connection_params, alpn).await?;
+                stream_and_info.map_stream(TcpSslConnectorStream::Proxy)
+            }
+            Some(ConnectionProxyConfig::Socks(_) | ConnectionProxyConfig::Http(_)) => {
+                log::warn!("SOCKS and HTTP proxies are not supported by TransportConnector");
+                return Err(TransportConnectError::InvalidConfiguration);
+            }
+        };
+
+        Ok(stream_and_info)
     }
 }
 
@@ -362,19 +388,17 @@ impl From<TlsProxyConnector> for TcpSslConnector {
 pub(crate) mod testutil {
     use std::future::Future;
     use std::net::{Ipv6Addr, SocketAddr};
+    use std::sync::LazyLock;
 
-    use lazy_static::lazy_static;
     use rcgen::CertifiedKey;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use warp::Filter;
 
     pub(crate) const SERVER_HOSTNAME: &str = "test-server.signal.org.local";
 
-    lazy_static! {
-        pub(crate) static ref SERVER_CERTIFICATE: CertifiedKey =
-            rcgen::generate_simple_self_signed([SERVER_HOSTNAME.to_string()])
-                .expect("can generate");
-    }
+    pub(crate) static SERVER_CERTIFICATE: LazyLock<CertifiedKey> = LazyLock::new(|| {
+        rcgen::generate_simple_self_signed([SERVER_HOSTNAME.to_string()]).expect("can generate")
+    });
 
     const FAKE_RESPONSE: &str = "Hello there";
     /// Starts an HTTP server listening on `::1` that responds with 200 and
@@ -474,9 +498,13 @@ mod test {
         let (addr, server) = localhost_http_server();
         let _server_handle = tokio::spawn(server);
 
-        let connector = TcpSslConnector::Invalid(DnsResolver::new_from_static_map(HashMap::from(
-            [(SERVER_HOSTNAME, LookupResult::localhost())],
-        )));
+        let connector = TcpSslConnector {
+            dns_resolver: DnsResolver::new_from_static_map(HashMap::from([(
+                SERVER_HOSTNAME,
+                LookupResult::localhost(),
+            )])),
+            proxy: Err(InvalidProxyConfig),
+        };
         let connection_params = TransportConnectionParams {
             sni: SERVER_HOSTNAME.into(),
             tcp_host: Host::Ip(addr.ip()),

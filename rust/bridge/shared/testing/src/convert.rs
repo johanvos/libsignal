@@ -31,9 +31,7 @@ impl AsyncRuntimeBase for NonSuspendingBackgroundThreadRuntime {}
 
 impl<F> AsyncRuntime<F> for NonSuspendingBackgroundThreadRuntime
 where
-    F: Future + Send + 'static,
-    F::Output: ResultReporter,
-    <F::Output as ResultReporter>::Receiver: Send,
+    F: Future<Output: ResultReporter<Receiver: Send>> + Send + 'static,
 {
     type Cancellation = std::future::Pending<()>;
 
@@ -226,6 +224,28 @@ fn TESTING_ProcessBytestringArray(input: Vec<&[u8]>) -> Box<[Vec<u8>]> {
         .map(|x| [x, x].concat())
         .collect::<Vec<Vec<u8>>>()
         .into_boxed_slice()
+}
+
+// Not needed for the FFI bridge because C can exactly describe all of these types.
+#[bridge_fn(ffi = false)]
+fn TESTING_RoundTripU8(input: u8) -> u8 {
+    input
+}
+#[bridge_fn(ffi = false)]
+fn TESTING_RoundTripU16(input: u16) -> u16 {
+    input
+}
+#[bridge_fn(ffi = false)]
+fn TESTING_RoundTripU32(input: u32) -> u32 {
+    input
+}
+#[bridge_fn(ffi = false)]
+fn TESTING_RoundTripI32(input: i32) -> i32 {
+    input
+}
+#[bridge_fn(ffi = false)]
+fn TESTING_RoundTripU64(input: u64) -> u64 {
+    input
 }
 
 #[bridge_fn]

@@ -3,34 +3,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::marker::PhantomData;
-use std::num::{NonZeroU16, NonZeroU32};
 use std::panic::RefUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aes_gcm_siv::aead::rand_core::CryptoRngCore;
-use async_trait::async_trait;
-use futures_util::future::join3;
-use libsignal_net::auth::Auth;
-use libsignal_net::connect_state::ConnectState;
-use libsignal_net::enclave::{
-    Cdsi, EnclaveEndpoint, EnclaveEndpointConnection, EnclaveKind, Nitro, PpssSetup, Sgx, Tpm2Snp,
+use libsignal_net::connect_state::{
+    ConnectState, DefaultConnectorFactory, PreconnectingFactory, SUGGESTED_CONNECT_CONFIG,
+    SUGGESTED_TLS_PRECONNECT_LIFETIME,
 };
-use libsignal_net::env::{add_user_agent_header, Env, Svr3Env, UserAgent};
+use libsignal_net::enclave::{Cdsi, EnclaveEndpoint, EnclaveEndpointConnection, EnclaveKind};
+use libsignal_net::env::{add_user_agent_header, Env, UserAgent};
 use libsignal_net::infra::connection_manager::MultiRouteConnectionManager;
 use libsignal_net::infra::dns::DnsResolver;
-use libsignal_net::infra::host::Host;
-use libsignal_net::infra::route::ConnectionOutcomeParams;
-use libsignal_net::infra::tcp_ssl::proxy::tls::TlsProxyConnector as TcpSslProxyConnector;
-use libsignal_net::infra::tcp_ssl::{DirectConnector as TcpSslDirectConnector, TcpSslConnector};
+use libsignal_net::infra::route::ConnectionProxyConfig;
+use libsignal_net::infra::tcp_ssl::{InvalidProxyConfig, TcpSslConnector};
 use libsignal_net::infra::timeouts::ONE_ROUTE_CONNECTION_TIMEOUT;
 use libsignal_net::infra::utils::ObservableEvent;
 use libsignal_net::infra::{EnableDomainFronting, EndpointConnection};
-use libsignal_net::svr::SvrConnection;
-use libsignal_net::svr3::traits::*;
-use libsignal_net::svr3::{Error, OpaqueMaskedShareSet};
-use libsignal_svr3::EvaluationResult;
 
 use crate::*;
 
@@ -49,39 +38,23 @@ pub enum Environment {
 }
 
 impl Environment {
-    pub fn env<'a>(self) -> Env<'a, Svr3Env<'a>> {
+    pub fn env(self) -> Env<'static> {
         match self {
             Self::Staging => libsignal_net::env::STAGING,
             Self::Prod => libsignal_net::env::PROD,
         }
     }
 }
-const CONNECT_PARAMS: ConnectionOutcomeParams = {
-    ConnectionOutcomeParams {
-        age_cutoff: Duration::from_secs(5 * 60),
-        cooldown_growth_factor: 10.0,
-        max_count: 5,
-        max_delay: Duration::from_secs(30),
-        count_growth_factor: 10.0,
-    }
-};
-
-type Svr3EndpointConnections = (
-    EnclaveEndpointConnection<Sgx, MultiRouteConnectionManager>,
-    EnclaveEndpointConnection<Nitro, MultiRouteConnectionManager>,
-    EnclaveEndpointConnection<Tpm2Snp, MultiRouteConnectionManager>,
-);
 
 struct EndpointConnections {
     chat: EndpointConnection<MultiRouteConnectionManager>,
     cdsi: EnclaveEndpointConnection<Cdsi, MultiRouteConnectionManager>,
-    svr3: Svr3EndpointConnections,
     enable_fronting: EnableDomainFronting,
 }
 
 impl EndpointConnections {
     fn new(
-        env: &Env<'static, Svr3Env<'static>>,
+        env: &Env<'static>,
         user_agent: &UserAgent,
         use_fallbacks: bool,
         network_change_event: &ObservableEvent,
@@ -102,31 +75,14 @@ impl EndpointConnections {
         );
         let cdsi =
             Self::endpoint_connection(&env.cdsi, user_agent, use_fallbacks, network_change_event);
-        let svr3 = (
-            Self::endpoint_connection(
-                env.svr3.sgx(),
-                user_agent,
-                use_fallbacks,
-                network_change_event,
-            ),
-            Self::endpoint_connection(
-                env.svr3.nitro(),
-                user_agent,
-                use_fallbacks,
-                network_change_event,
-            ),
-            Self::endpoint_connection(
-                env.svr3.tpm2snp(),
-                user_agent,
-                use_fallbacks,
-                network_change_event,
-            ),
-        );
         Self {
             chat,
             cdsi,
-            svr3,
-            enable_fronting: EnableDomainFronting(use_fallbacks),
+            enable_fronting: if use_fallbacks {
+                EnableDomainFronting::OneDomainPerProxy
+            } else {
+                EnableDomainFronting::No
+            },
         }
     }
 
@@ -155,14 +111,15 @@ impl EndpointConnections {
 }
 
 pub struct ConnectionManager {
-    env: Env<'static, Svr3Env<'static>>,
+    env: Env<'static>,
     user_agent: UserAgent,
     dns_resolver: DnsResolver,
-    connect: ::tokio::sync::RwLock<ConnectState>,
+    connect: ::tokio::sync::RwLock<ConnectState<PreconnectingFactory>>,
     // We could split this up to a separate mutex on each kind of connection,
     // but we don't hold it for very long anyway (just enough to clone the Arc).
     endpoints: std::sync::Mutex<Arc<EndpointConnections>>,
     transport_connector: std::sync::Mutex<TcpSslConnector>,
+    most_recent_network_change: std::sync::Mutex<Instant>,
     network_change_event: ObservableEvent,
 }
 
@@ -174,17 +131,14 @@ impl ConnectionManager {
         Self::new_from_static_environment(environment.env(), user_agent)
     }
 
-    pub fn new_from_static_environment(
-        env: Env<'static, Svr3Env<'static>>,
-        user_agent: &str,
-    ) -> Self {
+    pub fn new_from_static_environment(env: Env<'static>, user_agent: &str) -> Self {
         let network_change_event = ObservableEvent::new();
         let user_agent = UserAgent::with_libsignal_version(user_agent);
 
         let dns_resolver =
             DnsResolver::new_with_static_fallback(env.static_fallback(), &network_change_event);
         let transport_connector =
-            std::sync::Mutex::new(TcpSslDirectConnector::new(dns_resolver.clone()).into());
+            std::sync::Mutex::new(TcpSslConnector::new_direct(dns_resolver.clone()));
         let endpoints = std::sync::Mutex::new(
             EndpointConnections::new(&env, &user_agent, false, &network_change_event).into(),
         );
@@ -192,53 +146,38 @@ impl ConnectionManager {
             env,
             endpoints,
             user_agent,
-            connect: ConnectState::new(CONNECT_PARAMS),
+            connect: ConnectState::new_with_transport_connector(
+                SUGGESTED_CONNECT_CONFIG,
+                PreconnectingFactory::new(
+                    DefaultConnectorFactory,
+                    SUGGESTED_TLS_PRECONNECT_LIFETIME,
+                ),
+            ),
             dns_resolver,
             transport_connector,
+            most_recent_network_change: Instant::now().into(),
             network_change_event,
         }
     }
 
-    pub fn set_proxy(&self, host: &str, port: Option<NonZeroU16>) -> Result<(), std::io::Error> {
-        let host = Host::parse_as_ip_or_domain(host);
-
+    pub fn set_proxy(&self, proxy: ConnectionProxyConfig) {
         let mut guard = self.transport_connector.lock().expect("not poisoned");
-        match port {
-            Some(port) => {
-                let proxy_addr = (host, port);
-                match &mut *guard {
-                    TcpSslConnector::Direct(direct) => {
-                        *guard = direct.with_proxy(proxy_addr).into()
-                    }
-                    TcpSslConnector::Proxied(proxied) => proxied.set_proxy(proxy_addr),
-                    TcpSslConnector::Invalid(dns_resolver) => {
-                        *guard = TcpSslProxyConnector::new(dns_resolver.clone(), proxy_addr).into()
-                    }
-                };
-                Ok(())
-            }
-            None => {
-                match &*guard {
-                    TcpSslConnector::Direct(TcpSslDirectConnector { dns_resolver, .. })
-                    | TcpSslConnector::Proxied(TcpSslProxyConnector { dns_resolver, .. }) => {
-                        *guard = TcpSslConnector::Invalid(dns_resolver.clone())
-                    }
-                    TcpSslConnector::Invalid(_dns_resolver) => (),
-                }
-                Err(std::io::ErrorKind::InvalidInput.into())
-            }
-        }
+        guard.set_proxy(proxy);
+    }
+
+    pub fn set_invalid_proxy(&self) {
+        let mut guard = self.transport_connector.lock().expect("not poisoned");
+        guard.set_invalid();
     }
 
     pub fn clear_proxy(&self) {
         let mut guard = self.transport_connector.lock().expect("not poisoned");
-        match &*guard {
-            TcpSslConnector::Direct(_direct) => (),
-            TcpSslConnector::Proxied(TcpSslProxyConnector { dns_resolver, .. })
-            | TcpSslConnector::Invalid(dns_resolver) => {
-                *guard = TcpSslDirectConnector::new(dns_resolver.clone()).into()
-            }
-        };
+        guard.clear_proxy();
+    }
+
+    pub fn is_using_proxy(&self) -> Result<bool, InvalidProxyConfig> {
+        let guard = self.transport_connector.lock().expect("not poisoned");
+        guard.proxy().map(|proxy| proxy.is_some())
     }
 
     pub fn set_ipv6_enabled(&self, ipv6_enabled: bool) {
@@ -261,170 +200,40 @@ impl ConnectionManager {
         *self.endpoints.lock().expect("not poisoned") = Arc::new(new_endpoints);
     }
 
-    pub fn on_network_change(&self) {
-        self.network_change_event.fire()
+    const NETWORK_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
+
+    pub fn on_network_change(&self, now: Instant) {
+        {
+            let mut most_recent_change_guard = self
+                .most_recent_network_change
+                .lock()
+                .expect("not poisoned");
+            if now.saturating_duration_since(*most_recent_change_guard)
+                < Self::NETWORK_CHANGE_DEBOUNCE
+            {
+                log::info!("ConnectionManager: on_network_change (debounced)");
+                return;
+            }
+            *most_recent_change_guard = now;
+        }
+        log::info!("ConnectionManager: on_network_change");
+        self.network_change_event.fire();
+        self.connect.blocking_write().network_changed(now.into());
     }
 }
 
 bridge_as_handle!(ConnectionManager);
-
-pub enum PreviousVersion {}
-pub enum CurrentVersion {}
-
-pub struct Svr3Client<'a, Kind> {
-    connection_manager: &'a ConnectionManager,
-    auth: Auth,
-    kind: PhantomData<Kind>,
-}
-
-impl<'a, Kind> Svr3Client<'a, Kind> {
-    fn new(connection_manager: &'a ConnectionManager, auth: Auth) -> Self {
-        Self {
-            connection_manager,
-            auth,
-            kind: PhantomData,
-        }
-    }
-}
-
-pub struct Svr3Clients<'a> {
-    pub previous: Svr3Client<'a, PreviousVersion>,
-    pub current: Svr3Client<'a, CurrentVersion>,
-}
-
-impl<'a> Svr3Clients<'a> {
-    pub fn new(
-        connection_manager: &'a ConnectionManager,
-        username: String,
-        password: String,
-    ) -> Self {
-        let auth = Auth { username, password };
-        Self {
-            previous: Svr3Client::new(connection_manager, auth.clone()),
-            current: Svr3Client::new(connection_manager, auth),
-        }
-    }
-}
-
-#[async_trait]
-impl<'a> Svr3Connect for Svr3Client<'a, CurrentVersion> {
-    type Env = Svr3Env<'static>;
-
-    async fn connect(&self) -> <Self::Env as PpssSetup>::ConnectionResults {
-        let ConnectionManager {
-            endpoints,
-            transport_connector,
-            ..
-        } = &self.connection_manager;
-        let transport_connector = transport_connector.lock().expect("not poisoned").clone();
-        let endpoints = endpoints.lock().expect("not poisoned").clone();
-        let (sgx, nitro, tpm2snp) = &endpoints.svr3;
-        let (sgx, nitro, tpm2snp) = join3(
-            SvrConnection::connect(self.auth.clone(), sgx, transport_connector.clone()),
-            SvrConnection::connect(self.auth.clone(), nitro, transport_connector.clone()),
-            SvrConnection::connect(self.auth.clone(), tpm2snp, transport_connector),
-        )
-        .await;
-        (sgx, nitro, tpm2snp)
-    }
-}
-
-#[async_trait]
-impl<'a> Backup for Svr3Client<'a, PreviousVersion> {
-    async fn backup(
-        &self,
-        _password: &str,
-        _secret: [u8; 32],
-        _max_tries: NonZeroU32,
-        _rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<OpaqueMaskedShareSet, Error> {
-        empty_env::backup().await
-    }
-}
-
-#[async_trait]
-impl<'a> Restore for Svr3Client<'a, PreviousVersion> {
-    async fn restore(
-        &self,
-        _password: &str,
-        _share_set: OpaqueMaskedShareSet,
-        _rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<EvaluationResult, Error> {
-        empty_env::restore().await
-    }
-}
-
-#[async_trait]
-impl<'a> Remove for Svr3Client<'a, PreviousVersion> {
-    async fn remove(&self) -> Result<(), Error> {
-        empty_env::remove().await
-    }
-}
-
-#[async_trait]
-impl<'a> Query for Svr3Client<'a, PreviousVersion> {
-    async fn query(&self) -> Result<u32, Error> {
-        empty_env::query().await
-    }
-}
-
-#[async_trait]
-impl<'a> Rotate for Svr3Client<'a, PreviousVersion> {
-    async fn rotate(
-        &self,
-        _share_set: OpaqueMaskedShareSet,
-        _rng: &mut (impl CryptoRngCore + Send),
-    ) -> Result<(), Error> {
-        empty_env::rotate().await
-    }
-}
-
-// These functions define the behavior of the empty `PreviousVersion`
-// when there is no migration going on.
-// When there _is_ migration both current and previous clients should instead
-// implement `Svr3Connect` and use the blanket implementations of the traits.
-mod empty_env {
-    use super::*;
-
-    pub async fn backup() -> Result<OpaqueMaskedShareSet, Error> {
-        // Ideally it would be a panic, as this is certainly a programmer error
-        // that needs to be fixed. However, panics are propagated to the clients
-        // and become runtime exceptions that can be caught. This way we will
-        // don't change the set of expected errors on the client side, and get a
-        // descriptive message in the logs.
-        Err(Error::AttestationError(
-            attest::enclave::Error::AttestationDataError {
-                reason: "This SVR3 environment does not exist".to_string(),
-            },
-        ))
-    }
-
-    pub async fn restore() -> Result<EvaluationResult, Error> {
-        // This is the only error value that will make `restore_with_fallback`
-        // function effectively ignore this SVR3 setup, thus making it possible
-        // to use `restore_with_fallback` for all restores unconditionally.
-        Err(Error::DataMissing)
-    }
-
-    pub async fn remove() -> Result<(), Error> {
-        Ok(())
-    }
-
-    pub async fn query() -> Result<u32, Error> {
-        Err(Error::DataMissing)
-    }
-
-    pub async fn rotate() -> Result<(), Error> {
-        Ok(())
-    }
-}
+bridge_as_handle!(ConnectionProxyConfig);
 
 #[cfg(test)]
 mod test {
+    use ::tokio; // otherwise ambiguous with the tokio submodule
     use assert_matches::assert_matches;
+    use libsignal_net::chat::ConnectError;
     use test_case::test_case;
 
     use super::*;
+    use crate::net::chat::UnauthenticatedChatConnection;
 
     #[test_case(Environment::Staging; "staging")]
     #[test_case(Environment::Prod; "prod")]
@@ -432,12 +241,53 @@ mod test {
         let _ = ConnectionManager::new(env, "test-user-agent");
     }
 
+    // Normally we would write this test in the app languages, but it depends on timeouts.
+    // Using a paused tokio runtime auto-advances time when there's no other work to be done.
+    #[tokio::test(start_paused = true)]
+    async fn cannot_connect_through_invalid_proxy() {
+        let cm = ConnectionManager::new(Environment::Staging, "test-user-agent");
+        cm.set_invalid_proxy();
+        let err = UnauthenticatedChatConnection::connect(&cm)
+            .await
+            .map(|_| ())
+            .expect_err("should fail to connect");
+        assert_matches!(err, ConnectError::InvalidConnectionConfiguration);
+    }
+
     #[test]
-    fn connection_manager_invalid_after_invalid_host_port() {
-        let manager = ConnectionManager::new(Environment::Staging, "test-user-agent");
-        // This is not a valid port and so should make the ConnectionManager "invalid".
-        assert_matches!(manager.set_proxy("proxy.host", None), Err(e) if e.kind() == std::io::ErrorKind::InvalidInput);
-        let transport_connector = manager.transport_connector.lock().expect("not poisoned");
-        assert_matches!(&*transport_connector, TcpSslConnector::Invalid(_))
+    fn network_change_event_debounced() {
+        let cm = ConnectionManager::new(Environment::Staging, "test-user-agent");
+
+        let fire_count = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let _subscription = {
+            let fire_count = fire_count.clone();
+            cm.network_change_event.subscribe(Box::new(move || {
+                _ = fire_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }))
+        };
+
+        // The creation of the ConnectionManager sets the initial debounce timestamp,
+        // so let's say our first even happens well after that.
+        let start = Instant::now() + ConnectionManager::NETWORK_CHANGE_DEBOUNCE * 10;
+        cm.on_network_change(start);
+        assert_eq!(1, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start);
+        assert_eq!(1, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start + ConnectionManager::NETWORK_CHANGE_DEBOUNCE / 2);
+        assert_eq!(1, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start + ConnectionManager::NETWORK_CHANGE_DEBOUNCE);
+        assert_eq!(2, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start);
+        assert_eq!(2, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start + ConnectionManager::NETWORK_CHANGE_DEBOUNCE * 3 / 2);
+        assert_eq!(2, fire_count.load(std::sync::atomic::Ordering::SeqCst));
+
+        cm.on_network_change(start + ConnectionManager::NETWORK_CHANGE_DEBOUNCE * 4);
+        assert_eq!(3, fire_count.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

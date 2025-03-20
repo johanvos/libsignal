@@ -9,7 +9,7 @@ use crate::backup::chat::{ReactionError, ReactionSet};
 use crate::backup::file::{MessageAttachment, MessageAttachmentError};
 use crate::backup::frame::RecipientId;
 use crate::backup::method::LookupPair;
-use crate::backup::recipient::DestinationKind;
+use crate::backup::recipient::MinimalRecipientData;
 use crate::backup::serialize::SerializeOrder;
 use crate::backup::time::ReportUnusualTimestamp;
 use crate::backup::{TryFromWith, TryIntoWith as _};
@@ -19,7 +19,7 @@ use crate::proto::backup as proto;
 #[derive(Debug, serde::Serialize)]
 #[cfg_attr(test, derive_where(PartialEq; Recipient: PartialEq + SerializeOrder))]
 pub struct ViewOnceMessage<Recipient> {
-    pub attachment: Option<MessageAttachment>,
+    pub attachment: Option<Box<MessageAttachment>>,
     #[serde(bound(serialize = "Recipient: serde::Serialize + SerializeOrder"))]
     pub reactions: ReactionSet<Recipient>,
     _limit_construction_to_module: (),
@@ -34,7 +34,7 @@ pub enum ViewOnceMessageError {
     Reaction(#[from] ReactionError),
 }
 
-impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
     TryFromWith<proto::ViewOnceMessage, C> for ViewOnceMessage<R>
 {
     type Error = ViewOnceMessageError;
@@ -54,7 +54,7 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
         let reactions = reactions.try_into_with(context)?;
 
         Ok(Self {
-            attachment,
+            attachment: attachment.map(Box::new),
             reactions,
             _limit_construction_to_module: (),
         })
@@ -85,11 +85,8 @@ mod test {
         assert_eq!(
             proto::ViewOnceMessage::test_data().try_into_with(&TestContext::default()),
             Ok(ViewOnceMessage {
-                attachment: Some(MessageAttachment::from_proto_test_data()),
-                reactions: ReactionSet::from_iter([(
-                    TestContext::SELF_ID,
-                    Reaction::from_proto_test_data(),
-                )]),
+                attachment: Some(MessageAttachment::from_proto_test_data().into()),
+                reactions: ReactionSet::from_iter([Reaction::from_proto_test_data()]),
                 _limit_construction_to_module: ()
             })
         )

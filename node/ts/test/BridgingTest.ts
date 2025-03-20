@@ -110,4 +110,75 @@ describe('bridge_fn', () => {
   it('can process empty bytestring arrays', () => {
     assert.deepStrictEqual(Native.TESTING_ProcessBytestringArray([]), []);
   });
+
+  it('can round-trip various kinds of numbers', () => {
+    for (const value of [0, 1, 0x7f, 0x80, 0xff]) {
+      assert.strictEqual(value, Native.TESTING_RoundTripU8(value));
+    }
+    for (const value of [
+      -1,
+      0x100,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_VALUE,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]) {
+      assert.throws(() => Native.TESTING_RoundTripU8(value));
+    }
+
+    for (const value of [0, 1, 0x7fff, 0x8000, 0xffff]) {
+      assert.strictEqual(value, Native.TESTING_RoundTripU16(value));
+    }
+    for (const value of [
+      -1,
+      0x1_0000,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_VALUE,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]) {
+      assert.throws(() => Native.TESTING_RoundTripU16(value));
+    }
+
+    for (const value of [0, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff]) {
+      assert.strictEqual(value, Native.TESTING_RoundTripU32(value));
+    }
+    for (const value of [
+      -1,
+      0x1_0000_0000,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_VALUE,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]) {
+      assert.throws(() => Native.TESTING_RoundTripU32(value));
+    }
+
+    for (const value of [0, 1, 0x7fff_ffff, -0x8000_0000, -1]) {
+      assert.strictEqual(value, Native.TESTING_RoundTripI32(value));
+    }
+    for (const value of [
+      0x1_0000_0000,
+      -0x1_0000_0000,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_VALUE,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+    ]) {
+      assert.throws(() => Native.TESTING_RoundTripI32(value));
+    }
+
+    for (const value of [
+      0n,
+      1n,
+      0x7fff_ffff_ffff_ffffn,
+      0x8000_0000_0000_0000n,
+      0xffff_ffff_ffff_ffffn,
+    ]) {
+      assert.strictEqual(value, Native.TESTING_RoundTripU64(value));
+    }
+    for (const value of [-1n, 0x1_0000_0000_0000_0000n]) {
+      assert.throws(() => Native.TESTING_RoundTripU64(value));
+    }
+  });
 });

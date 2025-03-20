@@ -6,10 +6,10 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::{Add, Range, RangeInclusive};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
-use lazy_static::lazy_static;
 use poksho::args::{PointArgs, ScalarArgs};
 use poksho::{PokshoError, Statement};
 use rand::Rng;
@@ -20,20 +20,18 @@ use crate::constants::{
 };
 use crate::error::{ProofVerificationFailure, UsernameError};
 
-lazy_static! {
-    static ref PROOF_STATEMENT: Statement = {
-        let mut st = Statement::new();
-        st.add(
-            "username_hash",
-            &[
-                ("username_sha_scalar", "G1"),
-                ("nickname_scalar", "G2"),
-                ("discriminator_scalar", "G3"),
-            ],
-        );
-        st
-    };
-}
+static PROOF_STATEMENT: LazyLock<Statement> = LazyLock::new(|| {
+    let mut st = Statement::new();
+    st.add(
+        "username_hash",
+        &[
+            ("username_sha_scalar", "G1"),
+            ("nickname_scalar", "G2"),
+            ("discriminator_scalar", "G3"),
+        ],
+    );
+    st
+});
 
 #[derive(PartialEq)]
 pub struct Username {
@@ -44,7 +42,7 @@ pub struct Username {
 
 impl Display for Username {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.nickname, self.discriminator)
+        write!(f, "{}.{:02}", self.nickname, self.discriminator)
     }
 }
 
@@ -136,7 +134,7 @@ impl Username {
         *Self::hash_from_scalars(&self.scalars).compress().as_bytes()
     }
 
-    pub fn proof(&self, randomness: &[u8]) -> Result<Vec<u8>, UsernameError> {
+    pub fn proof(&self, randomness: &[u8; 32]) -> Result<Vec<u8>, UsernameError> {
         let hash = Self::hash_from_scalars(&self.scalars);
         let scalar_args = Self::make_scalar_args(&self.scalars);
         let point_args = Self::make_point_args(hash);
@@ -373,8 +371,12 @@ mod test {
 
     #[test]
     fn valid_usernames() {
-        for username in ["He110.01", "usr.999999999", "_identifier.42"] {
-            Username::new(username).map(|name| name.hash()).unwrap();
+        for username in ["He110.01", "usr.999999999", "_identifier.42", "LOUD.700"] {
+            let parsed = Username::new(username).unwrap();
+            _ = parsed.hash();
+            // Note that parsing is case-preserving even though username hashes are
+            // case-insensitive.
+            assert_eq!(parsed.to_string(), username);
         }
     }
 
@@ -497,7 +499,7 @@ mod test {
         proptest!(|(nickname in NICKNAME_PATTERN, discriminator in 1..DISCRIMINATOR_MAX)| {
             let username = Username::new(&Username::format_parts(&nickname, discriminator)).unwrap();
             let hash = username.hash();
-            let randomness: Vec<u8> = (1..33).collect();
+            let randomness = std::array::from_fn(|i| (i + 1).try_into().unwrap());
             let proof = username.proof(&randomness).unwrap();
             Username::verify_proof(&proof, hash).unwrap();
         });
@@ -506,7 +508,7 @@ mod test {
     #[test]
     fn many_random_makes_valid_usernames() {
         let mut rng = rand::thread_rng();
-        let randomness: Vec<u8> = (1..33).collect();
+        let randomness = std::array::from_fn(|i| (i + 1).try_into().unwrap());
         let nickname = "_SiGNA1";
         let candidates = Username::candidates_from(&mut rng, nickname, Default::default()).unwrap();
         for c in &candidates {

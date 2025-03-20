@@ -67,9 +67,6 @@ pub trait RemoteAddressInfo {
 /// Once the channel is established, creating the service is an infallible
 /// operation. Requests or queries sent to the service can still fail later, but
 /// the service is guaranteed to exist.
-///
-/// See [crate::chat::http::ChatOverHttp2ServiceConnector]
-/// and [crate::chat::ws::ChatOverWebSocketServiceConnector]
 #[async_trait]
 pub trait ServiceConnector: Clone {
     type Service;
@@ -125,9 +122,9 @@ impl<C: ServiceConnector> ServiceConnectorWithDecorator<C> {
 }
 
 #[async_trait]
-impl<'a, C> ServiceConnector for ServiceConnectorWithDecorator<C>
+impl<C> ServiceConnector for ServiceConnectorWithDecorator<C>
 where
-    C: ServiceConnector + Send + Sync + 'a,
+    C: ServiceConnector + Send + Sync,
 {
     type Service = C::Service;
     type Channel = C::Channel;
@@ -158,13 +155,15 @@ pub struct ServiceInitializer<C, M> {
     connection_manager: M,
 }
 
-impl<'a, C, M> ServiceInitializer<C, M>
+impl<C, M> ServiceInitializer<C, M>
 where
-    M: ConnectionManager + 'a,
-    C: ServiceConnector + Send + Sync + 'a,
-    C::Service: Send + Sync + 'a,
-    C::Channel: Send + Sync,
-    C::ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+    M: ConnectionManager,
+    C: ServiceConnector<
+            Service: Send,
+            Channel: Send,
+            ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+        > + Send
+        + Sync,
 {
     pub fn new(service_connector: C, connection_manager: M) -> Self {
         Self {
@@ -277,8 +276,7 @@ where
 
 impl<C, M> Service<C, M>
 where
-    C: ServiceConnector,
-    C::Service: RemoteAddressInfo,
+    C: ServiceConnector<Service: RemoteAddressInfo>,
 {
     pub async fn connection_info(&self) -> Result<ServiceConnectionInfo, StateError> {
         self.map_service(|s| s.connection_info().clone()).await
@@ -288,10 +286,13 @@ where
 impl<C, M> Service<C, M>
 where
     M: ConnectionManager + 'static,
-    C: ServiceConnector + Send + Sync + 'static,
-    C::Service: Clone + Send + Sync + 'static,
-    C::Channel: Send + Sync,
-    C::ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+    C: ServiceConnector<
+            Service: Clone + Send + Sync + 'static,
+            Channel: Send,
+            ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+        > + Send
+        + Sync
+        + 'static,
 {
     pub fn new(service_connector: C, connection_manager: M, connection_timeout: Duration) -> Self {
         Self {

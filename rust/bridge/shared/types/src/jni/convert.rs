@@ -9,6 +9,7 @@ use std::ops::Deref;
 use jni::objects::{AutoLocal, JByteBuffer, JMap, JObjectArray};
 use jni::sys::{jbyte, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
+use libsignal_account_keys::{AccountEntropyPool, InvalidAccountEntropyPool};
 use libsignal_net::cdsi::LookupResponseEntry;
 use libsignal_protocol::*;
 use paste::paste;
@@ -22,7 +23,7 @@ use std::convert::TryInto;
 
 use crate::io::{InputStream, SyncInputStream};
 use crate::message_backup::MessageBackupValidationOutcome;
-use crate::net::chat::{ChatListener, ResponseAndDebugInfo};
+use crate::net::chat::ChatListener;
 use crate::support::{Array, AsType, FixedLengthBincodeSerializable, Serialized};
 
 /// Converts arguments from their JNI form to their Rust form.
@@ -306,6 +307,19 @@ impl<'a> SimpleArgTypeInfo<'a> for Option<libsignal_core::E164> {
     }
 }
 
+impl<'a> SimpleArgTypeInfo<'a> for AccountEntropyPool {
+    type ArgType = <String as SimpleArgTypeInfo<'a>>::ArgType;
+    fn convert_from(
+        env: &mut JNIEnv<'a>,
+        foreign: &Self::ArgType,
+    ) -> Result<Self, BridgeLayerError> {
+        let pool = String::convert_from(env, foreign)?;
+        pool.parse().map_err(|e: InvalidAccountEntropyPool| {
+            BridgeLayerError::BadArgument(format!("bad account entropy pool: {e}"))
+        })
+    }
+}
+
 impl<'a> SimpleArgTypeInfo<'a> for Box<[u8]> {
     type ArgType = JByteArray<'a>;
 
@@ -534,6 +548,25 @@ impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param,
 }
 
 impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param, 'context>
+    for Box<dyn ChatListener>
+{
+    type ArgType = JObject<'context>;
+    type StoredType = Option<JniBridgeChatListener>;
+    fn borrow(
+        env: &mut JNIEnv<'context>,
+        store: &'param Self::ArgType,
+    ) -> Result<Self::StoredType, BridgeLayerError> {
+        if store.is_null() {
+            return Err(BridgeLayerError::NullPointer(Some("BridgeChatListener")));
+        }
+        Ok(Some(JniBridgeChatListener::new(env, store)?))
+    }
+    fn load_from(stored: &'storage mut Self::StoredType) -> Self {
+        stored.take().expect("not previously taken").into_listener()
+    }
+}
+
+impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param, 'context>
     for &'storage mut dyn GrpcReplyListener
 {
     type ArgType = JavaGrpcReplyListener<'param>;
@@ -729,6 +762,14 @@ impl ResultTypeInfo<'_> for bool {
 
 /// Supports all valid byte values `0..=255`.
 impl ResultTypeInfo<'_> for u8 {
+    type ResultType = jint;
+    fn convert_into(self, _env: &mut JNIEnv) -> Result<Self::ResultType, BridgeLayerError> {
+        Ok(self as jint)
+    }
+}
+
+/// Supports all valid byte values `0..=65536`.
+impl ResultTypeInfo<'_> for u16 {
     type ResultType = jint;
     fn convert_into(self, _env: &mut JNIEnv) -> Result<Self::ResultType, BridgeLayerError> {
         Ok(self as jint)
@@ -1126,8 +1167,7 @@ where
 
 impl<'a, T, P> SimpleArgTypeInfo<'a> for AsType<T, P>
 where
-    P: SimpleArgTypeInfo<'a> + TryInto<T>,
-    P::Error: Display,
+    P: SimpleArgTypeInfo<'a> + TryInto<T, Error: Display>,
 {
     type ArgType = P::ArgType;
 
@@ -1307,68 +1347,12 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::Response {
 
         new_instance(
             env,
-            ClassName("org.signal.libsignal.net.ChatService$Response"),
+            ClassName("org.signal.libsignal.net.ChatConnection$Response"),
             jni_args!((
                 status.as_u16().into() => int,
                 message_local => java.lang.String,
                 headers_jmap => java.util.Map,
                 body_arr => [byte]
-            ) -> void),
-        )
-    }
-}
-
-impl<'a> ResultTypeInfo<'a> for libsignal_net::chat::DebugInfo {
-    type ResultType = JObject<'a>;
-
-    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
-        let Self {
-            ip_type,
-            duration,
-            connection_info,
-        } = self;
-
-        // ip type as code
-        let ip_type_byte = ip_type.map_or(0, |i| i as i8);
-
-        // duration as millis
-        let duration_ms: i32 = duration.as_millis().try_into().expect("within i32 range");
-
-        // connection info string
-        let connection_info_string = env
-            .new_string(connection_info)
-            .check_exceptions(env, "DebugInfo::convert_into")?;
-
-        new_instance(
-            env,
-            ClassName("org.signal.libsignal.net.ChatService$DebugInfo"),
-            jni_args!((
-                ip_type_byte => byte,
-                duration_ms => int,
-                connection_info_string => java.lang.String,
-            ) -> void),
-        )
-    }
-}
-
-impl<'a> ResultTypeInfo<'a> for ResponseAndDebugInfo {
-    type ResultType = JObject<'a>;
-
-    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
-        let Self {
-            response,
-            debug_info,
-        } = self;
-
-        let response: JObject<'a> = response.convert_into(env)?;
-        let debug_info: JObject<'a> = debug_info.convert_into(env)?;
-
-        new_instance(
-            env,
-            ClassName("org.signal.libsignal.net.ChatService$ResponseAndDebugInfo"),
-            jni_args!((
-                response => org.signal.libsignal.net.ChatService::Response,
-                debug_info => org.signal.libsignal.net.ChatService::DebugInfo
             ) -> void),
         )
     }
@@ -1381,22 +1365,27 @@ impl<'a> ResultTypeInfo<'a> for ResponseAndDebugInfo {
 /// operation).
 ///
 /// [FindClass]: https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html#FindClass
-fn make_object_array<'a, It: IntoIterator>(
+fn make_object_array<'a, It>(
     env: &mut JNIEnv<'a>,
     element_type_signature: &str,
     it: It,
 ) -> Result<JObjectArray<'a>, BridgeLayerError>
 where
-    It::Item: ResultTypeInfo<'a>,
-    <It::Item as ResultTypeInfo<'a>>::ResultType: Into<JObject<'a>>,
-    It::IntoIter: ExactSizeIterator,
+    It: IntoIterator<
+        Item: ResultTypeInfo<'a, ResultType: Into<JObject<'a>>>,
+        IntoIter: ExactSizeIterator,
+    >,
 {
     let it = it.into_iter();
     let len = it.len();
     let array = env
         .new_object_array(
-            len.try_into()
-                .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{len}_usize to i32")))?,
+            len.try_into().map_err(|_| {
+                // This is not *really* the correct error, it will produce an
+                // IllegalArgumentException even though we're making a result. But also we shouldn't
+                // in practice try to return arrays of 2 billion objects.
+                BridgeLayerError::IntegerOverflow(format!("{len}_usize to i32"))
+            })?,
             element_type_signature,
             JavaObject::null(),
         )
@@ -1554,6 +1543,9 @@ macro_rules! jni_arg_type {
     (Option<Box<dyn ChatListener> >) =>{
         jni::JavaBridgeChatListener<'local>
     };
+    (Box<dyn ChatListener >) =>{
+        jni::JavaBridgeChatListener<'local>
+    };
     (&mut [u8]) => {
         ::jni::objects::JByteArray<'local>
     };
@@ -1574,6 +1566,9 @@ macro_rules! jni_arg_type {
     };
     (Pni) => {
         ::jni::objects::JByteArray<'local>
+    };
+    (AccountEntropyPool) => {
+        ::jni::objects::JString<'local>
     };
     (ServiceIdSequence<'_>) => {
         ::jni::objects::JByteArray<'local>
@@ -1680,6 +1675,10 @@ macro_rules! jni_result_type {
         // Note: not a jbyte. It's better to preserve the signedness here.
         ::jni::sys::jint
     };
+    (u16) => {
+        // Note: not a jshort. It's better to preserve the signedness here.
+        ::jni::sys::jint
+    };
     (i32) => {
         ::jni::sys::jint
     };
@@ -1750,12 +1749,6 @@ macro_rules! jni_result_type {
         ::jni::objects::JObject<'local>
     };
     (ChatResponse) => {
-        ::jni::objects::JObject<'local>
-    };
-    (ChatServiceDebugInfo) => {
-        ::jni::objects::JObject<'local>
-    };
-    (ResponseAndDebugInfo) => {
         ::jni::objects::JObject<'local>
     };
     (CiphertextMessage) => {

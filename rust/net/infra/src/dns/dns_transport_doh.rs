@@ -2,57 +2,31 @@
 // Copyright 2024 Signal Messenger, LLC.
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use const_str::ip_addr;
-use futures_util::stream::{BoxStream, FuturesUnordered};
+use futures_util::stream::FuturesUnordered;
+use futures_util::Stream;
 use http::uri::PathAndQuery;
 use http::{HeaderValue, Method};
 
 use crate::dns::custom_resolver::{DnsQueryResult, DnsTransport};
 use crate::dns::dns_errors::Error;
 use crate::dns::dns_lookup::DnsLookupRequest;
+use crate::dns::dns_message;
 use crate::dns::dns_message::{parse_a_record, parse_aaaa_record};
 use crate::dns::dns_types::ResourceType;
-use crate::dns::lookup_result::LookupResult;
-use crate::dns::{dns_message, DnsResolver};
 use crate::http_client::{http2_client, AggregatingHttp2Client};
-use crate::tcp_ssl::DirectConnector;
-use crate::{dns, ConnectionParams, DnsSource};
+use crate::route::{HttpsTlsRoute, ResolvedRoute, TcpRoute, TlsRoute};
+use crate::{dns, DnsSource};
 
-pub const CLOUDFLARE_NS: &str = "1.1.1.1";
-pub const MAX_RESPONSE_SIZE: usize = 10240;
-pub const KNOWN_NAMESERVERS: &[(&str, Ipv4Addr, Ipv6Addr)] = &[
-    (
-        CLOUDFLARE_NS,
-        ip_addr!(v4, "1.1.1.1"),
-        ip_addr!(v6, "2606:4700:4700::1111"),
-    ),
-    (
-        "dns.google",
-        ip_addr!(v4, "8.8.8.8"),
-        ip_addr!(v6, "2001:4860:4860::8888"),
-    ),
-];
-
-fn dns_resolver_for_known_ns(ipv6_enabled: bool) -> DnsResolver {
-    let map: HashMap<_, _> = KNOWN_NAMESERVERS
-        .iter()
-        .map(|(name, ipv4, ipv6)| {
-            (
-                *name,
-                LookupResult::new(DnsSource::Static, vec![*ipv4], vec![*ipv6]),
-            )
-        })
-        .collect();
-    let result = DnsResolver::new_from_static_map(map);
-    result.set_ipv6_enabled(ipv6_enabled);
-    result
-}
+pub(crate) const CLOUDFLARE_IPS: (Ipv4Addr, Ipv6Addr) = (
+    ip_addr!(v4, "1.1.1.1"),
+    ip_addr!(v6, "2606:4700:4700::1111"),
+);
+const MAX_RESPONSE_SIZE: usize = 10240;
 
 /// DNS transport that sends queries over HTTPS
 #[derive(Clone, Debug)]
@@ -60,23 +34,25 @@ pub struct DohTransport {
     http_client: AggregatingHttp2Client,
 }
 
-#[async_trait]
 impl DnsTransport for DohTransport {
-    type ConnectionParameters = ConnectionParams;
+    type ConnectionParameters = Vec<HttpsTlsRoute<TlsRoute<TcpRoute<IpAddr>>>>;
 
     fn dns_source() -> DnsSource {
         DnsSource::DnsOverHttpsLookup
     }
 
     async fn connect(
-        connection_params: Self::ConnectionParameters,
+        mut connection_params: Self::ConnectionParameters,
         ipv6_enabled: bool,
     ) -> dns::Result<Self> {
-        let connector = DirectConnector::new(dns_resolver_for_known_ns(ipv6_enabled));
-        match http2_client(&connector, connection_params, MAX_RESPONSE_SIZE).await {
+        let log_tag = "DNS-over-HTTPS".into();
+
+        connection_params.retain(|route| ipv6_enabled || route.immediate_target().is_ipv4());
+
+        match http2_client(connection_params, MAX_RESPONSE_SIZE, &log_tag).await {
             Ok(http_client) => Ok(Self { http_client }),
             Err(error) => {
-                log::error!("Failed to create HTTP2 client: {}", error);
+                log::error!("[{log_tag}] Failed to create HTTP2 client: {error}");
                 Err(Error::TransportFailure)
             }
         }
@@ -85,7 +61,7 @@ impl DnsTransport for DohTransport {
     async fn send_queries(
         self,
         request: DnsLookupRequest,
-    ) -> dns::Result<BoxStream<'static, dns::Result<DnsQueryResult>>> {
+    ) -> dns::Result<impl Stream<Item = dns::Result<DnsQueryResult>> + Send + 'static> {
         let arc = Arc::new(self);
         let futures = match request.ipv6_enabled {
             true => vec![
@@ -95,7 +71,7 @@ impl DnsTransport for DohTransport {
             ],
             false => vec![arc.clone().send_request(request.clone(), ResourceType::A)],
         };
-        Ok(Box::pin(FuturesUnordered::from_iter(futures)))
+        Ok(FuturesUnordered::from_iter(futures))
     }
 }
 

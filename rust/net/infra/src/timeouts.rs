@@ -21,7 +21,12 @@ pub const DNS_RESOLUTION_DELAY: Duration = Duration::from_millis(50);
 pub const DNS_CALL_BACKGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Frequency of the WebSocket `PING` requests
-pub const WS_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// Set to be slightly longer than the client keep-alive interval to minimize duplicate
+///   network usage.
+/// See: Signal-Android's KEEPALIVE_FREQUENCY_SECONDS OkHttpWebSocketConnection.java:58, and
+///      Signal-Desktop's KEEPALIVE_INTERVAL_MS at WebSocketResources.ts:1085,
+///    which are both thirty seconds.
+pub const WS_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(31);
 /// Maximum time of incoming packets inactivity allowed on a WebSocket connection
 pub const WS_MAX_IDLE_INTERVAL: Duration = Duration::from_secs(45);
 
@@ -52,3 +57,14 @@ pub const CONNECTION_ROUTE_COOLDOWN_INTERVALS: [Duration; 8] = [
 
 /// Maximum value of a coolduwn interval between connection attempts
 pub const CONNECTION_ROUTE_MAX_COOLDOWN: Duration = Duration::from_secs(64);
+
+/// The result of an operation that can time out or produce a value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, derive_more::From)]
+pub enum TimeoutOr<E> {
+    #[from(skip)]
+    Timeout {
+        /// How long the operation was allowed to run for before timing out.
+        attempt_duration: Duration,
+    },
+    Other(E),
+}

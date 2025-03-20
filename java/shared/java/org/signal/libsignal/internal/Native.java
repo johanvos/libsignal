@@ -70,7 +70,7 @@ public final class Native {
    * Package-private to allow the NativeTest class to load its shared library.
    * This method should only be called from a static initializer.
    */
-  static void loadLibrary(String name) throws IOException {
+  private static void loadLibrary(String name) throws IOException {
     String arch = System.getProperty("os.arch");
     // Special-case: some Java implementations use "x86_64", but OpenJDK uses "amd64".
     if ("x86_64".equals(arch)) {
@@ -90,6 +90,18 @@ public final class Native {
 
   private static void loadNativeCode() {
     try {
+      // First try to load the testing library. This will only succeed when
+      // libsignal is being used in a test context. The testing library
+      // contains a superset of the functionality of the non-test library, so if
+      // it gets loaded successfully, we're done.
+      loadLibrary("signal_jni_testing");
+      return;
+    } catch (Throwable e) {
+      // The testing library wasn't available. This is expected for production
+      // builds, so no error handling is needed. We'll try to load the non-test
+      // library next.
+    }
+    try {
       loadLibrary("signal_jni");
     } catch (Exception e) {
       throw new RuntimeException(e);
@@ -100,6 +112,11 @@ public final class Native {
     loadNativeCode();
     initializeLibrary();
   }
+
+  /**
+   * Ensures that the static initializer for this class gets run.
+   */
+  static void ensureLoaded() {}
 
   private Native() {}
 
@@ -121,6 +138,7 @@ public final class Native {
   public static native byte[] AccountEntropyPool_DeriveBackupKey(String accountEntropy);
   public static native byte[] AccountEntropyPool_DeriveSvrKey(String accountEntropy);
   public static native String AccountEntropyPool_Generate();
+  public static native boolean AccountEntropyPool_IsValid(String accountEntropy);
 
   public static native void Aes256Ctr32_Destroy(long handle);
   public static native long Aes256Ctr32_New(byte[] key, byte[] nonce, int initialCtr) throws Exception;
@@ -143,8 +161,6 @@ public final class Native {
 
   public static native Object AsyncLoadClass(Object tokioContext, String className);
 
-  public static native void AuthChat_Destroy(long handle);
-
   public static native void AuthCredentialPresentation_CheckValidContents(byte[] presentationBytes) throws Exception;
   public static native byte[] AuthCredentialPresentation_GetPniCiphertext(byte[] presentationBytes);
   public static native long AuthCredentialPresentation_GetRedemptionTime(byte[] presentationBytes);
@@ -153,6 +169,13 @@ public final class Native {
   public static native void AuthCredentialWithPniResponse_CheckValidContents(byte[] bytes) throws Exception;
 
   public static native void AuthCredentialWithPni_CheckValidContents(byte[] bytes) throws Exception;
+
+  public static native void AuthenticatedChatConnection_Destroy(long handle);
+  public static native CompletableFuture<Long> AuthenticatedChatConnection_connect(long asyncRuntime, long connectionManager, String username, String password, boolean receiveStories);
+  public static native CompletableFuture AuthenticatedChatConnection_disconnect(long asyncRuntime, long chat);
+  public static native void AuthenticatedChatConnection_init_listener(long chat, BridgeChatListener listener);
+  public static native CompletableFuture<Void> AuthenticatedChatConnection_preconnect(long asyncRuntime, long connectionManager);
+  public static native CompletableFuture<Object> AuthenticatedChatConnection_send(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
 
   public static native void BackupAuthCredentialPresentation_CheckValidContents(byte[] presentationBytes) throws Exception;
   public static native byte[] BackupAuthCredentialPresentation_GetBackupId(byte[] presentationBytes);
@@ -208,27 +231,19 @@ public final class Native {
   public static native void CdsiLookup_Destroy(long handle);
   public static native CompletableFuture<Object> CdsiLookup_complete(long asyncRuntime, long lookup);
   public static native CompletableFuture<Long> CdsiLookup_new(long asyncRuntime, long connectionManager, String username, String password, long request);
+  public static native CompletableFuture<Long> CdsiLookup_new_routes(long asyncRuntime, long connectionManager, String username, String password, long request);
   public static native byte[] CdsiLookup_token(long lookup);
-
-  public static native void ChatService_SetListenerAuth(long runtime, long chat, BridgeChatListener listener);
-  public static native void ChatService_SetListenerUnauth(long runtime, long chat, BridgeChatListener listener);
-  public static native CompletableFuture<Object> ChatService_auth_send(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
-  public static native CompletableFuture<Object> ChatService_auth_send_and_debug(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
-  public static native CompletableFuture<Object> ChatService_connect_auth(long asyncRuntime, long chat);
-  public static native CompletableFuture<Object> ChatService_connect_unauth(long asyncRuntime, long chat);
-  public static native CompletableFuture ChatService_disconnect_auth(long asyncRuntime, long chat);
-  public static native CompletableFuture ChatService_disconnect_unauth(long asyncRuntime, long chat);
-  public static native long ChatService_new_auth(long connectionManager, String username, String password, boolean receiveStories);
-  public static native long ChatService_new_unauth(long connectionManager);
-  public static native CompletableFuture<Object> ChatService_unauth_send(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
-  public static native CompletableFuture<Object> ChatService_unauth_send_and_debug(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
 
   public static native void ConnectionManager_Destroy(long handle);
   public static native void ConnectionManager_clear_proxy(long connectionManager);
   public static native long ConnectionManager_new(int environment, String userAgent);
   public static native void ConnectionManager_on_network_change(long connectionManager);
   public static native void ConnectionManager_set_censorship_circumvention_enabled(long connectionManager, boolean enabled);
-  public static native void ConnectionManager_set_proxy(long connectionManager, String host, int port) throws Exception;
+  public static native void ConnectionManager_set_invalid_proxy(long connectionManager);
+  public static native void ConnectionManager_set_proxy(long connectionManager, long proxy);
+
+  public static native void ConnectionProxyConfig_Destroy(long handle);
+  public static native long ConnectionProxyConfig_new(String scheme, String host, int port, String username, String password) throws Exception;
 
   public static native void CreateCallLinkCredentialPresentation_CheckValidContents(byte[] presentationBytes) throws Exception;
   public static native void CreateCallLinkCredentialPresentation_Verify(byte[] presentationBytes, byte[] roomId, long now, byte[] serverParamsBytes, byte[] callLinkParamsBytes) throws Exception;
@@ -292,7 +307,7 @@ public final class Native {
   public static native boolean ECPublicKey_Equals(long lhs, long rhs);
   public static native byte[] ECPublicKey_GetPublicKeyBytes(long obj) throws Exception;
   public static native byte[] ECPublicKey_Serialize(long obj) throws Exception;
-  public static native boolean ECPublicKey_Verify(long key, byte[] message, byte[] signature) throws Exception;
+  public static native boolean ECPublicKey_Verify(long key, byte[] message, byte[] signature);
 
   public static native void ExpiringProfileKeyCredentialResponse_CheckValidContents(byte[] buffer) throws Exception;
 
@@ -381,9 +396,10 @@ public final class Native {
   public static native byte[] IncrementalMac_Update(long mac, byte[] bytes, int offset, int length);
 
   public static native byte[] KeyTransparency_AciSearchKey(byte[] aci);
-  public static native CompletableFuture<byte[]> KeyTransparency_Distinguished(long asyncRuntime, int environment, long chat, byte[] lastDistinguishedTreeHead);
+  public static native CompletableFuture<byte[]> KeyTransparency_Distinguished(long asyncRuntime, int environment, long chatConnection, byte[] lastDistinguishedTreeHead);
   public static native byte[] KeyTransparency_E164SearchKey(String e164);
-  public static native CompletableFuture<Long> KeyTransparency_Search(long asyncRuntime, int environment, long chat, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
+  public static native CompletableFuture<byte[]> KeyTransparency_Monitor(long asyncRuntime, int environment, long chatConnection, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
+  public static native CompletableFuture<Long> KeyTransparency_Search(long asyncRuntime, int environment, long chatConnection, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
   public static native byte[] KeyTransparency_UsernameHashSearchKey(byte[] hash);
 
   public static native void KyberKeyPair_Destroy(long handle);
@@ -432,6 +448,7 @@ public final class Native {
   public static native Object MessageBackupValidator_Validate(long key, InputStream firstStream, InputStream secondStream, long len, int purpose) throws Exception;
 
   public static native long Mp4Sanitizer_Sanitize(InputStream input, long len) throws Exception;
+  public static native long Mp4Sanitizer_Sanitize_File_With_Compounded_MDAT_Boxes(InputStream input, long len, int cumulativeMdatBoxSize) throws Exception;
 
   public static native void NumericFingerprintGenerator_Destroy(long handle);
   public static native String NumericFingerprintGenerator_GetDisplayString(long obj) throws Exception;
@@ -612,7 +629,7 @@ public final class Native {
   public static native long ServerCertificate_New(int keyId, long serverKey, long trustRoot) throws Exception;
 
   public static native void ServerMessageAck_Destroy(long handle);
-  public static native CompletableFuture<Void> ServerMessageAck_Send(long asyncRuntime, long ack);
+  public static native void ServerMessageAck_Send(long ack) throws Exception;
 
   public static native byte[] ServerPublicParams_CreateAuthCredentialWithPniPresentationDeterministic(long serverPublicParams, byte[] randomness, byte[] groupSecretParams, byte[] authCredentialWithPniBytes);
   public static native byte[] ServerPublicParams_CreateExpiringProfileKeyCredentialPresentationDeterministic(long serverPublicParams, byte[] randomness, byte[] groupSecretParams, byte[] profileKeyCredential);
@@ -621,6 +638,7 @@ public final class Native {
   public static native byte[] ServerPublicParams_CreateReceiptCredentialRequestContextDeterministic(long serverPublicParams, byte[] randomness, byte[] receiptSerial);
   public static native long ServerPublicParams_Deserialize(byte[] buffer) throws Exception;
   public static native void ServerPublicParams_Destroy(long handle);
+  public static native byte[] ServerPublicParams_GetEndorsementPublicKey(long params);
   public static native byte[] ServerPublicParams_ReceiveAuthCredentialWithPniAsServiceId(long params, byte[] aci, byte[] pni, long redemptionTime, byte[] authCredentialWithPniResponseBytes) throws Exception;
   public static native byte[] ServerPublicParams_ReceiveExpiringProfileKeyCredential(long serverPublicParams, byte[] requestContext, byte[] response, long currentTimeInSeconds) throws Exception;
   public static native byte[] ServerPublicParams_ReceiveReceiptCredential(long serverPublicParams, byte[] requestContext, byte[] response) throws Exception;
@@ -631,7 +649,6 @@ public final class Native {
   public static native void ServerSecretParams_Destroy(long handle);
   public static native long ServerSecretParams_GenerateDeterministic(byte[] randomness);
   public static native long ServerSecretParams_GetPublicParams(long params);
-  public static native byte[] ServerSecretParams_IssueAuthCredentialWithPniAsServiceIdDeterministic(long serverSecretParams, byte[] randomness, byte[] aci, byte[] pni, long redemptionTime);
   public static native byte[] ServerSecretParams_IssueAuthCredentialWithPniZkcDeterministic(long serverSecretParams, byte[] randomness, byte[] aci, byte[] pni, long redemptionTime);
   public static native byte[] ServerSecretParams_IssueExpiringProfileKeyCredentialDeterministic(long serverSecretParams, byte[] randomness, byte[] request, byte[] userId, byte[] commitment, long expirationInSeconds) throws Exception;
   public static native byte[] ServerSecretParams_IssueReceiptCredentialDeterministic(long serverSecretParams, byte[] randomness, byte[] request, long receiptExpirationTime, long receiptLevel);
@@ -701,21 +718,16 @@ public final class Native {
 
   public static native long Svr2Client_New(byte[] mrenclave, byte[] attestationMsg, long currentTimestamp) throws Exception;
 
-  public static native CompletableFuture<byte[]> Svr3Backup(long asyncRuntime, long connectionManager, byte[] secret, String password, int maxTries, String username, String enclavePassword);
-
-  public static native CompletableFuture<byte[]> Svr3Migrate(long asyncRuntime, long connectionManager, byte[] secret, String password, int maxTries, String username, String enclavePassword);
-
-  public static native CompletableFuture<Void> Svr3Remove(long asyncRuntime, long connectionManager, String username, String enclavePassword);
-
-  public static native CompletableFuture<byte[]> Svr3Restore(long asyncRuntime, long connectionManager, String password, byte[] shareSet, String username, String enclavePassword);
-
-  public static native CompletableFuture<Void> Svr3Rotate(long asyncRuntime, long connectionManager, byte[] shareSet, String username, String enclavePassword);
-
   public static native void TokioAsyncContext_Destroy(long handle);
   public static native void TokioAsyncContext_cancel(long context, long rawCancellationId);
   public static native long TokioAsyncContext_new();
 
-  public static native void UnauthChat_Destroy(long handle);
+  public static native void UnauthenticatedChatConnection_Destroy(long handle);
+  public static native CompletableFuture<Long> UnauthenticatedChatConnection_connect(long asyncRuntime, long connectionManager);
+  public static native CompletableFuture UnauthenticatedChatConnection_disconnect(long asyncRuntime, long chat);
+  public static native long UnauthenticatedChatConnection_info(long chat);
+  public static native void UnauthenticatedChatConnection_init_listener(long chat, BridgeChatListener listener);
+  public static native CompletableFuture<Object> UnauthenticatedChatConnection_send(long asyncRuntime, long chat, long httpRequest, int timeoutMillis);
 
   public static native long UnidentifiedSenderMessageContent_Deserialize(byte[] data) throws Exception;
   public static native void UnidentifiedSenderMessageContent_Destroy(long handle);

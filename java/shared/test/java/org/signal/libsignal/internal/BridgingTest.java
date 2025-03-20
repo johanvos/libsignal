@@ -96,4 +96,45 @@ public class BridgingTest {
     assertArrayEquals(
         NativeTesting.TESTING_ProcessBytestringArray(new ByteBuffer[] {}), new byte[][] {});
   }
+
+  @Test
+  public void testIntegerRoundTrips() {
+    // Java doesn't have unsigned integers. We handle this differently for different types.
+
+    // For u8, we pass values as int.
+    for (var value : new int[] {0, 1, 0x7f, 0x80, 0xff}) {
+      assertEquals(value, NativeTesting.TESTING_RoundTripU8(value));
+    }
+    for (var value : new int[] {0x100, -1, Integer.MIN_VALUE, Integer.MAX_VALUE}) {
+      assertThrows(IllegalArgumentException.class, () -> NativeTesting.TESTING_RoundTripU8(value));
+    }
+
+    // For u16, we pass values as int.
+    for (var value : new int[] {0, 1, 0x7fff, 0x8000, 0xffff}) {
+      assertEquals(value, NativeTesting.TESTING_RoundTripU16(value));
+    }
+    for (var value : new int[] {0x1_0000, -1, Integer.MIN_VALUE, Integer.MAX_VALUE}) {
+      assertThrows(IllegalArgumentException.class, () -> NativeTesting.TESTING_RoundTripU16(value));
+    }
+
+    // For u32, we only support passing positive values. (We actually support *returning* large
+    // values by reinterpreting the bits, but this API can't test that.)
+    for (var value : new int[] {0, 1, Integer.MAX_VALUE}) {
+      assertEquals(value, NativeTesting.TESTING_RoundTripU32(value));
+    }
+    for (var value : new int[] {-1, Integer.MIN_VALUE}) {
+      assertThrows(IllegalArgumentException.class, () -> NativeTesting.TESTING_RoundTripU32(value));
+    }
+
+    // And for u64, we reinterpret the bits, which means we can round trip but negative values are
+    // treated as large positive ones.
+    for (var value : new long[] {0, 1, -1, Long.MAX_VALUE, Long.MIN_VALUE}) {
+      assertEquals(value, NativeTesting.TESTING_RoundTripU64(value));
+    }
+
+    // Signed integers we can handle directly.
+    for (var value : new int[] {0, 1, -1, Integer.MIN_VALUE, Integer.MAX_VALUE}) {
+      assertEquals(value, NativeTesting.TESTING_RoundTripI32(value));
+    }
+  }
 }

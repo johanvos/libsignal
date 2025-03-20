@@ -4,7 +4,7 @@
 //
 
 use crate::backup::file::{FilePointer, FilePointerError};
-use crate::backup::time::{ReportUnusualTimestamp, Timestamp};
+use crate::backup::time::{ReportUnusualTimestamp, Timestamp, TimestampError};
 use crate::backup::TryFromWith;
 use crate::proto::backup as proto;
 
@@ -21,8 +21,12 @@ pub struct LinkPreview {
 #[derive(Debug, displaydoc::Display, thiserror::Error)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum LinkPreviewError {
+    /// missing url
+    EmptyUrl,
     /// image: {0}
     Image(FilePointerError),
+    /// {0}
+    InvalidTimestamp(#[from] TimestampError),
 }
 
 impl<C: ReportUnusualTimestamp> TryFromWith<proto::LinkPreview, C> for LinkPreview {
@@ -38,7 +42,13 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::LinkPreview, C> for LinkPrevi
             special_fields: _,
         } = value;
 
-        let date = date.map(|d| Timestamp::from_millis(d, "LinkPreview.date", context));
+        if url.is_empty() {
+            return Err(LinkPreviewError::EmptyUrl);
+        }
+
+        let date = date
+            .map(|d| Timestamp::from_millis(d, "LinkPreview.date", context))
+            .transpose()?;
 
         let image = image
             .into_option()
@@ -78,13 +88,18 @@ mod test {
     }
 
     #[test_case(|_| {} => Ok(()); "valid")]
-    #[test_case(|x| x.url = "".into() => Ok(()); "empty url")]
+    #[test_case(|x| x.url = "".into() => Err(LinkPreviewError::EmptyUrl); "empty url")]
     #[test_case(|x| x.title = None => Ok(()); "no title")]
     #[test_case(|x| x.title = Some("".into()) => Ok(()); "empty title")]
     #[test_case(|x| x.image = None.into() => Ok(()); "no image")]
     #[test_case(|x| x.image = Some(proto::FilePointer::default()).into() => Err(LinkPreviewError::Image(FilePointerError::NoLocator)); "invalid image")]
     #[test_case(|x| x.description = None => Ok(()); "no description")]
     #[test_case(|x| x.description = Some("".into()) => Ok(()); "empty description")]
+    #[test_case(
+        |x| x.date = Some(MillisecondsSinceEpoch::FAR_FUTURE.0) =>
+        Err(LinkPreviewError::InvalidTimestamp(TimestampError("LinkPreview.date", MillisecondsSinceEpoch::FAR_FUTURE.0)));
+        "invalid timestamp"
+    )]
     fn link_preview(
         modifier: impl FnOnce(&mut proto::LinkPreview),
     ) -> Result<(), LinkPreviewError> {

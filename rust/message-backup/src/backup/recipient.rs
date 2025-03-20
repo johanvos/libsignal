@@ -7,20 +7,19 @@ use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use derive_where::derive_where;
+use intmap::IntMap;
 use itertools::Itertools as _;
 use libsignal_core::{Aci, Pni, ServiceIdKind};
 use libsignal_protocol::IdentityKey;
 use uuid::Uuid;
 use zkgroup::ProfileKeyBytes;
 
-use crate::backup::call::{CallLink, CallLinkError};
+use crate::backup::call::{CallLink, CallLinkError, CallLinkRootKey};
 use crate::backup::frame::RecipientId;
-use crate::backup::map::IntMap;
-use crate::backup::method::{LookupPair, Method, Store, ValidateOnly};
+use crate::backup::method::LookupPair;
 use crate::backup::serialize::{self, SerializeOrder, UnorderedList};
-use crate::backup::time::{ReportUnusualTimestamp, Timestamp};
-use crate::backup::{ReferencedTypes, TryFromWith, TryIntoWith};
+use crate::backup::time::{ReportUnusualTimestamp, Timestamp, TimestampError};
+use crate::backup::{TryFromWith, TryIntoWith};
 use crate::proto::backup as proto;
 use crate::proto::backup::recipient::Destination as RecipientDestination;
 
@@ -32,6 +31,8 @@ pub(crate) const MY_STORY_UUID: Uuid = Uuid::nil();
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum RecipientError {
+    /// 0 is not a valid recipient ID
+    InvalidId,
     /// multiple frames with the same ID
     DuplicateRecipient,
     /// Recipient.destination is a oneof but is empty
@@ -46,6 +47,8 @@ pub enum RecipientError {
     InvalidIdentityKey,
     /// missing identity key for contact marked {0:?}
     MissingIdentityKey(proto::contact::IdentityState),
+    /// Contact.nickname is present but empty
+    NicknameIsPresentButEmpty,
     /// distribution destination has invalid UUID
     InvalidDistributionId,
     /// invalid group: {0}
@@ -53,6 +56,7 @@ pub enum RecipientError {
     /// contact has neither an ACI, nor a PNI, nor an e164
     ContactHasNoIdentifiers,
     /// contact has a PNI but no e164
+    #[allow(dead_code)] // See the commented-out use site in this file.
     PniWithoutE164,
     /// contact registered value is UNKNOWN
     ContactRegistrationUnknown,
@@ -62,6 +66,8 @@ pub enum RecipientError {
     DistributionListPrivacyInvalid(proto::distribution_list::PrivacyMode),
     /// distribution list has members but has privacy ALL
     DistributionListPrivacyAllWithNonemptyMembers,
+    /// distribution list has no members but has privacy ALL_EXCEPT
+    DistributionListPrivacyAllExceptWithEmptyMembers,
     /// invalid call link: {0}
     InvalidCallLink(#[from] CallLinkError),
     /// contact has invalid username
@@ -76,59 +82,163 @@ pub enum RecipientError {
     DistributionListMemberDuplicate(RecipientId),
     /// distribution list member {0:?} is a {1:?} not a contact
     DistributionListMemberWrongKind(RecipientId, DestinationKind),
+    /// distribution list member {0:?} is a contact with no service IDs
+    DistributionListMemberHasNoServiceIds(RecipientId),
+    /// {0}
+    InvalidTimestamp(#[from] TimestampError),
 }
 
 /// Data kept in-memory from a [`proto::Recipient`] for [`ValidateOnly`] mode.
 ///
-/// This is intentionally the minimal amount of data required to validate later
-/// frames.
-#[derive(Debug)]
+/// This is intentionally the minimal amount of data required to validate later frames.
+///
+/// Supports Clone but not Copy, both in case we eventually have non-Copy fields and because it's
+/// still a bit big to copy around without thinking about it.
+#[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct MinimalRecipientData(DestinationKind);
+pub enum MinimalRecipientData {
+    Contact {
+        e164: Option<E164>,
+        aci: Option<Aci>,
+        pni: Option<Pni>,
+    },
+    Group {
+        master_key: zkgroup::GroupMasterKeyBytes,
+    },
+    DistributionList {
+        distribution_id: Uuid,
+    },
+    Self_,
+    ReleaseNotes,
+    CallLink {
+        root_key: CallLinkRootKey,
+    },
+}
+
+/// Minimal information about the recipient in a [`proto::Chat`].
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub enum ChatRecipientKind {
+    Self_,
+    ReleaseNotes,
+    Contact { has_aci: bool },
+    Group,
+}
+
+impl ChatRecipientKind {
+    /// Returns true iff `self` is a contact or the Self recipient.
+    pub fn is_individual(&self) -> bool {
+        match self {
+            Self::Contact { .. } => true,
+            Self::Group { .. } => false,
+            Self::Self_ => true,
+            Self::ReleaseNotes => false,
+        }
+    }
+
+    /// Returns true iff `self` is a contact with an ACI.
+    pub fn is_contact_with_aci(&self) -> bool {
+        match *self {
+            Self::Contact { has_aci } => has_aci,
+            Self::Group => false,
+            Self::ReleaseNotes => false,
+            Self::Self_ => false,
+        }
+    }
+}
+
+impl From<ChatRecipientKind> for DestinationKind {
+    fn from(value: ChatRecipientKind) -> Self {
+        match value {
+            ChatRecipientKind::Self_ => Self::Self_,
+            ChatRecipientKind::ReleaseNotes => Self::ReleaseNotes,
+            ChatRecipientKind::Group => Self::Group,
+            ChatRecipientKind::Contact { has_aci: _ } => Self::Contact,
+        }
+    }
+}
+
+impl TryFrom<&MinimalRecipientData> for ChatRecipientKind {
+    type Error = DestinationKind;
+
+    fn try_from(value: &MinimalRecipientData) -> Result<Self, Self::Error> {
+        Ok(match value {
+            MinimalRecipientData::Contact { aci, .. } => Self::Contact {
+                has_aci: aci.is_some(),
+            },
+            MinimalRecipientData::Group { .. } => Self::Group,
+            MinimalRecipientData::Self_ => Self::Self_,
+            MinimalRecipientData::ReleaseNotes => Self::ReleaseNotes,
+            kind @ (MinimalRecipientData::DistributionList { .. }
+            | MinimalRecipientData::CallLink { .. }) => return Err(*kind.as_ref()),
+        })
+    }
+}
+
+/// Minimal information about the author in a [`proto::ChatItem`].
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub enum ChatItemAuthorKind {
+    Self_,
+    ReleaseNotes,
+    Contact { has_e164: bool, has_aci: bool },
+}
+
+impl ChatItemAuthorKind {
+    /// Returns true iff `self` is a contact with an ACI or E164, or the Self recipient.
+    ///
+    /// Note that this **excludes `ReleaseNotes`**, hence "sender *account*".
+    pub fn is_valid_sender_account(&self) -> bool {
+        match *self {
+            ChatItemAuthorKind::Contact { has_e164, has_aci } => has_e164 || has_aci,
+            ChatItemAuthorKind::Self_ => true,
+            ChatItemAuthorKind::ReleaseNotes => false,
+        }
+    }
+
+    /// Returns true iff `self` is a contact with an ACI.
+    pub fn is_contact_with_aci(&self) -> bool {
+        match *self {
+            ChatItemAuthorKind::Contact {
+                has_e164: _,
+                has_aci,
+            } => has_aci,
+            ChatItemAuthorKind::Self_ => false,
+            ChatItemAuthorKind::ReleaseNotes => false,
+        }
+    }
+}
+
+impl AsRef<MinimalRecipientData> for MinimalRecipientData {
+    fn as_ref(&self) -> &MinimalRecipientData {
+        self
+    }
+}
 
 /// Data kept in-memory from a [`proto::Recipient`] for [`Store`] mode.
 ///
 /// This keeps the full data in memory behind a [`Arc`] so it can be cheaply
 /// cloned when referenced by later frames.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct FullRecipientData(Arc<Destination<Store>>);
+#[derive(Clone, Debug)]
+pub struct FullRecipientData(Arc<(MinimalRecipientData, Destination<FullRecipientData>)>);
 
-#[derive_where(Debug)]
-#[cfg_attr(test,
-    derive_where(PartialEq;
-        M::Value<ContactData>: PartialEq,
-        M::Value<GroupData>: PartialEq,
-        M::Value<DistributionListItem<M::RecipientReference>>: PartialEq,
-        M::Value<CallLink>: PartialEq
-    )
-)]
-#[derive(serde::Serialize, strum::EnumDiscriminants)]
+impl serde::Serialize for FullRecipientData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0 .1.serialize(serializer)
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, strum::EnumDiscriminants)]
+#[cfg_attr(test, derive(PartialEq))]
 #[strum_discriminants(name(DestinationKind))]
-pub enum Destination<M: Method + ReferencedTypes> {
-    Contact(M::Value<ContactData>),
-    Group(M::Value<GroupData>),
-    DistributionList(M::Value<DistributionListItem<M::RecipientReference>>),
-    Self_,
+pub enum Destination<R> {
+    Contact(ContactData),
+    Group(GroupData),
+    #[serde(bound(serialize = "DistributionListItem<R>: serde::Serialize"))]
+    DistributionList(DistributionListItem<R>),
+    Self_(SelfData),
     ReleaseNotes,
-    CallLink(M::Value<CallLink>),
-}
-
-impl DestinationKind {
-    pub fn is_individual(&self) -> bool {
-        match self {
-            DestinationKind::Contact | DestinationKind::Self_ => true,
-            DestinationKind::Group
-            | DestinationKind::DistributionList
-            | DestinationKind::ReleaseNotes
-            | DestinationKind::CallLink => false,
-        }
-    }
-}
-
-impl AsRef<DestinationKind> for DestinationKind {
-    fn as_ref(&self) -> &DestinationKind {
-        self
-    }
+    CallLink(CallLink),
 }
 
 /// Represents a phone number in E.164 format.
@@ -138,7 +248,7 @@ impl AsRef<DestinationKind> for DestinationKind {
 /// The ordering should be considered arbitrary; a proper ordering of E164s would use a
 /// lexicographic ordering of the decimal digits, but that costs more in CPU. Use the string
 /// representation as a sort key if sorting for human consumption.
-#[derive(Debug, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, serde::Serialize, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 #[serde(transparent)]
 pub struct E164(NonZeroU64);
 
@@ -162,7 +272,7 @@ impl std::fmt::Display for E164 {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct ContactData {
     #[serde(serialize_with = "serialize::optional_service_id_as_string")]
@@ -185,9 +295,30 @@ pub struct ContactData {
     pub identity_key: Option<IdentityKey>,
     #[serde(serialize_with = "serialize::enum_as_string")]
     pub identity_state: proto::contact::IdentityState,
+    pub nickname: Option<ContactName>,
+    pub note: String,
+    pub system_given_name: String,
+    pub system_family_name: String,
+    pub system_nickname: String,
+    #[serde(serialize_with = "serialize::optional_enum_as_string")]
+    pub avatar_color: Option<proto::AvatarColor>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct ContactName {
+    pub given_name: String,
+    pub family_name: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct SelfData {
+    #[serde(serialize_with = "serialize::optional_enum_as_string")]
+    pub avatar_color: Option<proto::AvatarColor>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum DistributionListItem<Recipient> {
     Deleted {
@@ -203,14 +334,14 @@ pub enum DistributionListItem<Recipient> {
     },
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum Registration {
     NotRegistered { unregistered_at: Option<Timestamp> },
     Registered,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum PrivacyMode<RecipientList> {
     OnlyWith(RecipientList),
@@ -220,37 +351,64 @@ pub enum PrivacyMode<RecipientList> {
 
 impl AsRef<DestinationKind> for MinimalRecipientData {
     fn as_ref(&self) -> &DestinationKind {
-        &self.0
+        // We cheat by returning static references. That's fine since these are
+        // just discriminants; they don't represent the actual data from the
+        // enum values.
+        match self {
+            Self::Contact { .. } => &DestinationKind::Contact,
+            Self::Group { .. } => &DestinationKind::Group,
+            Self::DistributionList { .. } => &DestinationKind::DistributionList,
+            Self::Self_ => &DestinationKind::Self_,
+            Self::ReleaseNotes => &DestinationKind::ReleaseNotes,
+            Self::CallLink { .. } => &DestinationKind::CallLink,
+        }
     }
 }
 
 impl std::ops::Deref for FullRecipientData {
-    type Target = Destination<Store>;
+    type Target = Destination<FullRecipientData>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.0 .1
     }
 }
 
-impl<C: LookupPair<RecipientId, DestinationKind, RecipientId> + ReportUnusualTimestamp>
-    TryFromWith<proto::Recipient, C> for MinimalRecipientData
-{
-    type Error = RecipientError;
-
-    fn try_from_with(item: proto::Recipient, context: &C) -> Result<Self, Self::Error> {
-        let destination: Destination<ValidateOnly> = item.try_into_with(context)?;
-        Ok(Self(*destination.as_ref()))
+impl<R> From<Destination<R>> for MinimalRecipientData {
+    fn from(value: Destination<R>) -> Self {
+        match value {
+            Destination::Contact(ContactData { aci, pni, e164, .. }) => {
+                Self::Contact { e164, aci, pni }
+            }
+            Destination::Group(GroupData { master_key, .. }) => Self::Group { master_key },
+            Destination::DistributionList(
+                DistributionListItem::Deleted {
+                    distribution_id, ..
+                }
+                | DistributionListItem::List {
+                    distribution_id, ..
+                },
+            ) => Self::DistributionList { distribution_id },
+            Destination::Self_(_) => Self::Self_,
+            Destination::ReleaseNotes => Self::ReleaseNotes,
+            Destination::CallLink(CallLink { root_key, .. }) => Self::CallLink { root_key },
+        }
     }
 }
 
 impl FullRecipientData {
-    pub(crate) fn new(data: Destination<Store>) -> Self {
-        Self(Arc::new(data))
+    pub(crate) fn new(data: Destination<FullRecipientData>) -> Self {
+        // Cloning the data to convert it to a MinimalRecipientData isn't very efficient,
+        // but it doesn't need to be for the time being.
+        Self(Arc::new((data.clone().into(), data)))
+    }
+
+    pub(crate) fn is_same_reference(&self, other: &FullRecipientData) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl AsRef<DestinationKind> for FullRecipientData {
-    fn as_ref(&self) -> &DestinationKind {
-        self.0.as_ref().as_ref()
+impl AsRef<MinimalRecipientData> for FullRecipientData {
+    fn as_ref(&self) -> &MinimalRecipientData {
+        &self.0 .0
     }
 }
 
@@ -260,13 +418,9 @@ impl AsRef<Self> for FullRecipientData {
     }
 }
 
-impl<C: LookupPair<RecipientId, DestinationKind, Self> + ReportUnusualTimestamp>
-    TryFromWith<proto::Recipient, C> for FullRecipientData
-{
-    type Error = RecipientError;
-
-    fn try_from_with(item: proto::Recipient, context: &C) -> Result<Self, Self::Error> {
-        item.try_into_with(context).map(Self::new)
+impl From<Destination<FullRecipientData>> for FullRecipientData {
+    fn from(value: Destination<FullRecipientData>) -> Self {
+        Self::new(value)
     }
 }
 
@@ -277,7 +431,7 @@ impl PartialEq for FullRecipientData {
     }
 }
 
-impl<M: Method + ReferencedTypes> AsRef<DestinationKind> for Destination<M> {
+impl<R> AsRef<DestinationKind> for Destination<R> {
     fn as_ref(&self) -> &DestinationKind {
         // We cheat by returning static references. That's fine since these are
         // just discriminants; they don't represent the actual data from the
@@ -286,17 +440,15 @@ impl<M: Method + ReferencedTypes> AsRef<DestinationKind> for Destination<M> {
             Destination::Contact(_) => &DestinationKind::Contact,
             Destination::Group(_) => &DestinationKind::Group,
             Destination::DistributionList(_) => &DestinationKind::DistributionList,
-            Destination::Self_ => &DestinationKind::Self_,
+            Destination::Self_(_) => &DestinationKind::Self_,
             Destination::ReleaseNotes => &DestinationKind::ReleaseNotes,
             Destination::CallLink(_) => &DestinationKind::CallLink,
         }
     }
 }
 
-impl<
-        M: Method + ReferencedTypes,
-        C: LookupPair<RecipientId, DestinationKind, M::RecipientReference> + ReportUnusualTimestamp,
-    > TryFromWith<proto::Recipient, C> for Destination<M>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
+    TryFromWith<proto::Recipient, C> for Destination<R>
 {
     type Error = RecipientError;
     fn try_from_with(value: proto::Recipient, context: &C) -> Result<Self, Self::Error> {
@@ -310,20 +462,25 @@ impl<
 
         Ok(match destination {
             RecipientDestination::Contact(contact) => {
-                Destination::Contact(M::value(contact.try_into_with(context)?))
+                Destination::Contact(contact.try_into_with(context)?)
             }
-            RecipientDestination::Group(group) => {
-                Destination::Group(M::value(group.try_into_with(context)?))
-            }
+            RecipientDestination::Group(group) => Destination::Group(group.try_into_with(context)?),
             RecipientDestination::DistributionList(list) => {
-                Destination::DistributionList(M::value(list.try_into_with(context)?))
+                Destination::DistributionList(list.try_into_with(context)?)
             }
-            RecipientDestination::Self_(proto::Self_ { special_fields: _ }) => Destination::Self_,
+            RecipientDestination::Self_(proto::Self_ {
+                avatarColor,
+                special_fields: _,
+            }) => {
+                // The color is allowed to be unset.
+                let avatar_color = avatarColor.map(|v| v.enum_value_or_default());
+                Destination::Self_(SelfData { avatar_color })
+            }
             RecipientDestination::ReleaseNotes(proto::ReleaseNotes { special_fields: _ }) => {
                 Destination::ReleaseNotes
             }
             RecipientDestination::CallLink(call_link) => {
-                Destination::CallLink(M::value(call_link.try_into_with(context)?))
+                Destination::CallLink(call_link.try_into_with(context)?)
             }
         })
     }
@@ -347,6 +504,12 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Contact, C> for ContactData {
             hideStory,
             identityKey,
             identityState,
+            nickname,
+            note,
+            systemGivenName,
+            systemFamilyName,
+            systemNickname,
+            avatarColor,
             special_fields: _,
         } = value;
 
@@ -379,13 +542,15 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Contact, C> for ContactData {
                 unregisteredTimestamp,
                 special_fields: _,
             }) => Registration::NotRegistered {
-                unregistered_at: NonZeroU64::new(unregisteredTimestamp).map(|u| {
-                    Timestamp::from_millis(
-                        u.get(),
-                        "Contact.notRegistered.unregisteredTimestamp",
-                        context,
-                    )
-                }),
+                unregistered_at: NonZeroU64::new(unregisteredTimestamp)
+                    .map(|u| {
+                        Timestamp::from_millis(
+                            u.get(),
+                            "Contact.notRegistered.unregisteredTimestamp",
+                            context,
+                        )
+                    })
+                    .transpose()?,
             },
             proto::contact::Registration::Registered(proto::contact::Registered {
                 special_fields: _,
@@ -428,6 +593,28 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Contact, C> for ContactData {
             }
         };
 
+        let nickname = nickname
+            .into_option()
+            .map(
+                |proto::contact::Name {
+                     given,
+                     family,
+                     special_fields: _,
+                 }| {
+                    if given.is_empty() && family.is_empty() {
+                        return Err(RecipientError::NicknameIsPresentButEmpty);
+                    }
+                    Ok(ContactName {
+                        given_name: given,
+                        family_name: family,
+                    })
+                },
+            )
+            .transpose()?;
+
+        // The color is allowed to be unset.
+        let avatar_color = avatarColor.map(|v| v.enum_value_or_default());
+
         Ok(Self {
             aci,
             pni,
@@ -443,11 +630,17 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Contact, C> for ContactData {
             hide_story: hideStory,
             identity_key,
             identity_state,
+            nickname,
+            note,
+            system_given_name: systemGivenName,
+            system_family_name: systemFamilyName,
+            system_nickname: systemNickname,
+            avatar_color,
         })
     }
 }
 
-impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
     TryFromWith<proto::DistributionListItem, C> for DistributionListItem<R>
 {
     type Error = RecipientError;
@@ -476,7 +669,7 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
                         deletion_timestamp,
                         "DistributionList.deletionTimestamp",
                         context,
-                    );
+                    )?;
                     Self::Deleted {
                         distribution_id,
                         at,
@@ -499,17 +692,27 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
                             if members_seen.insert(id, ()).is_some() {
                                 return Err(RecipientError::DistributionListMemberDuplicate(id));
                             }
-                            let (&kind, recipient_reference) = context
+                            let (recipient_data, recipient_reference) = context
                                 .lookup_pair(&id)
                                 .ok_or(RecipientError::DistributionListMemberUnknown(id))?;
-                            match kind {
-                                DestinationKind::Contact => Ok(recipient_reference.clone()),
-                                DestinationKind::Group
-                                | DestinationKind::DistributionList
-                                | DestinationKind::Self_
-                                | DestinationKind::ReleaseNotes
-                                | DestinationKind::CallLink => {
-                                    Err(RecipientError::DistributionListMemberWrongKind(id, kind))
+                            match recipient_data {
+                                MinimalRecipientData::Contact {
+                                    aci: None,
+                                    pni: None,
+                                    e164: _,
+                                } => Err(RecipientError::DistributionListMemberHasNoServiceIds(id)),
+                                MinimalRecipientData::Contact { .. } => {
+                                    Ok(recipient_reference.clone())
+                                }
+                                MinimalRecipientData::Group { .. }
+                                | MinimalRecipientData::DistributionList { .. }
+                                | MinimalRecipientData::Self_
+                                | MinimalRecipientData::ReleaseNotes
+                                | MinimalRecipientData::CallLink { .. } => {
+                                    Err(RecipientError::DistributionListMemberWrongKind(
+                                        id,
+                                        *recipient_data.as_ref(),
+                                    ))
                                 }
                             }
                         })
@@ -526,6 +729,11 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
                             PrivacyMode::OnlyWith(members)
                         }
                         (proto::distribution_list::PrivacyMode::ALL_EXCEPT, true) => {
+                            if members.is_empty() {
+                                return Err(
+                                    RecipientError::DistributionListPrivacyAllExceptWithEmptyMembers,
+                                );
+                            }
                             PrivacyMode::AllExcept(members)
                         }
                         (proto::distribution_list::PrivacyMode::ALL, true) => {
@@ -562,7 +770,6 @@ mod test {
     use test_case::test_case;
 
     use super::*;
-    use crate::backup::method::Store;
     use crate::backup::testutil::TestContext;
     use crate::backup::time::testutil::MillisecondsSinceEpoch;
 
@@ -612,7 +819,16 @@ mod test {
                 profileFamilyName: Some("FamilyName".to_owned()),
                 identityKey: Some(Self::TEST_IDENTITY_KEY_BYTES.to_vec()),
                 identityState: proto::contact::IdentityState::VERIFIED.into(),
-
+                nickname: Some(proto::contact::Name {
+                    given: "GivenNickName".to_owned(),
+                    family: "FamilyNickName".to_owned(),
+                    ..Default::default()
+                })
+                .into(),
+                systemGivenName: "GivenSystemName".to_owned(),
+                systemFamilyName: "FamilySystemName".to_owned(),
+                systemNickname: "SystemNickName".to_owned(),
+                note: "nb".into(),
                 ..Default::default()
             }
         }
@@ -620,7 +836,7 @@ mod test {
 
     impl proto::DistributionListItem {
         const TEST_CUSTOM_UUID: [u8; 16] = [0x99; 16];
-        fn test_data() -> Self {
+        pub(crate) fn test_data() -> Self {
             Self {
                 distributionId: Uuid::nil().into(),
                 item: Some(proto::distribution_list_item::Item::DistributionList(
@@ -656,6 +872,15 @@ mod test {
                     IdentityKey::decode(&proto::Contact::TEST_IDENTITY_KEY_BYTES).expect("valid"),
                 ),
                 identity_state: proto::contact::IdentityState::VERIFIED,
+                nickname: Some(ContactName {
+                    given_name: "GivenNickName".to_owned(),
+                    family_name: "FamilyNickName".to_owned(),
+                }),
+                system_given_name: "GivenSystemName".to_owned(),
+                system_family_name: "FamilySystemName".to_owned(),
+                system_nickname: "SystemNickName".to_owned(),
+                note: "nb".into(),
+                avatar_color: None,
             }
         }
     }
@@ -668,7 +893,7 @@ mod test {
         };
 
         assert_matches!(
-            Destination::<Store>::try_from_with(recipient, &TestContext::default()),
+            Destination::try_from_with(recipient, &TestContext::default()),
             Err(RecipientError::MissingDestination)
         );
     }
@@ -678,8 +903,8 @@ mod test {
         let recipient = proto::Recipient::test_data();
 
         assert_eq!(
-            Destination::<Store>::try_from_with(recipient, &TestContext::default()),
-            Ok(Destination::Self_)
+            Destination::try_from_with(recipient, &TestContext::default()),
+            Ok(Destination::Self_(SelfData { avatar_color: None }))
         )
     }
 
@@ -691,7 +916,7 @@ mod test {
         };
 
         assert_eq!(
-            Destination::<Store>::try_from_with(recipient, &TestContext::default()),
+            Destination::try_from_with(recipient, &TestContext::default()),
             Ok(Destination::Contact(ContactData::from_proto_test_data()))
         )
     }
@@ -723,6 +948,14 @@ mod test {
         x.identityState = proto::contact::IdentityState::DEFAULT.into();
     } => Ok(()); "missing_identity_default")]
     #[test_case(|x| x.identityKey = Some(vec![]) => Err(RecipientError::InvalidIdentityKey); "invalid_identity_key")]
+    #[test_case(|x| x.registration = Some(proto::contact::Registration::NotRegistered(proto::contact::NotRegistered {
+        unregisteredTimestamp: MillisecondsSinceEpoch::FAR_FUTURE.0,
+        ..Default::default()
+    })) => Err(RecipientError::InvalidTimestamp(TimestampError("Contact.notRegistered.unregisteredTimestamp", MillisecondsSinceEpoch::FAR_FUTURE.0))); "invalid unregisteredTimestamp")]
+    #[test_case(|x| x.nickname = None.into() => Ok(()); "no nickname")]
+    #[test_case(|x| x.nickname.as_mut().unwrap().given = "".into() => Ok(()); "no nickname given name")]
+    #[test_case(|x| x.nickname.as_mut().unwrap().family = "".into() => Ok(()); "no nickname family name")]
+    #[test_case(|x| x.nickname = Some(Default::default()).into() => Err(RecipientError::NicknameIsPresentButEmpty); "no nickname given or family name")]
     fn destination_contact(modifier: fn(&mut proto::Contact)) -> Result<(), RecipientError> {
         let mut contact = proto::Contact::test_data();
         modifier(&mut contact);
@@ -732,7 +965,7 @@ mod test {
             ..proto::Recipient::test_data()
         };
 
-        Destination::<Store>::try_from_with(recipient, &TestContext::default()).map(|_| ())
+        Destination::try_from_with(recipient, &TestContext::default()).map(|_| ())
     }
 
     #[test]
@@ -743,7 +976,7 @@ mod test {
         };
 
         assert_eq!(
-            Destination::<Store>::try_from_with(recipient, &TestContext::default()),
+            Destination::try_from_with(recipient, &TestContext::default()),
             Ok(Destination::Group(GroupData::from_proto_test_data()))
         );
     }
@@ -759,7 +992,7 @@ mod test {
             ..proto::Recipient::test_data()
         };
 
-        Destination::<Store>::try_from_with(recipient, &TestContext::default()).map(|_| ())
+        Destination::try_from_with(recipient, &TestContext::default()).map(|_| ())
     }
 
     #[test]
@@ -770,7 +1003,7 @@ mod test {
         };
 
         assert_eq!(
-            Destination::<Store>::try_from_with(recipient, &TestContext::default()),
+            Destination::try_from_with(recipient, &TestContext::default()),
             Ok(Destination::DistributionList(DistributionListItem::List {
                 distribution_id: Uuid::nil(),
                 privacy_mode: PrivacyMode::AllExcept(
@@ -809,10 +1042,24 @@ mod test {
         "member_is_not_a_contact"
     )]
     #[test_case(
+        |x| x.mut_distributionList().memberRecipientIds.push(TestContext::E164_ONLY_ID.0) =>
+        Err(RecipientError::DistributionListMemberHasNoServiceIds(TestContext::E164_ONLY_ID));
+        "member has no service IDs"
+    )]
+    #[test_case(
         |x| x.mut_distributionList().privacyMode = proto::distribution_list::PrivacyMode::ALL.into() =>
         Err(RecipientError::DistributionListPrivacyAllWithNonemptyMembers);
         "privacy_mode_all_with_nonempty_members"
     )]
+    #[test_case(
+        |x| x.mut_distributionList().memberRecipientIds.clear() =>
+        Err(RecipientError::DistributionListPrivacyAllExceptWithEmptyMembers);
+        "privacy_mode_all_except_with_empty_members"
+    )]
+    #[test_case(|x| {
+        x.mut_distributionList().privacyMode = proto::distribution_list::PrivacyMode::ONLY_WITH.into();
+        x.mut_distributionList().memberRecipientIds.clear();
+    } => Ok(()); "privacy_mode_only_with_empty_members")]
     #[test_case(
         |x| x.distributionId = proto::DistributionListItem::TEST_CUSTOM_UUID.into() => Err(RecipientError::DistributionListPrivacyInvalid(proto::distribution_list::PrivacyMode::ALL_EXCEPT));
         "privacy_mode_for_custom_story"
@@ -829,6 +1076,10 @@ mod test {
         x.distributionId = proto::DistributionListItem::TEST_CUSTOM_UUID.into();
         x.set_deletionTimestamp(MillisecondsSinceEpoch::TEST_VALUE.0);
     } => Ok(()); "valid_deletion")]
+    #[test_case(|x| {
+        x.distributionId = proto::DistributionListItem::TEST_CUSTOM_UUID.into();
+        x.set_deletionTimestamp(MillisecondsSinceEpoch::FAR_FUTURE.0);
+    } => Err(RecipientError::InvalidTimestamp(TimestampError("DistributionList.deletionTimestamp", MillisecondsSinceEpoch::FAR_FUTURE.0))); "invalid deletionTimestamp")]
     fn destination_distribution_list(
         modifier: fn(&mut proto::DistributionListItem),
     ) -> Result<(), RecipientError> {
@@ -840,6 +1091,6 @@ mod test {
             ..proto::Recipient::test_data()
         };
 
-        Destination::<Store>::try_from_with(recipient, &TestContext::default()).map(|_| ())
+        Destination::try_from_with(recipient, &TestContext::default()).map(|_| ())
     }
 }

@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use rand::{CryptoRng, Rng};
 
 use crate::consts::{MAX_FORWARD_JUMPS, MAX_UNACKNOWLEDGED_SESSION_AGE};
-use crate::ratchet::{ChainKey, MessageKeys};
+use crate::ratchet::{ChainKey, MessageKeyGenerator};
 use crate::state::{InvalidSessionError, SessionState};
 use crate::{
     session, CiphertextMessage, CiphertextMessageType, Direction, IdentityKeyStore, KeyPair,
@@ -33,7 +33,7 @@ pub async fn message_encrypt(
 
     let chain_key = session_state.get_sender_chain_key()?;
 
-    let message_keys = chain_key.message_keys();
+    let message_keys = chain_key.message_keys().generate_keys();
 
     let sender_ephemeral = session_state.sender_ratchet_key()?;
     let previous_counter = session_state.previous_counter();
@@ -131,10 +131,7 @@ pub async fn message_encrypt(
     {
         log::warn!(
             "Identity key {} is not trusted for remote address {}",
-            their_identity_key
-                .public_key()
-                .public_key_bytes()
-                .map_or_else(|e| format!("<error: {}>", e), hex::encode),
+            hex::encode(their_identity_key.public_key().public_key_bytes()),
             remote_address,
         );
         return Err(SignalProtocolError::UntrustedIdentity(
@@ -293,10 +290,7 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     {
         log::warn!(
             "Identity key {} is not trusted for remote address {}",
-            their_identity_key
-                .public_key()
-                .public_key_bytes()
-                .map_or_else(|e| format!("<error: {}>", e), hex::encode),
+            hex::encode(their_identity_key.public_key().public_key_bytes()),
             remote_address,
         );
         return Err(SignalProtocolError::UntrustedIdentity(
@@ -379,7 +373,7 @@ fn create_decryption_failure_log(
     lines.push(format!(
         "Message from {} failed to decrypt; sender ratchet public key {} message counter {}",
         remote_address,
-        hex::encode(ciphertext.sender_ratchet_key().public_key_bytes()?),
+        hex::encode(ciphertext.sender_ratchet_key().public_key_bytes()),
         ciphertext.counter()
     ));
 
@@ -425,10 +419,7 @@ fn decrypt_message_with_record<R: Rng + CryptoRng>(
             "Failed to decrypt {:?} message with ratchet key: {} and counter: {}. \
              Session loaded for {}. Local session has base key: {} and counter: {}. {}",
             original_message_type,
-            ciphertext
-                .sender_ratchet_key()
-                .public_key_bytes()
-                .map_or_else(|e| format!("<error: {}>", e), hex::encode),
+            hex::encode(ciphertext.sender_ratchet_key().public_key_bytes()),
             ciphertext.counter(),
             remote_address,
             state
@@ -593,7 +584,8 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
         original_message_type,
         &chain_key,
         counter,
-    )?;
+    )?
+    .generate_keys();
 
     let their_identity_key =
         state
@@ -688,7 +680,7 @@ fn get_or_create_message_key(
     original_message_type: CiphertextMessageType,
     chain_key: &ChainKey,
     counter: u32,
-) -> Result<MessageKeys> {
+) -> Result<MessageKeyGenerator> {
     let chain_index = chain_key.index();
 
     if chain_index > counter {
@@ -737,7 +729,7 @@ fn get_or_create_message_key(
 
     while chain_key.index() < counter {
         let message_keys = chain_key.message_keys();
-        state.set_message_keys(their_ephemeral, &message_keys)?;
+        state.set_message_keys(their_ephemeral, message_keys)?;
         chain_key = chain_key.next_chain_key();
     }
 

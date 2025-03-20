@@ -39,9 +39,9 @@ public struct ChatRequest: Equatable, Sendable {
     }
 
     // Exposed for testing
-    internal class InternalRequest: NativeHandleOwner {
+    internal class InternalRequest: NativeHandleOwner<SignalMutPointerHttpRequest> {
         convenience init(_ request: ChatRequest) throws {
-            var handle: OpaquePointer?
+            var handle = SignalMutPointerHttpRequest(untyped: nil)
             if let body = request.body {
                 try body.withUnsafeBorrowedBuffer { body in
                     try checkError(signal_http_request_new_with_body(&handle, request.method, request.pathAndQuery, body))
@@ -50,16 +50,38 @@ public struct ChatRequest: Equatable, Sendable {
                 try checkError(signal_http_request_new_without_body(&handle, request.method, request.pathAndQuery))
             }
             // Make sure we clean up the handle if there are any errors adding headers.
-            self.init(owned: handle!)
+            self.init(owned: NonNull(handle)!)
 
             for (name, value) in request.headers {
-                try checkError(signal_http_request_add_header(handle, name, value))
+                try checkError(signal_http_request_add_header(handle.const(), name, value))
             }
         }
 
-        override class func destroyNativeHandle(_ handle: OpaquePointer) -> SignalFfiErrorRef? {
-            return signal_http_request_destroy(handle)
+        override class func destroyNativeHandle(_ handle: NonNull<SignalMutPointerHttpRequest>) -> SignalFfiErrorRef? {
+            return signal_http_request_destroy(handle.pointer)
         }
+    }
+}
+
+extension SignalMutPointerHttpRequest: SignalMutPointer {
+    public typealias ConstPointer = SignalConstPointerHttpRequest
+
+    public init(untyped: OpaquePointer?) {
+        self.init(raw: untyped)
+    }
+
+    public func toOpaque() -> OpaquePointer? {
+        self.raw
+    }
+
+    public func const() -> Self.ConstPointer {
+        Self.ConstPointer(raw: self.raw)
+    }
+}
+
+extension SignalConstPointerHttpRequest: SignalConstPointer {
+    public func toOpaque() -> OpaquePointer? {
+        self.raw
     }
 }
 
@@ -111,26 +133,6 @@ public struct ChatResponse: Equatable, Sendable {
     }
 }
 
-public struct ChatServiceDebugInfo: Equatable, Sendable {
-    public var ipType: IpType
-    public var duration: TimeInterval
-    public var connectionInfo: String
-
-    public init(ipType: IpType, duration: TimeInterval, connectionInfo: String) {
-        self.ipType = ipType
-        self.duration = duration
-        self.connectionInfo = connectionInfo
-    }
-
-    internal init(consuming rawDebugInfo: SignalFfiChatServiceDebugInfo) {
-        var rawDebugInfo = rawDebugInfo
-        defer { rawDebugInfo.free() }
-        self.ipType = IpType(rawValue: rawDebugInfo.raw_ip_type) ?? .unknown
-        self.duration = rawDebugInfo.duration_secs
-        self.connectionInfo = String(cString: rawDebugInfo.connection_info)
-    }
-}
-
 extension SignalFfiChatResponse {
     fileprivate var rawHeadersAsBuffer: UnsafeBufferPointer<UnsafePointer<CChar>?> {
         .init(start: self.headers.base, count: self.headers.length)
@@ -143,14 +145,6 @@ extension SignalFfiChatResponse {
         signal_free_string(message)
         signal_free_list_of_strings(headers)
         signal_free_buffer(body.base, body.length)
-        // Zero out all the fields to be sure they won't be reused.
-        self = .init()
-    }
-}
-
-extension SignalFfiChatServiceDebugInfo {
-    fileprivate mutating func free() {
-        signal_free_string(connection_info)
         // Zero out all the fields to be sure they won't be reused.
         self = .init()
     }

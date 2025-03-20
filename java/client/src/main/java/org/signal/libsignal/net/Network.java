@@ -28,49 +28,90 @@ public class Network {
     }
   }
 
+  /**
+   * The "scheme" for Signal TLS proxies. See {@link #setProxy(String, String, Integer, String,
+   * String)}.
+   */
+  public static final String SIGNAL_TLS_PROXY_SCHEME = "org.signal.tls";
+
   private final TokioAsyncContext tokioAsyncContext;
 
   private final ConnectionManager connectionManager;
 
-  /**
-   * Group of the APIs responsible for communication with the SVR3 service.
-   *
-   * <p>Refer to {@link org.signal.libsignal.net.Svr3} for the detailed description.
-   */
-  private final Svr3 svr3;
-
   public Network(Environment env, String userAgent) {
     this.tokioAsyncContext = new TokioAsyncContext();
     this.connectionManager = new ConnectionManager(env, userAgent);
-    this.svr3 = new Svr3(this);
   }
 
   /**
    * Sets the proxy host to be used for all new connections (until overridden).
    *
-   * <p>Sets a domain name and port to be used to proxy all new outgoing connections. The proxy can
-   * be overridden by calling this method again or unset by calling {@link #clearProxy}.
+   * <p>Sets a server to be used to proxy all new outgoing connections. The proxy can be overridden
+   * by calling this method again or unset by calling {@link #clearProxy}. Passing {@code null} for
+   * the {@code port} means the default port for the scheme will be used. {@code username} and
+   * {@code password} can be {@code null} as well.
+   *
+   * <p>To specify a Signal transparent TLS proxy, use {@link SIGNAL_TLS_PROXY_SCHEME}, or the
+   * overload that takes a separate domain and port number.
    *
    * <p>Existing connections and services will continue with the setting they were created with. (In
-   * particular, changing this setting will not affect any existing {@link ChatService
-   * ChatServices}.)
+   * particular, changing this setting will not affect any existing {@link ChatConnection
+   * ChatConnections}.)
+   *
+   * @throws IOException if the scheme is unsupported or if the provided parameters are invalid for
+   *     that scheme (e.g. Signal TLS proxies don't support authentication)
+   */
+  public void setProxy(String scheme, String host, Integer port, String username, String password)
+      throws IOException {
+    this.connectionManager.setProxy(scheme, host, port, username, password);
+  }
+
+  /**
+   * Sets the Signal TLS proxy host to be used for all new connections (until overridden).
+   *
+   * <p>Sets a domain name and port to be used to proxy all new outgoing connections, using a Signal
+   * transparent TLS proxy. The proxy can be overridden by calling this method again or unset by
+   * calling {@link #clearProxy}.
+   *
+   * <p>Existing connections and services will continue with the setting they were created with. (In
+   * particular, changing this setting will not affect any existing {@link ChatConnection
+   * ChatConnections}.)
    *
    * @throws IOException if the host or port are not (structurally) valid, such as a port that
    *     doesn't fit in u16.
    */
   public void setProxy(String host, int port) throws IOException {
-    this.connectionManager.setProxy(host, port);
+    // Support <username>@<host> syntax to allow UNENCRYPTED_FOR_TESTING as a marker user.
+    // This is not a stable feature of the API and may go away in the future;
+    // the Rust layer will reject any other users anyway. But it's convenient for us.
+    final int atIndex = host.indexOf('@');
+    String username = null;
+    if (atIndex != -1) {
+      username = host.substring(0, atIndex);
+      host = host.substring(atIndex + 1);
+    }
+    this.connectionManager.setProxy(SIGNAL_TLS_PROXY_SCHEME, host, port, username, null);
+  }
+
+  /**
+   * Refuses to make any new connections until a new proxy configuration is set or {@link
+   * #clearProxy} is called.
+   *
+   * <p>Existing connections will not be affected.
+   */
+  public void setInvalidProxy() {
+    this.connectionManager.setInvalidProxy();
   }
 
   /**
    * Ensures that future connections will be made directly, not through a proxy.
    *
-   * <p>Clears any proxy configuration set via {@link #setProxy}. If none was set, calling this
-   * method is a no-op.
+   * <p>Clears any proxy configuration set via {@link #setProxy} or {@link #setInvalidProxy}. If
+   * none was set, calling this method is a no-op.
    *
    * <p>Existing connections and services will continue with the setting they were created with. (In
-   * particular, changing this setting will not affect any existing {@link ChatService
-   * ChatServices}.)
+   * particular, changing this setting will not affect any existing {@link ChatConnection
+   * ChatConnections}.)
    */
   public void clearProxy() {
     this.connectionManager.clearProxy();
@@ -82,7 +123,7 @@ public class Network {
    * <p>If CC is enabled, <em>new</em> connections and services may try additional routes to the
    * Signal servers. Existing connections and services will continue with the setting they were
    * created with. (In particular, changing this setting will not affect any existing {@link
-   * ChatService ChatServices}.)
+   * ChatConnection ChatConnections}.)
    *
    * <p>CC is off by default.
    */
@@ -99,14 +140,20 @@ public class Network {
     connectionManager.guardedRun(Native::ConnectionManager_on_network_change);
   }
 
-  public Svr3 svr3() {
-    return this.svr3;
-  }
-
   public CompletableFuture<CdsiLookupResponse> cdsiLookup(
       String username, String password, CdsiLookupRequest request, Consumer<byte[]> tokenConsumer)
       throws IOException, InterruptedException, ExecutionException {
-    return CdsiLookup.start(this, username, password, request)
+    return this.cdsiLookup(username, password, request, tokenConsumer, false);
+  }
+
+  public CompletableFuture<CdsiLookupResponse> cdsiLookup(
+      String username,
+      String password,
+      CdsiLookupRequest request,
+      Consumer<byte[]> tokenConsumer,
+      boolean useNewConnectLogic)
+      throws IOException, InterruptedException, ExecutionException {
+    return CdsiLookup.start(this, username, password, request, useNewConnectLogic)
         .thenCompose(
             (CdsiLookup lookup) -> {
               tokenConsumer.accept(lookup.getToken());
@@ -149,16 +196,56 @@ public class Network {
     return this.connectionManager;
   }
 
-  public UnauthenticatedChatService createUnauthChatService(ChatListener listener) {
-    return new UnauthenticatedChatService(tokioAsyncContext, connectionManager, listener);
+  /**
+   * Starts the process of connecting to the chat server.
+   *
+   * <p>If this completes successfully, the next call to {@link #connectAuthChat} may be able to
+   * finish more quickly. If it's incomplete or produces an error, such a call will start from
+   * scratch as usual. Only one preconnect is recorded, so there's no point in calling this more
+   * than once.
+   */
+  public CompletableFuture<Void> preconnectChat() {
+    return tokioAsyncContext.guardedMap(
+        asyncContext ->
+            connectionManager.guardedMap(
+                connectionManager ->
+                    Native.AuthenticatedChatConnection_preconnect(
+                        asyncContext, connectionManager)));
   }
 
-  public AuthenticatedChatService createAuthChatService(
+  /**
+   * Initiates an unauthenticated connection attempt to the chat service.
+   *
+   * <p>The returned {@link CompletableFuture} will resolve when the connection attempt succeeds or
+   * fails. If it succeeds, the {@link UnauthenticatedChatConnection} can be used to send requests
+   * to the chat service, and incoming events will be provided via the provided {@link
+   * ChatConnectionListener} argument.
+   *
+   * <p>If the connection attempt fails, the future will contain a {@link ChatServiceException} or
+   * other exception type wrapped in a {@link ExecutionException}.
+   */
+  public CompletableFuture<UnauthenticatedChatConnection> connectUnauthChat(
+      ChatConnectionListener listener) {
+    return UnauthenticatedChatConnection.connect(tokioAsyncContext, connectionManager, listener);
+  }
+
+  /**
+   * Initiates an authenticated connection attempt to the chat service.
+   *
+   * <p>The returned {@link CompletableFuture} will resolve when the connection attempt succeeds or
+   * fails. If it succeeds, the {@link AuthenticatedChatConnection} can be used to send requests to
+   * the chat service, and incoming events will be provided via the provided {@link
+   * ChatConnectionListener} argument.
+   *
+   * <p>If the connection attempt fails, the future will contain a {@link ChatServiceException} or
+   * other exception type wrapped in a {@link ExecutionException}.
+   */
+  public CompletableFuture<AuthenticatedChatConnection> connectAuthChat(
       final String username,
       final String password,
       final boolean receiveStories,
-      ChatListener listener) {
-    return new AuthenticatedChatService(
+      ChatConnectionListener listener) {
+    return AuthenticatedChatConnection.connect(
         tokioAsyncContext, connectionManager, username, password, receiveStories, listener);
   }
 
@@ -170,10 +257,37 @@ public class Network {
       this.environment = env;
     }
 
-    private void setProxy(String host, int port) throws IOException {
-      filterExceptions(
-          IOException.class,
-          () -> guardedRunChecked(h -> Native.ConnectionManager_set_proxy(h, host, port)));
+    private void setProxy(
+        String scheme, String host, Integer port, String username, String password)
+        throws IOException {
+      long rawProxyConfig;
+      try {
+        rawProxyConfig =
+            filterExceptions(
+                IOException.class,
+                () ->
+                    Native.ConnectionProxyConfig_new(
+                        scheme,
+                        host,
+                        // Integer.MIN_VALUE represents "no port provided"; we don't expect anyone
+                        // to pass that manually.
+                        port != null ? port : Integer.MIN_VALUE,
+                        username,
+                        password));
+      } catch (IOException | RuntimeException | Error e) {
+        setInvalidProxy();
+        throw e;
+      }
+
+      try {
+        guardedRun(h -> Native.ConnectionManager_set_proxy(h, rawProxyConfig));
+      } finally {
+        Native.ConnectionProxyConfig_Destroy(rawProxyConfig);
+      }
+    }
+
+    private void setInvalidProxy() {
+      guardedRun(Native::ConnectionManager_set_invalid_proxy);
     }
 
     private void clearProxy() {

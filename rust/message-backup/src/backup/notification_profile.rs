@@ -8,14 +8,14 @@
 // crate, but we want intra-crate privacy.
 #![allow(clippy::manual_non_exhaustive)]
 
+use intmap::IntMap;
 use itertools::Itertools;
 
 use crate::backup::frame::RecipientId;
-use crate::backup::map::IntMap;
 use crate::backup::method::LookupPair;
-use crate::backup::recipient::DestinationKind;
+use crate::backup::recipient::{DestinationKind, MinimalRecipientData};
 use crate::backup::serialize::{SerializeOrder, UnorderedList};
-use crate::backup::time::{ReportUnusualTimestamp, Timestamp};
+use crate::backup::time::{ReportUnusualTimestamp, Timestamp, TimestampError};
 use crate::backup::{Color, ColorError, TryFromWith};
 use crate::proto::backup as proto;
 
@@ -58,9 +58,11 @@ pub enum NotificationProfileError {
     InvalidWeekday(i32),
     /// {0:?} appears twice in enabledDays
     DuplicateDay(DayOfWeek),
+    /// {0}
+    InvalidTimestamp(#[from] TimestampError),
 }
 
-impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTimestamp>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
     TryFromWith<proto::NotificationProfile, C> for NotificationProfile<R>
 {
     type Error = NotificationProfileError;
@@ -91,7 +93,7 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
         let color = Color::try_from(color)?;
 
         let created_at =
-            Timestamp::from_millis(createdAtMs, "NotificationProfile.createdAtMs", context);
+            Timestamp::from_millis(createdAtMs, "NotificationProfile.createdAtMs", context)?;
 
         let mut seen_members = IntMap::default();
         let allowed_members = allowedMembers
@@ -101,15 +103,15 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R> + ReportUnusualTim
                 if seen_members.insert(id, ()).is_some() {
                     return Err(NotificationProfileError::DuplicateMember(id));
                 }
-                let (kind, recipient) = context
+                let (recipient_data, recipient) = context
                     .lookup_pair(&id)
                     .ok_or(NotificationProfileError::UnknownMember(id))?;
-                match kind {
+                match recipient_data.as_ref() {
                     DestinationKind::Contact | DestinationKind::Group => Ok(recipient.clone()),
-                    DestinationKind::DistributionList
+                    kind @ (DestinationKind::DistributionList
                     | DestinationKind::Self_
                     | DestinationKind::ReleaseNotes
-                    | DestinationKind::CallLink => {
+                    | DestinationKind::CallLink) => {
                         Err(NotificationProfileError::MemberWrongKind(id, *kind))
                     }
                 }
@@ -295,6 +297,11 @@ mod test {
     #[test_case(|x| x.allowedMembers = vec![TestContext::SELF_ID.0] => Err(NotificationProfileError::MemberWrongKind(TestContext::SELF_ID, DestinationKind::Self_)); "cannot include Self")]
     #[test_case(|x| x.allowedMembers = vec![TestContext::CONTACT_ID.0, TestContext::CONTACT_ID.0] => Err(NotificationProfileError::DuplicateMember(TestContext::CONTACT_ID)); "cannot include duplicates")]
     #[test_case(|x| x.allowedMembers = vec![1000] => Err(NotificationProfileError::UnknownMember(RecipientId(1000))); "unknown member")]
+    #[test_case(
+        |x| x.createdAtMs = MillisecondsSinceEpoch::FAR_FUTURE.0 =>
+        Err(NotificationProfileError::InvalidTimestamp(TimestampError("NotificationProfile.createdAtMs", MillisecondsSinceEpoch::FAR_FUTURE.0)));
+        "invalid createdAtMs"
+    )]
     fn profile(
         mutator: fn(&mut proto::NotificationProfile),
     ) -> Result<(), NotificationProfileError> {

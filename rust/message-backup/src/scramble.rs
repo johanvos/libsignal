@@ -22,8 +22,9 @@ use randomize::*;
 
 pub struct Scrambler {
     rng: rand::rngs::StdRng,
-    e164s: intmap::IntMap<u64>,
+    e164s: intmap::IntMap<u64, u64>,
     uuids: HashMap<Box<[u8]>, Box<[u8]>>,
+    usernames: u64,
 }
 
 impl Scrambler {
@@ -33,6 +34,7 @@ impl Scrambler {
             rng: rand::rngs::StdRng::seed_from_u64(0),
             e164s: Default::default(),
             uuids: Default::default(),
+            usernames: 0,
         }
     }
 
@@ -87,6 +89,12 @@ impl Scrambler {
             })
             .to_vec()
     }
+
+    /// Generates a username
+    fn next_username(&mut self) -> String {
+        self.usernames += 1;
+        format!("user.{:02}", self.usernames)
+    }
 }
 
 impl Default for Scrambler {
@@ -122,7 +130,6 @@ Signal is an independent nonprofit. We're not tied to any major tech companies, 
 
 const REPLACEMENT_EMOJI: &str = "❌";
 const REPLACEMENT_URL: &str = "https://signal.org";
-const REPLACEMENT_USERNAME: &str = "signal.01";
 
 fn scramble_content_type(content_type: &mut String) {
     if let Some(split_point) = content_type.find('/') {
@@ -216,12 +223,13 @@ impl Visit<Scrambler> for proto::AccountData {
             donationSubscriberData,
             accountSettings,
             backupsSubscriberData,
+            svrPin,
             special_fields: _,
         } = self;
 
         profileKey.randomize(&mut visitor.rng);
         if let Some(username) = username {
-            *username = REPLACEMENT_USERNAME.into()
+            *username = visitor.next_username();
         }
         usernameLink.accept(visitor);
         givenName.randomize(&mut visitor.rng);
@@ -232,6 +240,7 @@ impl Visit<Scrambler> for proto::AccountData {
         donationSubscriberData.accept(visitor);
         accountSettings.accept(visitor);
         backupsSubscriberData.accept(visitor);
+        svrPin.randomize(&mut visitor.rng);
     }
 }
 
@@ -477,6 +486,12 @@ impl Visit<Scrambler> for proto::Contact {
             identityKey,
             identityState: _,
             registration,
+            nickname,
+            systemGivenName,
+            systemFamilyName,
+            systemNickname,
+            note,
+            avatarColor: _,
             special_fields: _,
         } = self;
 
@@ -487,7 +502,7 @@ impl Visit<Scrambler> for proto::Contact {
             visitor.replace_service_id(pni);
         }
         if let Some(username) = username {
-            *username = REPLACEMENT_USERNAME.into();
+            *username = visitor.next_username();
         };
         if let Some(e164) = e164 {
             visitor.replace_e164(e164);
@@ -495,7 +510,16 @@ impl Visit<Scrambler> for proto::Contact {
         profileKey.randomize(&mut visitor.rng);
         profileGivenName.randomize(&mut visitor.rng);
         profileFamilyName.randomize(&mut visitor.rng);
-        identityKey.randomize(&mut visitor.rng);
+        if let Some(identity_key) = identityKey {
+            if libsignal_protocol::PublicKey::deserialize(identity_key).is_ok() {
+                *identity_key = libsignal_protocol::KeyPair::generate(&mut visitor.rng)
+                    .public_key
+                    .serialize()
+                    .into_vec();
+            } else {
+                identity_key.randomize(&mut visitor.rng);
+            }
+        }
 
         if let Some(reg) = registration {
             use proto::contact::Registration;
@@ -504,6 +528,12 @@ impl Visit<Scrambler> for proto::Contact {
                 Registration::NotRegistered(reg) => reg.accept(visitor),
             }
         }
+
+        nickname.accept(visitor);
+        systemGivenName.randomize(&mut visitor.rng);
+        systemFamilyName.randomize(&mut visitor.rng);
+        systemNickname.randomize(&mut visitor.rng);
+        note.randomize(&mut visitor.rng);
     }
 }
 
@@ -522,6 +552,18 @@ impl Visit<Scrambler> for proto::contact::NotRegistered {
     }
 }
 
+impl Visit<Scrambler> for proto::contact::Name {
+    fn accept(&mut self, visitor: &mut Scrambler) {
+        let Self {
+            given,
+            family,
+            special_fields: _,
+        } = self;
+        given.randomize(&mut visitor.rng);
+        family.randomize(&mut visitor.rng);
+    }
+}
+
 impl Visit<Scrambler> for proto::Group {
     fn accept(&mut self, visitor: &mut Scrambler) {
         let Self {
@@ -530,6 +572,8 @@ impl Visit<Scrambler> for proto::Group {
             hideStory: _,
             storySendMode: _,
             snapshot,
+            blocked: _,
+            avatarColor: _,
             special_fields: _,
         } = self;
         masterKey.randomize(&mut visitor.rng);
@@ -684,7 +728,10 @@ impl Visit<Scrambler> for proto::DistributionListItem {
 
 impl Visit<Scrambler> for proto::Self_ {
     fn accept(&mut self, _visitor: &mut Scrambler) {
-        let Self { special_fields: _ } = self;
+        let Self {
+            avatarColor: _,
+            special_fields: _,
+        } = self;
     }
 }
 
@@ -767,6 +814,7 @@ impl Visit<Scrambler> for proto::ChatItem {
                 Item::PaymentNotification(item) => item.accept(visitor),
                 Item::GiftBadge(item) => item.accept(visitor),
                 Item::ViewOnceMessage(item) => item.accept(visitor),
+                Item::DirectStoryReplyMessage(item) => item.accept(visitor),
             }
         }
     }
@@ -1787,7 +1835,7 @@ impl Visit<Scrambler> for proto::LearnedProfileChatUpdate {
             use proto::learned_profile_chat_update::PreviousName;
             match name {
                 PreviousName::E164(e164) => visitor.replace_e164(e164),
-                PreviousName::Username(username) => *username = REPLACEMENT_USERNAME.into(),
+                PreviousName::Username(username) => *username = visitor.next_username(),
             }
         }
     }
@@ -1928,6 +1976,36 @@ impl Visit<Scrambler> for proto::ViewOnceMessage {
         } = self;
         attachment.accept(visitor);
         reactions.accept(visitor);
+    }
+}
+
+impl Visit<Scrambler> for proto::DirectStoryReplyMessage {
+    fn accept(&mut self, visitor: &mut Scrambler) {
+        let Self {
+            reactions,
+            reply,
+            special_fields: _,
+        } = self;
+        reactions.accept(visitor);
+        if let Some(reply) = reply {
+            use proto::direct_story_reply_message::Reply;
+            match reply {
+                Reply::TextReply(text_reply) => text_reply.accept(visitor),
+                Reply::Emoji(emoji) => *emoji = REPLACEMENT_EMOJI.into(),
+            }
+        }
+    }
+}
+
+impl Visit<Scrambler> for proto::direct_story_reply_message::TextReply {
+    fn accept(&mut self, visitor: &mut Scrambler) {
+        let Self {
+            text,
+            longText,
+            special_fields: _,
+        } = self;
+        text.accept(visitor);
+        longText.accept(visitor);
     }
 }
 

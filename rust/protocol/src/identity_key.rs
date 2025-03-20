@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-//! Wrappers over cryptographic primitives from [`crate::curve`] to represent a user.
+//! Wrappers over cryptographic primitives from [`libsignal_core::curve`] to represent a user.
 
 #![warn(missing_docs)]
 
@@ -19,7 +19,9 @@ const ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2: &[u8] = b"Signal_PNI_Signature";
 /// A public key that represents the identity of a user.
 ///
 /// Wrapper for [`PublicKey`].
-#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
+#[derive(
+    Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy, derive_more::From, derive_more::Into,
+)]
 pub struct IdentityKey {
     public_key: PublicKey,
 }
@@ -53,14 +55,14 @@ impl IdentityKey {
     ///
     /// `signature` must be calculated from [`IdentityKeyPair::sign_alternate_identity`].
     pub fn verify_alternate_identity(&self, other: &IdentityKey, signature: &[u8]) -> Result<bool> {
-        self.public_key.verify_signature_for_multipart_message(
+        Ok(self.public_key.verify_signature_for_multipart_message(
             &[
                 ALTERNATE_IDENTITY_SIGNATURE_PREFIX_1,
                 ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2,
                 &other.serialize(),
             ],
             signature,
-        )
+        ))
     }
 }
 
@@ -69,18 +71,6 @@ impl TryFrom<&[u8]> for IdentityKey {
 
     fn try_from(value: &[u8]) -> Result<Self> {
         IdentityKey::decode(value)
-    }
-}
-
-impl From<PublicKey> for IdentityKey {
-    fn from(value: PublicKey) -> Self {
-        Self { public_key: value }
-    }
-}
-
-impl From<IdentityKey> for PublicKey {
-    fn from(value: IdentityKey) -> Self {
-        value.public_key
     }
 }
 
@@ -147,14 +137,14 @@ impl IdentityKeyPair {
         other: &IdentityKey,
         rng: &mut R,
     ) -> Result<Box<[u8]>> {
-        self.private_key.calculate_signature_for_multipart_message(
+        Ok(self.private_key.calculate_signature_for_multipart_message(
             &[
                 ALTERNATE_IDENTITY_SIGNATURE_PREFIX_1,
                 ALTERNATE_IDENTITY_SIGNATURE_PREFIX_2,
                 &other.serialize(),
             ],
             rng,
-        )
+        )?)
     }
 }
 

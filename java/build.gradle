@@ -7,7 +7,7 @@ plugins {
 }
 
 allprojects {
-    version = "0.64.1-gluon-1"
+    version = "0.67.5-gluon-1"
     group   = "org.signal"
 }
 
@@ -51,7 +51,7 @@ task makeJniLibrariesDesktop(type:Exec) {
   group 'Rust'
   description 'Build the JNI libraries'
 
-  def debugLevelLogsFlag = hasProperty('debugLevelLogs') ? ['--debug-level-logs'] : []
+  def debugLevelLogsFlag = project.hasProperty('debugLevelLogs') ? ['--debug-level-logs'] : []
   // Explicitly specify 'bash' for Windows compatibility.
   commandLine 'bash', './build_jni.sh', *debugLevelLogsFlag, 'desktop'
 }
@@ -60,7 +60,7 @@ task makeJniLibrariesServer(type:Exec) {
   group 'Rust'
   description 'Build the JNI libraries'
 
-  def debugLevelLogsFlag = hasProperty('debugLevelLogs') ? ['--debug-level-logs'] : []
+  def debugLevelLogsFlag = project.hasProperty('debugLevelLogs') ? ['--debug-level-logs'] : []
   def target = project.hasProperty('crossCompileServer') ? 'server-all' : 'server'
 
   commandLine 'bash', './build_jni.sh', *debugLevelLogsFlag, target

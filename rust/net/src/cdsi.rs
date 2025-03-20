@@ -10,13 +10,15 @@ use http::{HeaderName, StatusCode};
 use libsignal_core::{Aci, Pni, E164};
 use libsignal_net_infra::connection_manager::ConnectionManager;
 use libsignal_net_infra::dns::DnsResolver;
-use libsignal_net_infra::errors::{LogSafeDisplay, TransportConnectError};
-use libsignal_net_infra::route::{RouteProvider, UnresolvedWebsocketServiceRoute};
+use libsignal_net_infra::errors::{LogSafeDisplay, RetryLater, TransportConnectError};
+use libsignal_net_infra::route::{
+    RouteProvider, ThrottlingConnector, UnresolvedWebsocketServiceRoute,
+};
 use libsignal_net_infra::ws::{NextOrClose, WebSocketConnectError, WebSocketServiceError};
 use libsignal_net_infra::ws2::attested::{
     AttestedConnection, AttestedConnectionError, AttestedProtocolError,
 };
-use libsignal_net_infra::{extract_retry_after_seconds, TransportConnector};
+use libsignal_net_infra::{extract_retry_later, TransportConnector};
 use prost::Message as _;
 use thiserror::Error;
 use tungstenite::protocol::frame::coding::CloseCode;
@@ -24,8 +26,8 @@ use tungstenite::protocol::CloseFrame;
 use uuid::Uuid;
 
 use crate::auth::Auth;
-use crate::connect_state::ConnectState;
-use crate::enclave::{Cdsi, EnclaveEndpointConnection, EndpointParams, NewHandshake as _};
+use crate::connect_state::{ConnectState, WebSocketTransportConnectorFactory};
+use crate::enclave::{Cdsi, EnclaveEndpointConnection, EndpointParams};
 use crate::proto::cds2::{ClientRequest, ClientResponse};
 use crate::ws::WebSocketServiceConnectError;
 
@@ -67,6 +69,7 @@ impl FixedLengthSerializable for Uuid {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub struct AciAndAccessKey {
     pub aci: Aci,
     pub access_key: [u8; 16],
@@ -84,6 +87,7 @@ impl FixedLengthSerializable for AciAndAccessKey {
 }
 
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 pub struct LookupRequest {
     pub new_e164s: Vec<E164>,
     pub prev_e164s: Vec<E164>,
@@ -238,7 +242,7 @@ pub enum LookupError {
     /// invalid response received from the server
     InvalidResponse,
     /// retry later
-    RateLimited { retry_after_seconds: u32 },
+    RateLimited(#[from] RetryLater),
     /// request token was invalid
     InvalidToken,
     /// failed to parse the response from the server
@@ -285,12 +289,8 @@ impl From<crate::enclave::Error> for LookupError {
                     received_at: _,
                 } => {
                     if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                        if let Some(retry_after_seconds) =
-                            extract_retry_after_seconds(response.headers())
-                        {
-                            return Self::RateLimited {
-                                retry_after_seconds,
-                            };
+                        if let Some(retry_later) = extract_retry_later(response.headers()) {
+                            return Self::RateLimited(retry_later);
                         }
                     }
                     Self::WebSocket(WebSocketServiceError::Http(response))
@@ -337,7 +337,7 @@ impl CdsiConnection {
     {
         log::info!("connecting to CDSI endpoint");
         let (connection, _info) = endpoint
-            .connect(auth, transport_connector)
+            .connect(auth, transport_connector, "cdsi".into())
             .inspect_err(|e| {
                 log::warn!("CDSI connection failed: {e}");
             })
@@ -348,7 +348,7 @@ impl CdsiConnection {
     }
 
     pub async fn connect_with(
-        connect: &tokio::sync::RwLock<ConnectState>,
+        connect: &tokio::sync::RwLock<ConnectState<impl WebSocketTransportConnectorFactory>>,
         resolver: &DnsResolver,
         route_provider: impl RouteProvider<Route = UnresolvedWebsocketServiceRoute>,
         confirmation_header_name: Option<HeaderName>,
@@ -356,14 +356,24 @@ impl CdsiConnection {
         params: &EndpointParams<'_, Cdsi>,
         auth: Auth,
     ) -> Result<Self, LookupError> {
-        let connection = ConnectState::connect_attested_ws(
+        let (connection, _route_info) = ConnectState::connect_attested_ws(
             connect,
             route_provider,
             auth,
             resolver,
             confirmation_header_name,
-            ws_config,
-            move |attestation_message| Cdsi::new_handshake(params, attestation_message),
+            (
+                ws_config,
+                // We don't want to race multiple websocket handshakes because when
+                // we take the first one, the others will be uncermoniously closed.
+                // That looks like unexpected behavior at the server end, and the
+                // wasted handshakes consume resources unnecessarily.  Instead,
+                // allow parallelism at the transport level but throttle the number
+                // of websocket handshakes that can complete.
+                ThrottlingConnector::new(crate::infra::ws::WithoutResponseHeaders::new(), 1),
+            ),
+            "cdsi".into(),
+            params,
         )
         .await?;
         Ok(Self(connection))
@@ -512,9 +522,9 @@ fn err_for_close(close: Option<CloseFrame<'_>>) -> LookupError {
                 log::warn!("failed to parse rate limit from reason");
                 return unexpected_close(close);
             };
-            LookupError::RateLimited {
+            LookupError::RateLimited(RetryLater {
                 retry_after_seconds,
-            }
+            })
         }
         CdsiCloseCode::ServerInternalError | CdsiCloseCode::ServerUnavailable => {
             LookupError::Server {
@@ -531,6 +541,7 @@ mod test {
 
     use assert_matches::assert_matches;
     use hex_literal::hex;
+    use itertools::Itertools as _;
     use libsignal_net_infra::testutil::InMemoryWarpConnector;
     use libsignal_net_infra::utils::ObservableEvent;
     use libsignal_net_infra::ws::testutil::fake_websocket;
@@ -736,10 +747,15 @@ mod test {
         ));
 
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
-                assert_eq!(fake_attestation, FAKE_ATTESTATION);
-                attest::sgx_session::testutil::handshake_from_tests_data()
-            })
+            AttestedConnection::connect(
+                client,
+                FAKE_WS_CONFIG,
+                "test".into(),
+                |fake_attestation| {
+                    assert_eq!(fake_attestation, FAKE_ATTESTATION);
+                    attest::sgx_session::testutil::handshake_from_tests_data()
+                },
+            )
             .await
             .expect("handshake failed"),
         );
@@ -763,6 +779,112 @@ mod test {
                 records: vec![FakeServerState::RESPONSE_RECORD],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn large_request_split() {
+        // Large requests should be split into multiple Noise packets, but those
+        // will be sent concatenated as a single websocket message since that's
+        // the form the CDSI server expectes.
+        const LARGE_NUMBER_OF_ENTRIES: u16 = 20_000;
+
+        let (server, client) = fake_websocket().await;
+
+        let mut fake_server = FakeServerState::default();
+        let (received_request_tx, mut received_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run_attested_server(
+            server,
+            attest::sgx_session::testutil::private_key(),
+            move |next_or_close| {
+                let frame = next_or_close.next_or(()).unwrap();
+                let mut output = fake_server.receive_frame(&frame);
+                match &fake_server {
+                    FakeServerState::AwaitingLookupRequest => (),
+                    FakeServerState::AwaitingTokenAck => {
+                        // Send the initial request for comparison.
+                        received_request_tx.send(frame).unwrap();
+                    }
+                    FakeServerState::Finished => {
+                        // Override the output to send a larger response message
+                        // that will be split over multiple Noise packets.
+                        let large_number_of_triples = (1..=LARGE_NUMBER_OF_ENTRIES)
+                            .map(|i| LookupResponseEntry {
+                                e164: E164::new(NonZeroU64::new(i.into()).unwrap()),
+                                aci: None,
+                                pni: None,
+                            })
+                            .collect_serialized();
+                        let serialized_response = ClientResponse {
+                            debug_permits_used: 1,
+                            e164_pni_aci_triples: large_number_of_triples,
+                            ..Default::default()
+                        }
+                        .encode_to_vec();
+                        assert!(
+                            serialized_response.len() > 10 * NOISE_TRANSPORT_PER_PACKET_MAX,
+                            "response size: {}",
+                            serialized_response.len()
+                        );
+                        *output.message.as_mut().unwrap() = serialized_response;
+                    }
+                }
+
+                output
+            },
+        ));
+
+        let cdsi_connection = CdsiConnection(
+            AttestedConnection::connect(
+                client,
+                FAKE_WS_CONFIG,
+                "test".into(),
+                |fake_attestation| {
+                    assert_eq!(fake_attestation, FAKE_ATTESTATION);
+                    attest::sgx_session::testutil::handshake_from_tests_data()
+                },
+            )
+            .await
+            .expect("handshake failed"),
+        );
+
+        let large_number_of_e164s = (1..=LARGE_NUMBER_OF_ENTRIES)
+            .map(|i| E164::new(NonZeroU64::new(i.into()).unwrap()))
+            .collect_vec();
+        let request = LookupRequest {
+            token: b"valid but ignored token".as_slice().into(),
+            new_e164s: large_number_of_e164s.clone(),
+            prev_e164s: large_number_of_e164s,
+            acis_and_access_keys: (1..=LARGE_NUMBER_OF_ENTRIES)
+                .map(|i| {
+                    let mut bytes = [0; 16];
+                    *bytes.first_chunk_mut().expect("long enough") = i.to_be_bytes();
+                    AciAndAccessKey {
+                        access_key: bytes,
+                        aci: Uuid::from_bytes(bytes).into(),
+                    }
+                })
+                .collect(),
+        };
+
+        let serialized_request = request.clone().into_client_request().encode_to_vec();
+
+        const NOISE_TRANSPORT_PER_PACKET_MAX: usize = 65535;
+        assert!(
+            serialized_request.len() > 10 * NOISE_TRANSPORT_PER_PACKET_MAX,
+            "request size: {}",
+            serialized_request.len()
+        );
+
+        let (_token, collector) = cdsi_connection
+            .send_request(request)
+            .await
+            .expect("request accepted");
+
+        let request_received_at_server = received_request_rx.recv().await.unwrap();
+        assert_eq!(request_received_at_server.len(), serialized_request.len());
+
+        let response = collector.collect().await.expect("successful request");
+        assert_eq!(response.records.len(), LARGE_NUMBER_OF_ENTRIES as usize);
     }
 
     const RETRY_AFTER_SECS: u32 = 12345;
@@ -790,10 +912,15 @@ mod test {
         ));
 
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
-                assert_eq!(fake_attestation, FAKE_ATTESTATION);
-                attest::sgx_session::testutil::handshake_from_tests_data()
-            })
+            AttestedConnection::connect(
+                client,
+                FAKE_WS_CONFIG,
+                "test".into(),
+                |fake_attestation| {
+                    assert_eq!(fake_attestation, FAKE_ATTESTATION);
+                    attest::sgx_session::testutil::handshake_from_tests_data()
+                },
+            )
             .await
             .expect("handshake failed"),
         );
@@ -807,9 +934,9 @@ mod test {
 
         assert_matches!(
             response,
-            Err(LookupError::RateLimited {
+            Err(LookupError::RateLimited(RetryLater {
                 retry_after_seconds: RETRY_AFTER_SECS
-            })
+            }))
         );
     }
 
@@ -836,10 +963,15 @@ mod test {
         ));
 
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
-                assert_eq!(fake_attestation, FAKE_ATTESTATION);
-                attest::sgx_session::testutil::handshake_from_tests_data()
-            })
+            AttestedConnection::connect(
+                client,
+                FAKE_WS_CONFIG,
+                "test".into(),
+                |fake_attestation| {
+                    assert_eq!(fake_attestation, FAKE_ATTESTATION);
+                    attest::sgx_session::testutil::handshake_from_tests_data()
+                },
+            )
             .await
             .expect("handshake failed"),
         );
@@ -856,9 +988,9 @@ mod test {
 
         assert_matches!(
             response,
-            Err(LookupError::RateLimited {
+            Err(LookupError::RateLimited(RetryLater {
                 retry_after_seconds: RETRY_AFTER_SECS
-            })
+            }))
         )
     }
 
@@ -886,9 +1018,9 @@ mod test {
         let result = CdsiConnection::connect(&endpoint_connection, connector, auth).await;
         assert_matches!(
             result,
-            Err(LookupError::RateLimited {
+            Err(LookupError::RateLimited(RetryLater {
                 retry_after_seconds: 100
-            })
+            }))
         )
     }
 
@@ -912,10 +1044,15 @@ mod test {
         ));
 
         let cdsi_connection = CdsiConnection(
-            AttestedConnection::connect(client, FAKE_WS_CONFIG, |fake_attestation| {
-                assert_eq!(fake_attestation, FAKE_ATTESTATION);
-                attest::sgx_session::testutil::handshake_from_tests_data()
-            })
+            AttestedConnection::connect(
+                client,
+                FAKE_WS_CONFIG,
+                "test".into(),
+                |fake_attestation| {
+                    assert_eq!(fake_attestation, FAKE_ATTESTATION);
+                    attest::sgx_session::testutil::handshake_from_tests_data()
+                },
+            )
             .await
             .expect("handshake failed"),
         );

@@ -4,28 +4,21 @@
 //
 
 use std::num::NonZeroU16;
-use std::str::FromStr;
-use std::time::Duration;
 
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use libsignal_bridge_macros::*;
-use libsignal_bridge_types::net::chat::{
-    AuthChat, HttpRequest, ResponseAndDebugInfo, ServerMessageAck,
-};
+use libsignal_bridge_types::net::chat::ServerMessageAck;
 use libsignal_bridge_types::net::{ConnectionManager, TokioAsyncContext};
 use libsignal_core::E164;
 use libsignal_net::cdsi::{CdsiProtocolError, LookupError, LookupResponse, LookupResponseEntry};
-use libsignal_net::chat::{
-    self, ChatServiceError, DebugInfo as ChatServiceDebugInfo, Response as ChatResponse,
-};
-use libsignal_net::infra::ws::WebSocketServiceError;
+use libsignal_net::infra::errors::RetryLater;
 use libsignal_net::infra::ws2::attested::AttestedProtocolError;
-use libsignal_net::infra::IpType;
 use libsignal_protocol::{Aci, Pni};
 use nonzero_ext::nonzero;
 use uuid::Uuid;
 
 use crate::*;
+
+pub mod chat;
 
 #[bridge_io(TokioAsyncContext)]
 async fn TESTING_CdsiLookupResponseConvert() -> LookupResponse {
@@ -82,13 +75,16 @@ macro_rules! make_error_testing_enum {
             }
         };
         impl TryFrom<String> for $name {
-            type Error = <Self as FromStr>::Err;
+            type Error = <Self as ::std::str::FromStr>::Err;
             fn try_from(value: String) -> Result<Self, Self::Error> {
-                FromStr::from_str(&value)
+                ::std::str::FromStr::from_str(&value)
             }
         }
     }
 }
+
+// Make accessible to child modules.
+use make_error_testing_enum;
 
 make_error_testing_enum! {
     enum TestingCdsiLookupError for LookupError {
@@ -126,9 +122,9 @@ fn TESTING_CdsiLookupErrorConvert(
             })
         }
         TestingCdsiLookupError::InvalidResponse => LookupError::InvalidResponse,
-        TestingCdsiLookupError::RetryAfter42Seconds => LookupError::RateLimited {
+        TestingCdsiLookupError::RetryAfter42Seconds => LookupError::RateLimited(RetryLater {
             retry_after_seconds: 42,
-        },
+        }),
         TestingCdsiLookupError::InvalidToken => LookupError::InvalidToken,
         TestingCdsiLookupError::InvalidArgument => LookupError::InvalidArgument {
             server_reason: "fake reason".into(),
@@ -145,168 +141,9 @@ fn TESTING_CdsiLookupErrorConvert(
     })
 }
 
-make_error_testing_enum! {
-    enum TestingChatServiceError for ChatServiceError {
-        WebSocket => WebSocket,
-        AppExpired => AppExpired,
-        DeviceDeregistered => DeviceDeregistered,
-        UnexpectedFrameReceived => UnexpectedFrameReceived,
-        ServerRequestMissingId => ServerRequestMissingId,
-        FailedToPassMessageToIncomingChannel => FailedToPassMessageToIncomingChannel,
-        IncomingDataInvalid => IncomingDataInvalid,
-        RequestHasInvalidHeader => RequestHasInvalidHeader,
-        Timeout => Timeout,
-        TimeoutEstablishingConnection => TimeoutEstablishingConnection,
-        AllConnectionRoutesFailed => AllConnectionRoutesFailed,
-        ServiceInactive => ServiceInactive,
-        ServiceUnavailable => ServiceUnavailable,
-        ServiceIntentionallyDisconnected => ServiceIntentionallyDisconnected,
-        RetryLater => RetryAfter42Seconds,
-    }
-}
-
-#[bridge_fn]
-fn TESTING_ChatServiceErrorConvert(
-    // The stringly-typed API makes the call sites more self-explanatory.
-    error_description: AsType<TestingChatServiceError, String>,
-) -> Result<(), ChatServiceError> {
-    Err(match error_description.into_inner() {
-        TestingChatServiceError::WebSocket => ChatServiceError::WebSocket(
-            libsignal_net::infra::ws::WebSocketServiceError::Other("testing"),
-        ),
-        TestingChatServiceError::AppExpired => ChatServiceError::AppExpired,
-        TestingChatServiceError::DeviceDeregistered => ChatServiceError::DeviceDeregistered,
-        TestingChatServiceError::UnexpectedFrameReceived => {
-            ChatServiceError::UnexpectedFrameReceived
-        }
-        TestingChatServiceError::ServerRequestMissingId => ChatServiceError::ServerRequestMissingId,
-        TestingChatServiceError::FailedToPassMessageToIncomingChannel => {
-            ChatServiceError::FailedToPassMessageToIncomingChannel
-        }
-        TestingChatServiceError::IncomingDataInvalid => ChatServiceError::IncomingDataInvalid,
-        TestingChatServiceError::RequestHasInvalidHeader => {
-            ChatServiceError::RequestHasInvalidHeader
-        }
-        TestingChatServiceError::Timeout => ChatServiceError::Timeout,
-        TestingChatServiceError::TimeoutEstablishingConnection => {
-            ChatServiceError::TimeoutEstablishingConnection { attempts: 42 }
-        }
-        TestingChatServiceError::AllConnectionRoutesFailed => {
-            ChatServiceError::AllConnectionRoutesFailed { attempts: 42 }
-        }
-        TestingChatServiceError::ServiceInactive => ChatServiceError::ServiceInactive,
-        TestingChatServiceError::ServiceUnavailable => ChatServiceError::ServiceUnavailable,
-        TestingChatServiceError::ServiceIntentionallyDisconnected => {
-            ChatServiceError::ServiceIntentionallyDisconnected
-        }
-        TestingChatServiceError::RetryAfter42Seconds => ChatServiceError::RetryLater {
-            retry_after_seconds: 42,
-        },
-    })
-}
-
-#[bridge_fn]
-fn TESTING_ChatServiceResponseConvert(
-    body_present: bool,
-) -> Result<ChatResponse, ChatServiceError> {
-    let body = match body_present {
-        true => Some(b"content".to_vec().into_boxed_slice()),
-        false => None,
-    };
-    let mut headers = HeaderMap::new();
-    headers.append(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
-    headers.append(http::header::FORWARDED, HeaderValue::from_static("1.1.1.1"));
-    Ok(ChatResponse {
-        status: StatusCode::OK,
-        message: Some("OK".to_string()),
-        body,
-        headers,
-    })
-}
-
-#[bridge_fn]
-fn TESTING_ChatServiceDebugInfoConvert() -> Result<ChatServiceDebugInfo, ChatServiceError> {
-    Ok(ChatServiceDebugInfo {
-        ip_type: Some(IpType::V4),
-        duration: Duration::from_millis(200),
-        connection_info: "connection_info".to_string(),
-    })
-}
-
-#[bridge_fn]
-fn TESTING_ChatServiceResponseAndDebugInfoConvert() -> Result<ResponseAndDebugInfo, ChatServiceError>
-{
-    Ok(ResponseAndDebugInfo {
-        response: TESTING_ChatServiceResponseConvert(true)?,
-        debug_info: TESTING_ChatServiceDebugInfoConvert()?,
-    })
-}
-
-#[bridge_fn]
-fn TESTING_ChatRequestGetMethod(request: &HttpRequest) -> String {
-    request.method.to_string()
-}
-
-#[bridge_fn]
-fn TESTING_ChatRequestGetPath(request: &HttpRequest) -> String {
-    request.path.to_string()
-}
-
-#[bridge_fn]
-fn TESTING_ChatRequestGetHeaderValue(request: &HttpRequest, header_name: String) -> String {
-    request
-        .headers
-        .lock()
-        .expect("not poisoned")
-        .get(HeaderName::try_from(header_name).expect("valid header name"))
-        .expect("header value present")
-        .to_str()
-        .expect("value is a string")
-        .to_string()
-}
-
-#[bridge_fn]
-fn TESTING_ChatRequestGetBody(request: &HttpRequest) -> Vec<u8> {
-    request
-        .body
-        .clone()
-        .map(|b| b.into_vec())
-        .unwrap_or_default()
-}
-
-#[bridge_fn]
-fn TESTING_ChatService_InjectRawServerRequest(chat: &AuthChat, bytes: &[u8]) {
-    let request_proto = <chat::RequestProto as prost::Message>::decode(bytes)
-        .expect("invalid protobuf cannot use this endpoint to test");
-    chat.synthetic_request_tx
-        .blocking_send(chat::ws::ServerEvent::fake(request_proto))
-        .expect("not closed");
-}
-
-#[bridge_fn]
-fn TESTING_ChatService_InjectConnectionInterrupted(chat: &AuthChat) {
-    chat.synthetic_request_tx
-        .blocking_send(chat::ws::ServerEvent::Stopped(ChatServiceError::WebSocket(
-            WebSocketServiceError::ChannelClosed,
-        )))
-        .expect("not closed");
-}
-
-#[bridge_fn]
-fn TESTING_ChatService_InjectIntentionalDisconnect(chat: &AuthChat) {
-    chat.synthetic_request_tx
-        .blocking_send(chat::ws::ServerEvent::Stopped(
-            ChatServiceError::ServiceIntentionallyDisconnected,
-        ))
-        .expect("not closed");
-}
-
 #[bridge_fn(jni = false, ffi = false)]
 fn TESTING_ServerMessageAck_Create() -> ServerMessageAck {
-    ServerMessageAck::new(Box::new(|_| Box::pin(std::future::ready(Ok(())))))
+    ServerMessageAck::new(Box::new(|_| Ok(())))
 }
 
 #[bridge_fn(jni = false, ffi = false)]
@@ -315,20 +152,23 @@ fn TESTING_ConnectionManager_newLocalOverride(
     chatPort: AsType<NonZeroU16, u16>,
     cdsiPort: AsType<NonZeroU16, u16>,
     svr2Port: AsType<NonZeroU16, u16>,
-    svr3SgxPort: AsType<NonZeroU16, u16>,
-    svr3NitroPort: AsType<NonZeroU16, u16>,
-    svr3Tpm2SnpPort: AsType<NonZeroU16, u16>,
     rootCertificateDer: &[u8],
 ) -> ConnectionManager {
     let ports = net_env::LocalhostEnvPortConfig {
         chat_port: chatPort.into_inner(),
         cdsi_port: cdsiPort.into_inner(),
         svr2_port: svr2Port.into_inner(),
-        svr3_sgx_port: svr3SgxPort.into_inner(),
-        svr3_nitro_port: svr3NitroPort.into_inner(),
-        svr3_tpm2_snp_port: svr3Tpm2SnpPort.into_inner(),
     };
 
     let env = net_env::localhost_test_env_with_ports(ports, rootCertificateDer);
     ConnectionManager::new_from_static_environment(env, userAgent.as_str())
+}
+
+#[bridge_fn]
+fn TESTING_ConnectionManager_isUsingProxy(manager: &ConnectionManager) -> i32 {
+    match manager.is_using_proxy() {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
 }

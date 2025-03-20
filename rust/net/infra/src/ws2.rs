@@ -6,8 +6,9 @@
 use std::fmt::Display;
 use std::io::Error as IoError;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use futures_util::{Sink, SinkExt as _, Stream, StreamExt as _};
+use futures_util::{SinkExt as _, Stream, StreamExt as _};
 use pin_project::pin_project;
 use tokio::select;
 use tokio::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use tungstenite::protocol::CloseFrame;
 use tungstenite::Message;
 
 use crate::errors::LogSafeDisplay;
-use crate::ws::{TextOrBinary, WebSocketServiceError};
+use crate::ws::{TextOrBinary, WebSocketServiceError, WebSocketStreamLike};
 
 pub mod attested;
 
@@ -100,6 +101,9 @@ pub struct Connection<S, R> {
 
     /// Configuration for this websocket client's behavior.
     config: Config,
+
+    /// A tag to include in log lines, to disambiguate multiple websockets.
+    log_tag: Arc<str>,
 }
 
 /// Fatal error that causes a connection to be closed.
@@ -142,7 +146,8 @@ pub enum MessageEvent<Meta> {
 /// This can't necessarily be precise since there are network delays and
 /// queueing involved and so a "simultaneous" disconnect can result in each side
 /// seeing a different outcome.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 pub enum FinishReason {
     /// The local end disconnected first.
     LocalDisconnect,
@@ -156,7 +161,7 @@ pub enum FinishReason {
 /// in response to sending on an established (post-handshake) connection. It was
 /// manually produced by tracing through original sites for all the possible
 /// errors and seeing where those intersected calls originating from
-/// [`tokio_tungstenite::WebSocketStream::send`] and friends.
+/// [`tokio_tungstenite::WebSocketStream`]'s `send()` and friends.
 #[derive(Debug, thiserror::Error)]
 pub enum TungsteniteSendError {
     /// Like [`tungstenite::Error::AlreadyClosed`].
@@ -175,7 +180,7 @@ pub enum TungsteniteSendError {
 /// in response to receiving on an established (post-handshake) connection. It
 /// was manually produced by tracing through original sites for all the possible
 /// errors and seeing where those intersected calls originating from
-/// [`tokio_tungstenite::WebSocketStream::next`] and friends.
+/// [`tokio_tungstenite::WebSocketStream`]'s `next()` and friends.
 #[derive(Debug, thiserror::Error)]
 pub enum TungsteniteReceiveError {
     /// Like [`tungstenite::Error::Io`].
@@ -200,7 +205,7 @@ impl<S, R, SendMeta> Connection<S, R>
 where
     R: Stream<Item = (TextOrBinary, SendMeta)>,
 {
-    pub fn new(stream: S, outgoing_rx: R, config: Config) -> Self {
+    pub fn new(stream: S, outgoing_rx: R, config: Config, log_tag: Arc<str>) -> Self {
         Self {
             stream,
             outgoing_rx,
@@ -210,6 +215,7 @@ where
             last_heard_from_server: None,
             last_sent_to_server: None,
             last_sent_ping_to_server: None,
+            log_tag,
         }
     }
 
@@ -236,8 +242,7 @@ where
         self: Pin<&mut Self>,
     ) -> Outcome<MessageEvent<SendMeta>, Result<FinishReason, NextEventError>>
     where
-        S: Stream<Item = Result<Message, tungstenite::Error>>
-            + Sink<Message, Error = tungstenite::Error>,
+        S: WebSocketStreamLike,
     {
         let ConnectionProj {
             mut stream,
@@ -253,6 +258,7 @@ where
             last_sent_to_server,
             last_sent_ping_to_server,
             last_heard_from_server,
+            log_tag,
         } = self.project();
 
         // For the first call this function, assume we just heard from & sent to
@@ -383,16 +389,24 @@ where
                         // tungstenite handles pings internally, nothing to do here.
                         Outcome::Continue(MessageEvent::ReceivedPingPong)
                     }
-                    Message::Close(None)
-                    | Message::Close(Some(CloseFrame {
-                        code: CloseCode::Normal,
-                        ..
-                    })) => Outcome::Finished(Ok(FinishReason::RemoteDisconnect)),
-                    Message::Close(Some(CloseFrame { code, reason })) => {
-                        Outcome::Finished(Err(NextEventError::AbnormalServerClose {
-                            code,
-                            reason: reason.into_owned(),
-                        }))
+                    Message::Close(close) => {
+                        let code = close.as_ref().map(|c| c.code);
+                        log::info!(
+                            "[{log_tag}] received a close frame from the server with code {code:?}",
+                        );
+                        match close {
+                            None
+                            | Some(CloseFrame {
+                                code: CloseCode::Normal,
+                                ..
+                            }) => Outcome::Finished(Ok(FinishReason::RemoteDisconnect)),
+                            Some(CloseFrame { code, reason }) => {
+                                Outcome::Finished(Err(NextEventError::AbnormalServerClose {
+                                    code,
+                                    reason: reason.into_owned(),
+                                }))
+                            }
+                        }
                     }
                     Message::Frame(_) => {
                         unreachable!("Message::Frame is never returned for a read")
@@ -644,6 +658,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -679,6 +694,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -728,6 +744,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -795,6 +812,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -817,6 +835,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -849,6 +868,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -880,6 +900,7 @@ mod test {
                 remote_idle_ping_timeout: FOREVER,
                 remote_idle_disconnect_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -907,7 +928,7 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sends_ping_after_remote_inactivity() {
+    async fn sends_ping_after_remote_inactivity_then_time_out() {
         // A single ping will be sent locally before the server times out.
         const REMOTE_IDLE_PING_TIMEOUT: Duration = Duration::from_secs(12);
         const REMOTE_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -922,6 +943,7 @@ mod test {
                 remote_idle_disconnect_timeout: REMOTE_DISCONNECT_TIMEOUT,
                 local_idle_timeout: FOREVER,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 
@@ -957,6 +979,7 @@ mod test {
                 remote_idle_ping_timeout: REMOTE_IDLE_TIMEOUT,
                 remote_idle_disconnect_timeout: REMOTE_DISCONNECT_TIMEOUT,
             },
+            "test".into(),
         );
         pin_mut!(connection);
 

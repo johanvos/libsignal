@@ -189,8 +189,9 @@ pub fn run_future_on_runtime<'cx, R, F, O, E>(
 ) -> JsResult<'cx, JsPromise>
 where
     R: AsyncRuntime<F>,
-    F: Future + std::panic::UnwindSafe + 'static,
-    F::Output: ResultReporter<Receiver = PromiseSettler<O, E>>,
+    F: Future<Output: ResultReporter<Receiver = PromiseSettler<O, E>>>
+        + std::panic::UnwindSafe
+        + 'static,
     O: for<'a> ResultTypeInfo<'a> + Send + std::panic::UnwindSafe + 'static,
     E: SignalNodeError + Send + 'static,
 {
@@ -232,7 +233,7 @@ impl<T: Future> Future for AssertSendSafe<T> {
     }
 }
 
-/// A wrapper around [neon::Channel] that restricts direct use to the Neon Context where it was
+/// A wrapper around [`neon::event::Channel`] that restricts direct use to the Neon Context where it was
 /// created.
 ///
 /// This allows us to implement [`AsyncRuntime`] for non-Send Futures: we start them here, on the
@@ -256,9 +257,7 @@ impl AsyncRuntimeBase for ChannelOnItsOriginalThread<'_> {}
 
 impl<F> AsyncRuntime<F> for ChannelOnItsOriginalThread<'_>
 where
-    F: Future + 'static,
-    F::Output: ResultReporter,
-    <F::Output as ResultReporter>::Receiver: Send,
+    F: Future<Output: ResultReporter<Receiver: Send>> + 'static,
 {
     // Cancellation isn't supported at this time.
     type Cancellation = std::future::Pending<()>;

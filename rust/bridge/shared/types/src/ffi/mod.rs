@@ -191,6 +191,7 @@ pub struct FfiResponseAndDebugInfo {
     debug_info: FfiChatServiceDebugInfo,
 }
 
+#[cfg_attr(doc, visibility::make(pub))]
 struct UnexpectedPanic(Box<dyn std::any::Any + Send>);
 
 impl std::fmt::Debug for UnexpectedPanic {
@@ -198,6 +199,48 @@ impl std::fmt::Debug for UnexpectedPanic {
         f.debug_tuple("UnexpectedPanic")
             .field(&describe_panic(&self.0))
             .finish()
+    }
+}
+
+// Wrapper for a `*mut T` that gets translated by cbindgen into a named struct
+// type in the generated C header file. This is useful because the consuming
+// Swift code considers all opaque pointers to be the same type, but
+// differentiates between the generated named struct types.
+#[repr(C)]
+#[derive(derive_more::From)]
+#[derive_where(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MutPointer<T> {
+    raw: *mut T,
+}
+
+impl<T> MutPointer<T> {
+    pub fn into_inner(self) -> *mut T {
+        self.raw
+    }
+
+    pub fn null() -> Self {
+        Self {
+            raw: std::ptr::null_mut(),
+        }
+    }
+}
+
+// Wrapped `*const T`. This type exists for the same reason `MutPointer` does.
+#[repr(C)]
+#[derive_where(Copy, Clone, Debug, PartialEq)]
+pub struct ConstPointer<T> {
+    raw: *const T,
+}
+
+impl<T> From<&T> for ConstPointer<T> {
+    fn from(raw: &T) -> Self {
+        Self { raw }
+    }
+}
+
+impl<T> ConstPointer<T> {
+    pub fn into_inner(self) -> *const T {
+        self.raw
     }
 }
 
@@ -261,14 +304,14 @@ macro_rules! ffi_bridge_handle_destroy {
             )]
             #[allow(non_snake_case)]
             pub unsafe extern "C" fn [<__bridge_handle_ffi_ $ffi_name _destroy>](
-                p: *mut $typ
+                p: $crate::ffi::MutPointer<$typ>
             ) -> *mut ffi::SignalFfiError {
                 // The only thing the closure does is drop the value if there is
                 // one. Drop shouldn't panic, and if it does and leaves the
                 // value in an (internally) inconsistent state, that's fine
                 // for the purposes of unwind safety since this is the last
                 // reference to the value.
-                let p = std::panic::AssertUnwindSafe(p);
+                let p = std::panic::AssertUnwindSafe(p.into_inner());
                 ffi::run_ffi_safe(|| {
                     if !p.is_null() {
                         drop(Box::from_raw(*p));

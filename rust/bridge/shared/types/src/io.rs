@@ -21,6 +21,8 @@ use mediasan_common::{AsyncSkip, Skip};
 pub enum InputStreamRead<'a> {
     /// The read operation must be completed by awaiting a [`Future`] yielding the read bytes. The buffer provided to
     /// [`InputStream::read`] was not modified.
+    ///
+    /// [`Future`]: std::future::Future
     Pending(LocalBoxFuture<'a, io::Result<Vec<u8>>>),
 
     /// The read operation completed immediately, and `amount_read` bytes were copied into the buffer provided to
@@ -164,10 +166,7 @@ impl AsyncRead for AsyncInput<'_> {
             AsyncInputState::Idle => self.stream.read(buf)?,
             AsyncInputState::Reading(read_future) => InputStreamRead::Pending(read_future),
             AsyncInputState::Skipping { .. } => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "cannot read while skipping",
-                )))
+                return Poll::Ready(Err(io::Error::other("cannot read while skipping")))
             }
         };
 

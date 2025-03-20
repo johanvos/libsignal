@@ -20,7 +20,7 @@ use crate::certs::RootCertificates;
 use crate::connection_manager::{
     MultiRouteConnectionManager, SingleRouteThrottlingConnectionManager,
 };
-use crate::errors::TransportConnectError;
+use crate::errors::{LogSafeDisplay, RetryLater, TransportConnectError};
 use crate::host::Host;
 use crate::timeouts::{WS_KEEP_ALIVE_INTERVAL, WS_MAX_IDLE_INTERVAL};
 use crate::utils::ObservableEvent;
@@ -68,9 +68,20 @@ impl From<&IpAddr> for IpType {
     }
 }
 
+impl LogSafeDisplay for IpType {}
+impl std::fmt::Display for IpType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
 /// Whether or not to enable domain fronting.
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
-pub struct EnableDomainFronting(pub bool);
+pub enum EnableDomainFronting {
+    No,
+    OneDomainPerProxy,
+    AllDomains,
+}
 
 /// A collection of commonly used decorators for HTTP requests.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +190,7 @@ pub struct ServiceConnectionInfo {
 /// remote host.
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
-pub struct ConnectionInfo {
+pub struct TransportInfo {
     /// The IP address version over which the connection is established.
     pub ip_version: IpType,
 
@@ -189,8 +200,8 @@ pub struct ConnectionInfo {
 
 /// An established connection.
 pub trait Connection {
-    /// Returns information about the connection.
-    fn connection_info(&self) -> ConnectionInfo;
+    /// Returns transport-level information about the connection.
+    fn transport_info(&self) -> TransportInfo;
 }
 
 /// Source for the result of a hostname lookup.
@@ -215,7 +226,7 @@ pub enum DnsSource {
 }
 
 /// Type of the route used for the connection.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, strum::Display)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, strum::Display, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum RouteType {
     /// Direct connection to the service.
@@ -298,9 +309,9 @@ impl<T> StreamAndInfo<T> {
     }
 }
 
-pub trait AsyncDuplexStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
+pub trait AsyncDuplexStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
-impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncDuplexStream for S {}
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncDuplexStream for S {}
 
 /// Establishes TCP/TLS connections to remote destinations.
 ///
@@ -381,18 +392,19 @@ pub fn make_ws_config(
 
 /// Extracts and parses the `Retry-After` header.
 ///
-/// Returns raw seconds rather than `Duration` to guarantee the smaller range.
-///
 /// Does not support the "http-date" form of the header.
-pub fn extract_retry_after_seconds(headers: &http::header::HeaderMap) -> Option<u32> {
-    headers.get("retry-after")?.to_str().ok()?.parse().ok()
+pub fn extract_retry_later(headers: &http::header::HeaderMap) -> Option<RetryLater> {
+    let retry_after_seconds = headers.get("retry-after")?.to_str().ok()?.parse().ok()?;
+    Some(RetryLater {
+        retry_after_seconds,
+    })
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub mod testutil {
     use std::fmt::Debug;
     use std::io;
-    use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+    use std::io::Error as IoError;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -490,8 +502,7 @@ pub mod testutil {
     #[async_trait]
     impl<F> TransportConnector for InMemoryWarpConnector<F>
     where
-        F: Filter + Clone + Send + Sync + 'static,
-        F::Extract: Reply,
+        F: Filter<Extract: Reply> + Clone + Send + Sync + 'static,
     {
         type Stream = DuplexStream;
 
@@ -525,10 +536,13 @@ pub mod testutil {
 
     impl<C> NoReconnectService<C>
     where
-        C: ServiceConnector + Send + Sync + 'static,
-        C::Service: Clone + Send + Sync + 'static,
-        C::Channel: Send + Sync,
-        C::ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+        C: ServiceConnector<
+                Service: Clone + Send + Sync + 'static,
+                Channel: Send + Sync,
+                ConnectError: Send + Sync + Debug + LogSafeDisplay + ErrorClassifier,
+            > + Send
+            + Sync
+            + 'static,
     {
         pub async fn start<M>(service_connector: C, connection_manager: M) -> Self
         where
@@ -601,30 +615,31 @@ pub mod testutil {
         type Error = E;
 
         fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.get_mut().tx.poll_ready_unpin(cx).map_err(|_| {
-                IoError::new(IoErrorKind::Other, "poll_reserve for send failed").into()
-            })
+            self.get_mut()
+                .tx
+                .poll_ready_unpin(cx)
+                .map_err(|_| IoError::other("poll_reserve for send failed").into())
         }
 
         fn start_send(self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
             self.get_mut()
                 .tx
                 .start_send_unpin(Ok(item))
-                .map_err(|_| IoError::new(IoErrorKind::Other, "send failed").into())
+                .map_err(|_| IoError::other("send failed").into())
         }
 
         fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.get_mut()
                 .tx
                 .poll_flush_unpin(cx)
-                .map_err(|_| IoError::new(IoErrorKind::Other, "flush failed").into())
+                .map_err(|_| IoError::other("flush failed").into())
         }
 
         fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
             self.get_mut()
                 .tx
                 .poll_close_unpin(cx)
-                .map_err(|_| IoError::new(IoErrorKind::Other, "close failed").into())
+                .map_err(|_| IoError::other("close failed").into())
         }
     }
 }
@@ -653,7 +668,7 @@ pub(crate) mod test {
 
         assert_eq!(
             ServiceConnectionInfo {
-                address: Host::Ip(ip_addr!("1.2.3.4")),
+                address: Host::Ip(ip_addr!("192.0.2.4")),
                 ..connection_info
             }
             .description(),

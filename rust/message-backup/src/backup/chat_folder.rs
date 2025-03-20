@@ -8,12 +8,12 @@
 // crate, but we want intra-crate privacy.
 #![allow(clippy::manual_non_exhaustive)]
 
+use intmap::IntMap;
 use itertools::Itertools;
 
 use crate::backup::frame::RecipientId;
-use crate::backup::map::IntMap;
 use crate::backup::method::LookupPair;
-use crate::backup::recipient::DestinationKind;
+use crate::backup::recipient::{DestinationKind, MinimalRecipientData};
 use crate::backup::serialize::{SerializeOrder, UnorderedList};
 use crate::backup::TryFromWith;
 use crate::proto::backup as proto;
@@ -121,8 +121,8 @@ impl<R> ChatFolder<R> {
     }
 }
 
-impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R>> TryFromWith<proto::ChatFolder, C>
-    for ChatFolder<R>
+impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R>>
+    TryFromWith<proto::ChatFolder, C> for ChatFolder<R>
 {
     type Error = ChatFolderError;
     fn try_from_with(item: proto::ChatFolder, context: &C) -> Result<Self, Self::Error> {
@@ -160,9 +160,10 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R>> TryFromWith<proto
                 if seen_included_members.insert(id, ()).is_some() {
                     return Err(ChatFolderError::IncludedMemberDuplicate(id));
                 }
-                let (kind, recipient) = context
+                let (data, recipient) = context
                     .lookup_pair(&id)
                     .ok_or(ChatFolderError::IncludedMemberUnknown(id))?;
+                let kind = data.as_ref();
                 match kind {
                     DestinationKind::Contact | DestinationKind::Self_ | DestinationKind::Group => {
                         Ok(recipient.clone())
@@ -184,12 +185,13 @@ impl<R: Clone, C: LookupPair<RecipientId, DestinationKind, R>> TryFromWith<proto
                 if seen_excluded_members.insert(id, ()).is_some() {
                     return Err(ChatFolderError::ExcludedMemberDuplicate(id));
                 }
-                if seen_included_members.get(&id).is_some() {
+                if seen_included_members.get(id).is_some() {
                     return Err(ChatFolderError::MemberIsBothIncludedAndExcluded(id));
                 }
-                let (kind, recipient) = context
+                let (data, recipient) = context
                     .lookup_pair(&id)
                     .ok_or(ChatFolderError::ExcludedMemberUnknown(id))?;
+                let kind = data.as_ref();
                 match kind {
                     DestinationKind::Contact | DestinationKind::Self_ | DestinationKind::Group => {
                         Ok(recipient.clone())
@@ -279,7 +281,7 @@ mod test {
     #[test_case(|x| x.excludedRecipientIds.push(TestContext::SELF_ID.0) => Ok(()); "excluding Self is okay")]
     #[test_case(|x| x.excludedRecipientIds.push(TestContext::CALL_LINK_ID.0) => Err(ChatFolderError::ExcludedMemberWrongKind(TestContext::CALL_LINK_ID, DestinationKind::CallLink)); "excluding call links is not okay")]
     #[test_case(|x| x.excludedRecipientIds.push(TestContext::CONTACT_ID.0) => Err(ChatFolderError::ExcludedMemberDuplicate(TestContext::CONTACT_ID)); "duplicate exclusion")]
-    #[test_case(|x| x.excludedRecipientIds.push(9999) => Err(ChatFolderError::ExcludedMemberUnknown(RecipientId(9999))); "unknown exclusion")]
+    #[test_case(|x| x.excludedRecipientIds.push(TestContext::NONEXISTENT_ID.0) => Err(ChatFolderError::ExcludedMemberUnknown(TestContext::NONEXISTENT_ID)); "unknown exclusion")]
     #[test_case(|x| {
         x.includeAllGroupChats = false;
         x.includedRecipientIds.push(TestContext::GROUP_ID.0);
@@ -289,7 +291,7 @@ mod test {
         x.includedRecipientIds.push(TestContext::GROUP_ID.0);
         x.includedRecipientIds.push(TestContext::GROUP_ID.0);
     } => Err(ChatFolderError::IncludedMemberDuplicate(TestContext::GROUP_ID)); "duplicate inclusion")]
-    #[test_case(|x| x.includedRecipientIds.push(9999) => Err(ChatFolderError::IncludedMemberUnknown(RecipientId(9999))); "unknown inclusion")]
+    #[test_case(|x| x.includedRecipientIds.push(TestContext::NONEXISTENT_ID.0) => Err(ChatFolderError::IncludedMemberUnknown(TestContext::NONEXISTENT_ID)); "unknown inclusion")]
     #[test_case(|x| x.includedRecipientIds.push(TestContext::CALL_LINK_ID.0) => Err(ChatFolderError::IncludedMemberWrongKind(TestContext::CALL_LINK_ID, DestinationKind::CallLink)); "including call links is not okay")]
     #[test_case(|x| x.includedRecipientIds.push(TestContext::CONTACT_ID.0) => Err(ChatFolderError::MemberIsBothIncludedAndExcluded(TestContext::CONTACT_ID)); "member in both lists")]
     #[test_case(|x| x.includedRecipientIds.push(TestContext::GROUP_ID.0) => Ok(()); "include a group even though all groups are included by default")]

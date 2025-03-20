@@ -3,36 +3,39 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-use std::future::Future;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use futures_util::TryFutureExt;
 use tokio::net::TcpStream;
-use tokio_boring_signal::SslStream;
 use tokio_util::either::Either;
 
 use crate::errors::TransportConnectError;
 use crate::route::{ConnectionProxyRoute, Connector, ConnectorExt as _, TlsRoute};
-use crate::tcp_ssl::proxy::socks::SocksStream;
 use crate::{Connection, IpType};
 
+pub mod https;
 pub mod socks;
 pub mod tls;
+
+mod stream;
+pub use stream::ProxyStream;
 
 /// Stateless [`Connector`] impl for [`ConnectionProxyRoute`].
 #[derive(Debug, Default)]
 pub struct StatelessProxied;
 
 impl Connector<ConnectionProxyRoute<IpAddr>, ()> for StatelessProxied {
-    type Connection = Either<SslStream<TcpStream>, Either<TcpStream, SocksStream>>;
+    type Connection = ProxyStream;
 
     type Error = TransportConnectError;
 
-    fn connect_over(
+    async fn connect_over(
         &self,
         (): (),
         route: ConnectionProxyRoute<IpAddr>,
-    ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
+        log_tag: Arc<str>,
+    ) -> Result<Self::Connection, Self::Error> {
         match route {
             ConnectionProxyRoute::Tls { proxy } => {
                 let TlsRoute {
@@ -41,44 +44,43 @@ impl Connector<ConnectionProxyRoute<IpAddr>, ()> for StatelessProxied {
                 } = proxy;
 
                 let connector = super::StatelessDirect;
-                Either::Left(async move {
-                    let tcp = connector.connect(inner).await?;
-                    connector
-                        .connect_over(tcp, tls_fragment)
-                        .await
-                        .map(Either::Left)
-                })
+
+                let tcp = connector.connect(inner, log_tag.clone()).await?;
+                connector
+                    .connect_over(tcp, tls_fragment, log_tag)
+                    .await
+                    .map(Into::into)
             }
             ConnectionProxyRoute::Tcp { proxy } => {
                 let connector = super::StatelessDirect;
-                Either::Right(Either::Left(async move {
-                    match connector.connect(proxy).await {
-                        Ok(connection) => Ok(Either::Right(Either::Left(connection))),
-                        Err(_io_error) => Err(TransportConnectError::TcpConnectionFailed),
-                    }
-                }))
+                match connector.connect(proxy, log_tag).await {
+                    Ok(connection) => Ok(connection.into()),
+                    Err(_io_error) => Err(TransportConnectError::TcpConnectionFailed),
+                }
             }
-            ConnectionProxyRoute::Socks(route) => Either::Right(Either::Right(
-                self.connect(route)
-                    .map_ok(|connection| Either::Right(Either::Right(connection))),
-            )),
+            ConnectionProxyRoute::Socks(route) => {
+                self.connect(route, log_tag).map_ok(Into::into).await
+            }
+            ConnectionProxyRoute::Https(route) => {
+                self.connect(route, log_tag).map_ok(Into::into).await
+            }
         }
     }
 }
 
 impl<L: Connection, R: Connection> Connection for Either<L, R> {
-    fn connection_info(&self) -> crate::ConnectionInfo {
+    fn transport_info(&self) -> crate::TransportInfo {
         match self {
-            Self::Left(l) => l.connection_info(),
-            Self::Right(r) => r.connection_info(),
+            Self::Left(l) => l.transport_info(),
+            Self::Right(r) => r.transport_info(),
         }
     }
 }
 
 impl Connection for TcpStream {
-    fn connection_info(&self) -> crate::ConnectionInfo {
+    fn transport_info(&self) -> crate::TransportInfo {
         let local_addr = self.local_addr().expect("has local addr");
-        crate::ConnectionInfo {
+        crate::TransportInfo {
             ip_version: IpType::from(&local_addr.ip()),
             local_port: local_addr.port(),
         }
@@ -89,33 +91,29 @@ impl Connection for TcpStream {
 pub(crate) mod testutil {
     use std::future::Future;
     use std::net::{Ipv6Addr, SocketAddr};
+    use std::sync::LazyLock;
 
     use assert_matches::assert_matches;
     use boring_signal::pkey::PKey;
     use boring_signal::ssl::{SslAcceptor, SslMethod};
     use boring_signal::x509::X509;
     use futures_util::{pin_mut, Stream, StreamExt as _};
-    use lazy_static::lazy_static;
     use rcgen::CertifiedKey;
     use tls_parser::{ClientHello, TlsExtension, TlsMessage, TlsMessageHandshake, TlsPlaintext};
     use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufStream};
 
     pub(crate) const PROXY_HOSTNAME: &str = "test-proxy.signal.org.local";
 
-    lazy_static! {
-        pub(crate) static ref PROXY_CERTIFICATE: CertifiedKey =
-            rcgen::generate_simple_self_signed([PROXY_HOSTNAME.to_string()]).expect("can generate");
-    }
+    pub(crate) static PROXY_CERTIFICATE: LazyLock<CertifiedKey> = LazyLock::new(|| {
+        rcgen::generate_simple_self_signed([PROXY_HOSTNAME.to_string()]).expect("can generate")
+    });
 
     struct ProxyServer<S> {
         incoming_connections_stream: S,
         upstream_addr: SocketAddr,
     }
 
-    impl<S: Stream> ProxyServer<S>
-    where
-        S::Item: AsyncRead + AsyncWrite,
-    {
+    impl<S: Stream<Item: AsyncRead + AsyncWrite>> ProxyServer<S> {
         async fn proxy(self) {
             let Self {
                 incoming_connections_stream,

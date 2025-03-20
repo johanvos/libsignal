@@ -225,7 +225,7 @@ pub trait ResultReporter {
 /// counter to generate IDs---2^64 *nanoseconds* is over 500 years.
 ///
 /// This type is designed to not need cleanup across language bridges.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, derive_more::From)]
 pub enum CancellationId {
     NotSupported,
     Id(NonZeroU64),
@@ -246,12 +246,6 @@ impl From<u64> for CancellationId {
             Ok(value) => Self::Id(value),
             Err(_) => Self::NotSupported,
         }
-    }
-}
-
-impl From<NonZeroU64> for CancellationId {
-    fn from(value: NonZeroU64) -> Self {
-        Self::Id(value)
     }
 }
 
@@ -278,10 +272,7 @@ pub trait AsyncRuntimeBase {
 ///
 /// Putting the future type in the trait signature allows runtimes to impose additional
 /// requirements, such as `Send`, on the Futures they can run.
-pub trait AsyncRuntime<F: Future>: AsyncRuntimeBase
-where
-    F::Output: ResultReporter,
-{
+pub trait AsyncRuntime<F: Future<Output: ResultReporter>>: AsyncRuntimeBase {
     type Cancellation: Future<Output = ()>;
 
     /// Runs the provided future to completion, then reports the result.
@@ -303,10 +294,7 @@ pub struct NoOpAsyncRuntime;
 
 impl AsyncRuntimeBase for NoOpAsyncRuntime {}
 
-impl<F: Future> AsyncRuntime<F> for NoOpAsyncRuntime
-where
-    F::Output: ResultReporter,
-{
+impl<F: Future<Output: ResultReporter>> AsyncRuntime<F> for NoOpAsyncRuntime {
     type Cancellation = std::future::Pending<()>;
 
     fn run_future(

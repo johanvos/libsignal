@@ -13,15 +13,15 @@ use libsignal_core::ServiceIdKind;
 use zkgroup::GroupMasterKeyBytes;
 
 use crate::backup::serialize::{self, UnorderedList};
-use crate::backup::time::{Duration, ReportUnusualTimestamp};
+use crate::backup::time::{Duration, ReportUnusualTimestamp, TimestampError};
 use crate::backup::{likely_empty, TryFromWith, TryIntoWith};
 use crate::proto::backup as proto;
 
 mod members;
 use members::*;
 
-#[derive(Debug, serde::Serialize)]
-#[cfg_attr(test, derive(PartialEq, Clone))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct GroupSnapshot {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -80,6 +80,8 @@ pub enum GroupError {
     MemberPendingProfileKeyHasProfileKey,
     /// MemberPendingProfileKey's userId and addedByUserId are the same
     MemberPendingProfileKeyWasInvitedBySelf,
+    /// {0}
+    InvalidTimestamp(#[from] TimestampError),
 }
 
 impl proto::group::group_attribute_blob::Content {
@@ -278,7 +280,7 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::group::GroupSnapshot, C> for 
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct GroupData {
     #[serde(with = "hex")]
@@ -288,6 +290,9 @@ pub struct GroupData {
     #[serde(serialize_with = "serialize::enum_as_string")]
     pub story_send_mode: proto::group::StorySendMode,
     pub snapshot: GroupSnapshot,
+    pub blocked: bool,
+    #[serde(serialize_with = "serialize::optional_enum_as_string")]
+    pub avatar_color: Option<proto::AvatarColor>,
     _limit_construction_to_module: (),
 }
 
@@ -300,6 +305,8 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Group, C> for GroupData {
             hideStory,
             storySendMode,
             snapshot,
+            blocked,
+            avatarColor,
             special_fields: _,
         } = value;
 
@@ -313,6 +320,9 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Group, C> for GroupData {
             | proto::group::StorySendMode::ENABLED) => s,
         };
 
+        // The color is allowed to be unset.
+        let avatar_color = avatarColor.map(|v| v.enum_value_or_default());
+
         let snapshot = snapshot
             .into_option()
             .ok_or(GroupError::MissingSnapshot)?
@@ -324,6 +334,8 @@ impl<C: ReportUnusualTimestamp> TryFromWith<proto::Group, C> for GroupData {
             hide_story: hideStory,
             story_send_mode,
             snapshot,
+            blocked,
+            avatar_color,
             _limit_construction_to_module: (),
         })
     }
@@ -400,7 +412,6 @@ mod test {
 
     impl GroupData {
         pub(crate) fn from_proto_test_data() -> Self {
-            use proto::group::access_control::AccessRequired;
             GroupData {
                 master_key: proto::Group::TEST_MASTER_KEY,
                 story_send_mode: proto::group::StorySendMode::ENABLED,
@@ -429,6 +440,8 @@ mod test {
                     members_banned: vec![GroupMemberBanned::from_proto_test_data()].into(),
                     _limit_construction_to_module: (),
                 },
+                blocked: false,
+                avatar_color: None,
                 _limit_construction_to_module: (),
             }
         }

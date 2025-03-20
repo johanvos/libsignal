@@ -6,9 +6,9 @@
 [package]
 name = "libsignal-bridge-types"
 version = "0.1.0"
-authors = ["Signal Messenger LLC"]
+authors.workspace = true
+license.workspace = true
 edition = "2021"
-license = "AGPL-3.0-only"
 
 [lints]
 workspace = true
@@ -21,7 +21,6 @@ libsignal-core = { workspace = true }
 libsignal-message-backup = { workspace = true }
 libsignal-net = { workspace = true }
 libsignal-protocol = { workspace = true }
-libsignal-svr3 = { workspace = true }
 signal-chat = { workspace = true }
 signal-crypto = { workspace = true }
 signal-grpc = { workspace = true }
@@ -34,6 +33,7 @@ aes-gcm-siv = { workspace = true }
 async-trait = { workspace = true }
 atomic-take = { workspace = true }
 derive-where = { workspace = true }
+derive_more = { workspace = true, features = ["deref", "from", "into"] }
 displaydoc = { workspace = true }
 futures-util = { workspace = true }
 hmac = { workspace = true }
@@ -51,6 +51,7 @@ static_assertions = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 uuid = { workspace = true }
+visibility = { workspace = true }
 
 # Enable this for all libsignal app language libraries
 subtle = { workspace = true, features = ["core_hint_black_box"] }

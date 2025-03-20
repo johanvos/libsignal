@@ -9,10 +9,11 @@ use std::sync::Arc;
 
 use futures_util::{Sink, Stream};
 use pin_project::pin_project;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::route::connect::Connector;
-use crate::{Connection, ConnectionInfo};
+use crate::{Connection, TransportInfo};
 
 /// [`Connector`] wrapper that limits the number of concurrent connection
 /// attempts.
@@ -36,6 +37,19 @@ impl<C> ThrottlingConnector<C> {
             permits: Semaphore::new(permits).into(),
         }
     }
+
+    /// Replaces the inner `Connector` in `self`.
+    ///
+    /// Consumes `self` and returns a new `ThrottlingConnector` that keeps the
+    /// same `Semaphore` but uses the provided connector in place of the
+    /// original one.
+    pub fn replace_connector<NewC>(self, new_connector: NewC) -> ThrottlingConnector<NewC> {
+        let Self { inner: _, permits } = self;
+        ThrottlingConnector {
+            inner: new_connector,
+            permits,
+        }
+    }
 }
 
 /// Pairs a connection `S` with a [`OwnedSemaphorePermit`].
@@ -44,8 +58,16 @@ impl<C> ThrottlingConnector<C> {
 /// this connection, and can only be released by dropping this connection.
 /// Dropping a `ThrottlingConnector` unblocks one in-progress call to
 /// [`Connector::connect_over`].
+#[derive(Debug)]
 #[pin_project]
 pub struct ThrottledConnection<S>(#[pin] S, OwnedSemaphorePermit);
+
+impl<S> ThrottledConnection<S> {
+    /// Returns the inner connection, **discarding the semaphore permit.**
+    pub fn into_inner(self) -> S {
+        self.0
+    }
+}
 
 impl<C, R, Inner> Connector<R, Inner> for ThrottlingConnector<C>
 where
@@ -61,6 +83,7 @@ where
         &self,
         over: Inner,
         route: R,
+        log_tag: Arc<str>,
     ) -> impl Future<Output = Result<Self::Connection, Self::Error>> + Send {
         let Self { inner, permits } = self;
         async move {
@@ -68,7 +91,7 @@ where
                 .acquire_owned()
                 .await
                 .expect("semaphore not closed");
-            let connection = inner.connect_over(over, route).await?;
+            let connection = inner.connect_over(over, route, log_tag).await?;
             Ok(ThrottledConnection(connection, permit))
         }
     }
@@ -139,7 +162,41 @@ impl<S: Sink<T>, T> Sink<T> for ThrottledConnection<S> {
 }
 
 impl<C: Connection> Connection for ThrottledConnection<C> {
-    fn connection_info(&self) -> ConnectionInfo {
-        self.0.connection_info()
+    fn transport_info(&self) -> TransportInfo {
+        self.0.transport_info()
+    }
+}
+
+impl<S: AsyncRead> AsyncRead for ThrottledConnection<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.as_pin_mut().poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite> AsyncWrite for ThrottledConnection<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.as_pin_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.as_pin_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        self.as_pin_mut().poll_shutdown(cx)
     }
 }
