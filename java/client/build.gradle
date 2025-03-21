@@ -169,6 +169,12 @@ publishing {
             artifactId = archivesBaseName
             from components.java
 
+            nativePlatforms.each { platform, props ->
+                artifact project.tasks."nativeLib_${platform}" {
+                    archiveClassifier.set(props['classifier'])
+                }
+            }
+
             pom {
                 name = archivesBaseName
                 description = 'Signal Protocol cryptography library for Java'
@@ -191,15 +197,6 @@ publishing {
                     developer {
                         name = 'Signal Messenger LLC'
                     }
-                }
-            }
-        }
-
-        nativePlatforms.each { platform, props ->
-            maven(MavenPublication) {
-                artifactId = archivesBaseName
-                artifact project.tasks."nativeLib_${platform}" {
-                    archiveClassifier = props['classifier']
                 }
             }
         }
