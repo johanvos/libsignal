@@ -144,6 +144,25 @@ test {
 
 // MARK: Publishing
 
+def nativePlatforms = [
+    'darwin_aarch64': [ classifier: 'darwin_aarch64', libFileName: 'libsignal_jni_aarch64.dylib' ],
+    'darwin_x64': [ classifier: 'darwin_x86_64', libFileName: 'libsignal_jni_amd64.dylib' ],
+    'linux_aarch64': [ classifier: 'linux_aarch64', libFileName: 'libsignal_jni_aarch64.so' ],
+    'linux_x64': [ classifier: 'linux_x86_64', libFileName: 'libsignal_jni_amd64.so' ],
+    'win_x64': [ classifier: 'win_x86_64', libFileName: 'signal_jni_amd64.dll' ],
+]
+
+nativePlatforms.each { platform, props ->
+    project.task("nativeLib_${platform}", type: Jar) {
+        dependsOn processResources
+
+        archiveBaseName = archivesBaseName
+        from(layout.buildDirectory.dir('nativeLibs')) {
+            include props['libFileName']
+        }
+    }
+}
+
 publishing {
     publications {
         mavenJava(MavenPublication) {
@@ -172,6 +191,15 @@ publishing {
                     developer {
                         name = 'Signal Messenger LLC'
                     }
+                }
+            }
+        }
+
+        nativePlatforms.each { platform, props ->
+            maven(MavenPublication) {
+                artifactId = archivesBaseName
+                artifact project.tasks."nativeLib_${platform}" {
+                    archiveClassifier = props['classifier']
                 }
             }
         }
