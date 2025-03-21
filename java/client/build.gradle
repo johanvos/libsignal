@@ -145,11 +145,11 @@ test {
 // MARK: Publishing
 
 def nativePlatforms = [
-    'darwin_aarch64': [ classifier: 'darwin_aarch64', libFileName: 'libsignal_jni_aarch64.dylib' ],
-    'darwin_x64': [ classifier: 'darwin_x86_64', libFileName: 'libsignal_jni_amd64.dylib' ],
-    'linux_aarch64': [ classifier: 'linux_aarch64', libFileName: 'libsignal_jni_aarch64.so' ],
-    'linux_x64': [ classifier: 'linux_x86_64', libFileName: 'libsignal_jni_amd64.so' ],
-    'win_x64': [ classifier: 'win_x86_64', libFileName: 'signal_jni_amd64.dll' ],
+    'darwin_aarch64': [ classifier: 'darwin-aarch64', libFileName: 'libsignal_jni_aarch64.dylib' ],
+    'darwin_x64': [ classifier: 'darwin-x86_64', libFileName: 'libsignal_jni_amd64.dylib' ],
+    'linux_aarch64': [ classifier: 'linux-aarch64', libFileName: 'libsignal_jni_aarch64.so' ],
+    'linux_x64': [ classifier: 'linux-x86_64', libFileName: 'libsignal_jni_amd64.so' ],
+    'win_x64': [ classifier: 'win-x86_64', libFileName: 'signal_jni_amd64.dll' ],
 ]
 
 nativePlatforms.each { platform, props ->
