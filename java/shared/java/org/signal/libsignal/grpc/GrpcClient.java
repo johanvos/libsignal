@@ -15,11 +15,11 @@ public class GrpcClient implements NativeHandleGuard.Owner {
 
   private final long unsafeHandle;
 
-  public GrpcClient() {
+  public GrpcClient() throws Exception {
     this(DEFAULT_TARGET);
   }
 
-  public GrpcClient(String target) {
+  public GrpcClient(String target) throws Exception {
     this.unsafeHandle = Native.GrpcClient_New(target);
   }
 
@@ -34,18 +34,18 @@ public class GrpcClient implements NativeHandleGuard.Owner {
   }
 
   public byte[] sendDirectMessage(
-      String method, String urlFragment, byte[] body, Map<String, List<String>> headers) {
+      String method, String urlFragment, byte[] body, Map<String, List<String>> headers) throws Exception {
     return Native.GrpcClient_SendDirectMessage(
         this.unsafeHandle, method, urlFragment, body, headers);
   }
 
   public void openStream(
-      String uri, Map<String, List<String>> headers, GrpcReplyListener replyListener) {
+      String uri, Map<String, List<String>> headers, GrpcReplyListener replyListener) throws Exception {
     Native.GrpcClient_OpenStream(this.unsafeHandle, uri, headers, replyListener);
   }
 
   public void sendMessageOnStream(
-      String method, String urlFragment, byte[] body, Map<String, List<String>> headers) {
+      String method, String urlFragment, byte[] body, Map<String, List<String>> headers) throws Exception {
     Native.GrpcClient_SendMessageOnStream(this.unsafeHandle, method, urlFragment, body, headers);
   }
 }

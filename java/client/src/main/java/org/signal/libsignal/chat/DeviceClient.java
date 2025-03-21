@@ -17,11 +17,11 @@ public class DeviceClient implements NativeHandleGuard.Owner {
 
   private final long unsafeHandle;
 
-  public DeviceClient() {
+  public DeviceClient() throws Exception {
     this(DEFAULT_TARGET);
   }
 
-  public DeviceClient(String target) {
+  public DeviceClient(String target) throws Exception {
     this.unsafeHandle = Native.DeviceClient_New(target);
   }
 
@@ -42,7 +42,7 @@ public class DeviceClient implements NativeHandleGuard.Owner {
           Native.DeviceClient_GetDevices(
               guard.nativeHandle(), request.toByteArray(), authorization);
       return GetDevicesResponse.parseFrom(serializedResponse);
-    } catch (InvalidProtocolBufferException e) {
+    } catch (Exception e) {
       throw new SignalChatCommunicationFailureException(e);
     }
   }

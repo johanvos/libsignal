@@ -13,11 +13,11 @@ public class QuicClient {
 
   private final long unsafeHandle;
 
-  public QuicClient() {
+  public QuicClient() throws Exception {
     this(DEFAULT_TARGET);
   }
 
-  public QuicClient(String target) {
+  public QuicClient(String target) throws Exception {
     this.unsafeHandle = Native.QuicClient_New(target);
   }
 
@@ -31,16 +31,16 @@ public class QuicClient {
     return this.unsafeHandle;
   }
 
-  public byte[] sendMessage(byte[] data) {
+  public byte[] sendMessage(byte[] data) throws Exception {
     return Native.QuicClient_SendMessage(this.unsafeHandle, data);
   }
 
   public void openControlledStream(
-      String baseUrl, Map<String, String> headers, QuicCallbackListener listener) {
+      String baseUrl, Map<String, String> headers, QuicCallbackListener listener) throws Exception {
     Native.QuicClient_OpenControlledStream(this.unsafeHandle, baseUrl, headers, listener);
   }
 
-  public void writeMessageOnStream(byte[] payload) {
+  public void writeMessageOnStream(byte[] payload) throws Exception {
     Native.QuicClient_WriteMessageOnStream(this.unsafeHandle, payload);
   }
 }
