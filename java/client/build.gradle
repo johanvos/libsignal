@@ -160,6 +160,10 @@ nativePlatforms.each { platform, props ->
         from(layout.buildDirectory.dir('nativeLibs')) {
             include props['libFileName']
         }
+
+        manifest {
+            attributes('Automatic-Module-Name': 'org.signal.libsignalnative')
+        }
     }
 }
 

@@ -17,11 +17,11 @@ public class ProfileClient implements NativeHandleGuard.Owner {
 
   private final long unsafeHandle;
 
-  public ProfileClient() {
+  public ProfileClient() throws Exception {
     this(DEFAULT_TARGET);
   }
 
-  public ProfileClient(String target) {
+  public ProfileClient(String target) throws Exception {
     this.unsafeHandle = Native.ProfileClient_New(target);
   }
 
@@ -41,7 +41,7 @@ public class ProfileClient implements NativeHandleGuard.Owner {
       byte[] serializedResponse =
           Native.ProfileClient_GetVersionedProfile(guard.nativeHandle(), request.toByteArray());
       return GetVersionedProfileResponse.parseFrom(serializedResponse);
-    } catch (InvalidProtocolBufferException e) {
+    } catch (Exception e) {
       throw new SignalChatCommunicationFailureException(e);
     }
   }

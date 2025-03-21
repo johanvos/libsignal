@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Future;
 import java.util.UUID;
 import java.util.Map;
+import java.util.Optional;
 
 public final class Native {
   private static Path tempDir;
@@ -82,6 +83,15 @@ public final class Native {
         if (in != null) {
           copyToTempDirAndLoad(in, libraryName);
           return;
+        }
+      }
+      Optional<Module> libSignalNativeModule = ModuleLayer.boot().findModule("org.signal.libsignalnative");
+      if (libSignalNativeModule.isPresent()) {
+        try (InputStream in = libSignalNativeModule.get().getResourceAsStream("/" + libraryName)) {
+          if (in != null) {
+            copyToTempDirAndLoad(in, libraryName);
+            return;
+          }
         }
       }
     }
@@ -287,8 +297,8 @@ public final class Native {
   public static native long DecryptionErrorMessage_GetTimestamp(long obj) throws Exception;
 
   public static native void DeviceClient_Destroy(long handle);
-  public static native byte[] DeviceClient_GetDevices(long deviceClient, byte[] request, String authorization);
-  public static native long DeviceClient_New(String target);
+  public static native byte[] DeviceClient_GetDevices(long deviceClient, byte[] request, String authorization) throws Exception;
+  public static native long DeviceClient_New(String target) throws Exception;
 
   public static native byte[] DeviceTransfer_GenerateCertificate(byte[] privateKey, String name, int daysToExpire) throws Exception;
   public static native byte[] DeviceTransfer_GeneratePrivateKey();
@@ -361,14 +371,14 @@ public final class Native {
   public static native void GroupSendToken_CheckValidContents(byte[] bytes) throws Exception;
   public static native byte[] GroupSendToken_ToFullToken(byte[] token, long expiration);
 
-  public static native void GrpcClient_Destroy(long handle);
-  public static native long GrpcClient_New(String target);
-  public static native void GrpcClient_OpenStream(long grpcClient, String uri, Map headers, GrpcReplyListener listener);
-  public static native byte[] GrpcClient_SendDirectMessage(long grpcClient, String method, String urlFragment, byte[] body, Map headers);
-  public static native void GrpcClient_SendMessageOnStream(long grpcClient, String method, String urlFragment, byte[] body, Map headers);
-
   public static native long GroupSessionBuilder_CreateSenderKeyDistributionMessage(long sender, UUID distributionId, SenderKeyStore store) throws Exception;
   public static native void GroupSessionBuilder_ProcessSenderKeyDistributionMessage(long sender, long senderKeyDistributionMessage, SenderKeyStore store) throws Exception;
+
+  public static native void GrpcClient_Destroy(long handle);
+  public static native long GrpcClient_New(String target) throws Exception;
+  public static native void GrpcClient_OpenStream(long grpcClient, String uri, Map headers, GrpcReplyListener listener) throws Exception;
+  public static native byte[] GrpcClient_SendDirectMessage(long grpcClient, String method, String urlFragment, byte[] body, Map headers) throws Exception;
+  public static native void GrpcClient_SendMessageOnStream(long grpcClient, String method, String urlFragment, byte[] body, Map headers) throws Exception;
 
   public static native byte[] HKDF_DeriveSecrets(int outputLength, byte[] ikm, byte[] label, byte[] salt) throws Exception;
 
@@ -511,8 +521,8 @@ public final class Native {
   public static native long PreKeySignalMessage_New(int messageVersion, int registrationId, int preKeyId, int signedPreKeyId, long baseKey, long identityKey, long signalMessage) throws Exception;
 
   public static native void ProfileClient_Destroy(long handle);
-  public static native byte[] ProfileClient_GetVersionedProfile(long profileClient, byte[] request);
-  public static native long ProfileClient_New(String target);
+  public static native byte[] ProfileClient_GetVersionedProfile(long profileClient, byte[] request) throws Exception;
+  public static native long ProfileClient_New(String target) throws Exception;
 
   public static native void ProfileKeyCiphertext_CheckValidContents(byte[] buffer) throws Exception;
 
@@ -539,10 +549,10 @@ public final class Native {
   public static native long ProtocolAddress_New(String name, int deviceId);
 
   public static native void QuicClient_Destroy(long handle);
-  public static native long QuicClient_New(String target);
-  public static native void QuicClient_OpenControlledStream(long quicClient, String baseUrl, Map headers, QuicCallbackListener listener);
-  public static native byte[] QuicClient_SendMessage(long quicClient, byte[] data);
-  public static native void QuicClient_WriteMessageOnStream(long quicClient, byte[] payload);
+  public static native long QuicClient_New(String target) throws Exception;
+  public static native void QuicClient_OpenControlledStream(long quicClient, String baseUrl, Map headers, QuicCallbackListener listener) throws Exception;
+  public static native byte[] QuicClient_SendMessage(long quicClient, byte[] data) throws Exception;
+  public static native void QuicClient_WriteMessageOnStream(long quicClient, byte[] payload) throws Exception;
 
   public static native void ReceiptCredentialPresentation_CheckValidContents(byte[] buffer) throws Exception;
   public static native long ReceiptCredentialPresentation_GetReceiptExpirationTime(byte[] presentation);
