@@ -57,6 +57,9 @@ jobs:
 
     - run: brew install protobuf
       if: matrix.os == 'macos-latest'
+    
+    - run: sudo apt-get update && sudo apt-get install protobuf-compiler
+      if: matrix.os == 'ubuntu-20.04'
 
     - name: Build client for host
       run: java/build_jni.sh desktop
@@ -131,6 +134,8 @@ jobs:
     - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
       with:
         submodules: recursive
+
+    - run: sudo apt-get update && sudo apt-get install protobuf-compiler
 
     - name: Download built client libraries
       uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
