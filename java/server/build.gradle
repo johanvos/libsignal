@@ -99,6 +99,6 @@ publishing {
 
 setUpSigningKey(signing)
 signing {
-    required { isReleaseBuild() && gradle.taskGraph.hasTask(":server:publish") }
+    required { !isSkipSigning() && isReleaseBuild() && gradle.taskGraph.hasTask(":server:publish") }
     sign publishing.publications.mavenJava
 }

@@ -133,11 +133,41 @@ test {
 
 // MARK: Publishing
 
+def nativePlatforms = [
+    'darwin_aarch64': [ classifier: 'darwin-aarch64', libFileName: 'libsignal_jni_aarch64.dylib' ],
+    'darwin_x64': [ classifier: 'darwin-x86_64', libFileName: 'libsignal_jni_amd64.dylib' ],
+    'linux_aarch64': [ classifier: 'linux-aarch64', libFileName: 'libsignal_jni_aarch64.so' ],
+    'linux_x64': [ classifier: 'linux-x86_64', libFileName: 'libsignal_jni_amd64.so' ],
+    'win_x64': [ classifier: 'win-x86_64', libFileName: 'signal_jni_amd64.dll' ],
+]
+
+nativePlatforms.each { platform, props ->
+    project.task("nativeLib_${platform}", type: Jar) {
+        dependsOn processResources
+
+        archiveBaseName = archivesBaseName
+        from(layout.buildDirectory.dir('nativeLibs')) {
+            include props['libFileName']
+        }
+
+        manifest {
+            attributes('Automatic-Module-Name': 'org.signal.libsignalnative')
+        }
+    }
+}
+
 publishing {
     publications {
         mavenJava(MavenPublication) {
             artifactId = archivesBaseName
+            version = 'head-SNAPSHOT'
             from components.java
+
+            nativePlatforms.each { platform, props ->
+                artifact project.tasks."nativeLib_${platform}" {
+                    archiveClassifier.set(props['classifier'])
+                }
+            }
 
             pom {
                 name = archivesBaseName
@@ -169,6 +199,6 @@ publishing {
 
 setUpSigningKey(signing)
 signing {
-    required { isReleaseBuild() && gradle.taskGraph.hasTask(":client:publish") }
+    required { !isSkipSigning() && isReleaseBuild() && gradle.taskGraph.hasTask(":client:publish") }
     sign publishing.publications.mavenJava
 }
