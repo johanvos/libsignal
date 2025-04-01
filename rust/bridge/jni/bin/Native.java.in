@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.util.concurrent.Future;
 import java.util.UUID;
 import java.util.Map;
+import java.util.Optional;
 
 public final class Native {
   private static Path tempDir;
@@ -80,6 +81,15 @@ public final class Native {
         if (in != null) {
           copyToTempDirAndLoad(in, libraryName);
           return;
+        }
+      }
+      Optional<Module> libSignalNativeModule = ModuleLayer.boot().findModule("org.signal.libsignalnative");
+      if (libSignalNativeModule.isPresent()) {
+        try (InputStream in = libSignalNativeModule.get().getResourceAsStream("/" + libraryName)) {
+          if (in != null) {
+            copyToTempDirAndLoad(in, libraryName);
+            return;
+          }
         }
       }
     }
