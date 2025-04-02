@@ -46,6 +46,12 @@ jobs:
     - run: sudo apt-get update && sudo apt-get install gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
       if: ${{ matrix.os == 'ubuntu-20.04' && matrix.additional-rust-target != '' }}
 
+    - name: Install Protoc
+      if: matrix.os == 'ubuntu-20.04'
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
     # install nasm compiler for boring
     - name: Install nasm
       if: startsWith(matrix.os, 'windows')
@@ -58,9 +64,6 @@ jobs:
     - run: brew install protobuf
       if: matrix.os == 'macos-latest'
     
-    - run: sudo apt-get update && sudo apt-get install protobuf-compiler
-      if: matrix.os == 'ubuntu-20.04'
-
     - name: Build client for host
       run: java/build_jni.sh desktop
       if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
@@ -135,7 +138,10 @@ jobs:
       with:
         submodules: recursive
 
-    - run: sudo apt-get update && sudo apt-get install protobuf-compiler
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Download built client libraries
       uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
