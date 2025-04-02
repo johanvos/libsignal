@@ -1,14 +1,10 @@
-v0.68.0
+v0.68.1
 
-- Swift: Allow UnidentifiedSenderMessageContent to be constructed from a message type and opaque bytes. (Contributed by @saman3d!)
+- Swift: GroupIdentifier is now CustomStringConvertible (to its hex bytes)
 
-- net: Add a client for the registration verification service. This is currently
-  only available via the Node bindings.
+- Swift: `[UInt8]` and `Data` both now have a `toHex()` method backed by the Rust `hex` crate.
 
-- Java: InputStreams created by MessageBackup.validate() are now correctly closed when the operation is complete.
+- backups: Release notes can now be included in a chat folder.
 
-- Node: The InputStream abstraction now has an optional close() method, which will be called by MessageBackup.validate() on any created streams when the operation is complete. If your InputStream already has a close() method, this may be a breaking change for you.
-
-- backups: Enforce that messages with expiration timers < 24 hours are not included in Remote Backups.
-
-- backups: Add support for LocalLocator for local backups
+- net: Fix a bug where DNS-over-HTTPs lookups wouldn't attempt to make IPv4 and IPv6 connections
+  to the nameserver in parallel.
