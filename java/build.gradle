@@ -117,5 +117,6 @@ def isSkipSigning() {
 }
 
 def isReleaseBuild() {
-    return version.contains("SNAPSHOT") == false
+    return false
+    // return version.contains("SNAPSHOT") == false
 }
