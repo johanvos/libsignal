@@ -451,6 +451,8 @@ impl SignalNodeError for libsignal_net::chat::SendError {
     ) -> Handle<'a, JsError> {
         let name = match self {
             Self::Disconnected => Some("ChatServiceInactive"),
+            Self::ConnectionInvalidated => Some("ConnectionInvalidated"),
+            Self::ConnectedElsewhere => Some("ConnectedElsewhere"),
             Self::WebSocket(_)
             | Self::IncomingDataInvalid
             | Self::RequestHasInvalidHeader
@@ -602,12 +604,6 @@ mod registration {
         NotReadyForVerification,
         VerificationSendFailed,
         VerificationNotDeliverable(VerificationCodeNotDeliverable),
-    }
-
-    impl std::fmt::Display for BridgedErrorVariant {
-        fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
-            unreachable!("not actually used")
-        }
     }
 
     impl SignalNodeError for BridgedErrorVariant {

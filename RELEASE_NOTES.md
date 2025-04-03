@@ -1,10 +1,9 @@
-v0.68.1
+v0.69.0
 
-- Swift: GroupIdentifier is now CustomStringConvertible (to its hex bytes)
+- Net: Remove the fallback connect code paths for CDSI. This is a breaking change.
 
-- Swift: `[UInt8]` and `Data` both now have a `toHex()` method backed by the Rust `hex` crate.
+- backups: Validate ChatFolder::id
 
-- backups: Release notes can now be included in a chat folder.
+- Node: GroupIdentifier now has a custom toString() (to its base64 representation)
 
-- net: Fix a bug where DNS-over-HTTPs lookups wouldn't attempt to make IPv4 and IPv6 connections
-  to the nameserver in parallel.
+- Net: onConnectionInterrupted will now pass along ConnectedElsewhere and ConnectionInvalidated as disconnection reasons, when applicable.
