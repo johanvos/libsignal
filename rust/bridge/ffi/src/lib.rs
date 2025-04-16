@@ -14,6 +14,7 @@ use libsignal_bridge::ffi::*;
 #[cfg(feature = "libsignal-bridge-testing")]
 #[allow(unused_imports)]
 use libsignal_bridge_testing::*;
+use libsignal_core::try_scoped;
 use libsignal_protocol::*;
 
 pub mod logging;
@@ -68,10 +69,10 @@ pub unsafe extern "C" fn signal_error_get_message(
     err: *const SignalFfiError,
     out: *mut *const c_char,
 ) -> *mut SignalFfiError {
-    let result = (|| {
+    let result = try_scoped(|| {
         let err = err.as_ref().ok_or(NullPointerError)?;
         write_result_to(out, err.to_string())
-    })();
+    });
 
     match result {
         Ok(()) => std::ptr::null_mut(),
@@ -282,7 +283,7 @@ pub unsafe extern "C" fn signal_hex_encode(
             return Err(NullPointerError.into());
         }
         let output = std::slice::from_raw_parts_mut(output, output_len);
-        let output = zerocopy::AsBytes::as_bytes_mut(output);
+        let output = zerocopy::IntoBytes::as_mut_bytes(output);
         let input = std::slice::from_raw_parts(input, input_len);
         hex::encode_to_slice(input, output).expect("checked above");
         Ok(())

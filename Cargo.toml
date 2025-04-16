@@ -35,7 +35,7 @@ default-members = [
 resolver = "2" # so that our dev-dependency features don't leak into products
 
 [workspace.package]
-version = "0.69.0"
+version = "0.70.0"
 rust-version = "1.80.1"
 authors = ["Signal Messenger LLC"]
 license = "AGPL-3.0-only"
@@ -203,7 +203,7 @@ visibility = "0.1.1"
 warp = "0.3.6"
 webpsan = { version = "0.5.3", default-features = false }
 x25519-dalek = "2.0.0"
-zerocopy = "0.7.34"
+zerocopy = "0.8.24"
 
 [patch.crates-io]
 # When building libsignal, just use our forks so we don't end up with two different versions of the libraries.

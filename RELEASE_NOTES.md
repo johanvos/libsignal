@@ -1,9 +1,13 @@
-v0.69.0
+v0.70.0
 
-- Net: Remove the fallback connect code paths for CDSI. This is a breaking change.
+- Resuming an existing registration session now requires the phone number with for which the session was created.
 
-- backups: Validate ChatFolder::id
+- Make the registration service client available in Java.
 
-- Node: GroupIdentifier now has a custom toString() (to its base64 representation)
+- Enable registering an account via the Node registration service client.
 
-- Net: onConnectionInterrupted will now pass along ConnectedElsewhere and ConnectionInvalidated as disconnection reasons, when applicable.
+- Java, Node, Swift: remove items marked as deprecated. This includes functions related to CDSI, HKDF, message backup validation, media sanitization, incremental MACs, and usernames.
+
+- Android: Build with NDK 28, the latest stable.
+
+- backups: Validate NotificationProfile::id

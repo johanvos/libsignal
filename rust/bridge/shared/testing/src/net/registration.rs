@@ -4,21 +4,31 @@
 //
 
 use std::collections::HashSet;
+use std::panic::UnwindSafe;
 use std::str::FromStr;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use libsignal_bridge_macros::*;
+use libsignal_bridge_types::net::registration::{
+    ConnectChatBridge, RegistrationCreateSessionRequest, RegistrationService,
+};
+use libsignal_bridge_types::net::TokioAsyncContext;
+use libsignal_net::chat::fake::FakeChatRemote;
+use libsignal_net::chat::ChatConnection;
 use libsignal_net::infra::errors::RetryLater;
 use libsignal_net::registration::{
-    CreateSessionError, RegistrationSession, RequestError, RequestVerificationCodeError,
-    RequestedInformation, ResumeSessionError, SubmitVerificationError, UpdateSessionError,
-    VerificationCodeNotDeliverable,
+    ConnectChat, CreateSessionError, RegistrationSession, RequestError,
+    RequestVerificationCodeError, RequestedInformation, ResumeSessionError,
+    SubmitVerificationError, UpdateSessionError, VerificationCodeNotDeliverable,
 };
 
 use super::make_error_testing_enum;
+use crate::net::chat::FakeChatServer;
 use crate::*;
 
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 pub fn TESTING_RegistrationSessionInfoConvert() -> RegistrationSession {
     RegistrationSession {
         allowed_to_request_code: true,
@@ -29,6 +39,76 @@ pub fn TESTING_RegistrationSessionInfoConvert() -> RegistrationSession {
         requested_information: HashSet::from([RequestedInformation::PushChallenge]),
     }
 }
+
+#[derive(Clone)]
+struct ConnectFakeChat(
+    tokio::runtime::Handle,
+    tokio::sync::mpsc::UnboundedSender<FakeChatRemote>,
+);
+
+struct ConnectFakeChatBridge(tokio::sync::mpsc::UnboundedSender<FakeChatRemote>);
+
+impl UnwindSafe for ConnectFakeChat {}
+
+impl ConnectChatBridge for ConnectFakeChatBridge {
+    fn create_chat_connector(
+        self: Box<Self>,
+        runtime: tokio::runtime::Handle,
+    ) -> Box<dyn ConnectChat + Send + Sync + std::panic::UnwindSafe> {
+        let Self(tx) = *self;
+        Box::new(ConnectFakeChat(runtime, tx))
+    }
+}
+impl ConnectChat for ConnectFakeChat {
+    fn connect_chat(
+        &self,
+        on_disconnect: tokio::sync::oneshot::Sender<std::convert::Infallible>,
+    ) -> BoxFuture<'_, Result<ChatConnection, libsignal_net::chat::ConnectError>> {
+        let mut on_disconnect = Some(on_disconnect);
+        let listener = move |event| match event {
+            libsignal_net::chat::ws2::ListenerEvent::Finished(_) => drop(on_disconnect.take()),
+            libsignal_net::chat::ws2::ListenerEvent::ReceivedAlerts(_)
+            | libsignal_net::chat::ws2::ListenerEvent::ReceivedMessage(_, _) => (),
+        };
+
+        let (chat, remote) = ChatConnection::new_fake(self.0.clone(), Box::new(listener), []);
+
+        std::future::ready(
+            self.1
+                .send(remote)
+                .map_err(|_| libsignal_net::chat::ConnectError::AllAttemptsFailed)
+                .map(|()| chat),
+        )
+        .boxed()
+    }
+}
+
+#[bridge_io(TokioAsyncContext, ffi = false)]
+async fn TESTING_FakeRegistrationSession_CreateSession(
+    create_session: RegistrationCreateSessionRequest,
+    chat: &FakeChatServer,
+) -> Result<RegistrationService, RequestError<CreateSessionError>> {
+    RegistrationService::create_session(
+        Box::new(ConnectFakeChatBridge(chat.tx.clone())),
+        tokio::runtime::Handle::current(),
+        create_session,
+    )
+    .await
+}
+
+// Use aliases so that places that refer to syntactic argument names (e.g.
+// jni::jni_arg and friends) aren't ambiguous.
+/// cbindgen:ignore
+type TestingCreateSessionRequestError = TestingRequestError<TestingCreateSessionError>;
+/// cbindgen:ignore
+type TestingResumeSessionRequestError = TestingRequestError<TestingResumeSessionError>;
+/// cbindgen:ignore
+type TestingUpdateSessionRequestError = TestingRequestError<TestingUpdateSessionError>;
+/// cbindgen:ignore
+type TestingRequestVerificationCodeRequestError =
+    TestingRequestError<TestingRequestVerificationCodeError>;
+/// cbindgen:ignore
+type TestingSubmitVerificationRequestError = TestingRequestError<TestingSubmitVerificationError>;
 
 struct TestingRequestError<E>(RequestError<E>);
 
@@ -75,11 +155,8 @@ make_error_testing_enum!(
     }
 );
 
-/// cbindgen:ignore
-type TestingCreateSessionRequestError = TestingRequestError<TestingCreateSessionError>;
-
 /// Return an error matching the requested description.
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 fn TESTING_RegistrationService_CreateSessionErrorConvert(
     // The stringly-typed API makes the call sites more self-explanatory.
     error_description: AsType<TestingCreateSessionRequestError, String>,
@@ -101,11 +178,8 @@ make_error_testing_enum!(
     }
 );
 
-/// cbindgen:ignore
-type TestingResumeSessionRequestError = TestingRequestError<TestingResumeSessionError>;
-
 /// Return an error matching the requested description.
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 fn TESTING_RegistrationService_ResumeSessionErrorConvert(
     // The stringly-typed API makes the call sites more self-explanatory.
     error_description: AsType<TestingResumeSessionRequestError, String>,
@@ -125,11 +199,8 @@ make_error_testing_enum!(
     }
 );
 
-/// cbindgen:ignore
-type TestingUpdateSessionRequestError = TestingRequestError<TestingUpdateSessionError>;
-
 /// Return an error matching the requested description.
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 fn TESTING_RegistrationService_UpdateSessionErrorConvert(
     // The stringly-typed API makes the call sites more self-explanatory.
     error_description: AsType<TestingUpdateSessionRequestError, String>,
@@ -155,12 +226,8 @@ make_error_testing_enum!(
     }
 );
 
-/// cbindgen:ignore
-type TestingRequestVerificationCodeRequestError =
-    TestingRequestError<TestingRequestVerificationCodeError>;
-
 /// Return an error matching the requested description.
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 fn TESTING_RegistrationService_RequestVerificationCodeErrorConvert(
     // The stringly-typed API makes the call sites more self-explanatory.
     error_description: AsType<TestingRequestVerificationCodeRequestError, String>,
@@ -201,11 +268,8 @@ make_error_testing_enum!(
     }
 );
 
-/// cbindgen:ignore
-type TestingSubmitVerificationRequestError = TestingRequestError<TestingSubmitVerificationError>;
-
 /// Return an error matching the requested description.
-#[bridge_fn(ffi = false, jni = false)]
+#[bridge_fn(ffi = false)]
 fn TESTING_RegistrationService_SubmitVerificationErrorConvert(
     // The stringly-typed API makes the call sites more self-explanatory.
     error_description: AsType<TestingSubmitVerificationRequestError, String>,
