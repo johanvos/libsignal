@@ -29,11 +29,6 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 #define SignalBackupId_LEN 16
 
-/**
- * The encoded length of a [`FourCC`], in bytes.
- */
-#define SignalFourCC_ENCODED_LEN 4
-
 #define SignalNUM_AUTH_CRED_ATTRIBUTES 3
 
 #define SignalNUM_PROFILE_KEY_CRED_ATTRIBUTES 4
@@ -125,6 +120,11 @@ SPDX-License-Identifier: AGPL-3.0-only
  */
 #define SignalSECONDS_PER_DAY 86400
 
+/**
+ * The encoded length of a [`FourCC`], in bytes.
+ */
+#define SignalFourCC_ENCODED_LEN 4
+
 typedef enum {
   SignalCiphertextMessageTypeWhisper = 2,
   SignalCiphertextMessageTypePreKey = 3,
@@ -210,6 +210,8 @@ typedef enum {
   SignalErrorCodeSvrRotationMachineTooManySteps = 162,
   SignalErrorCodeAppExpired = 170,
   SignalErrorCodeDeviceDeregistered = 171,
+  SignalErrorCodeConnectionInvalidated = 172,
+  SignalErrorCodeConnectedElsewhere = 173,
   SignalErrorCodeBackupValidation = 180,
 } SignalErrorCode;
 
@@ -225,6 +227,8 @@ typedef struct SignalAes256GcmEncryption SignalAes256GcmEncryption;
 typedef struct SignalAes256GcmSiv SignalAes256GcmSiv;
 
 typedef struct SignalAuthenticatedChatConnection SignalAuthenticatedChatConnection;
+
+typedef struct SignalBridgedStringMap SignalBridgedStringMap;
 
 typedef struct SignalCdsiLookup SignalCdsiLookup;
 
@@ -541,6 +545,14 @@ typedef uint8_t SignalServiceIdFixedWidthBinaryBytes[17];
 typedef struct {
   SignalPrivateKey *raw;
 } SignalMutPointerPrivateKey;
+
+typedef struct {
+  SignalBridgedStringMap *raw;
+} SignalMutPointerBridgedStringMap;
+
+typedef struct {
+  const SignalBridgedStringMap *raw;
+} SignalConstPointerBridgedStringMap;
 
 typedef struct {
   SignalSgxClientState *raw;
@@ -1191,6 +1203,14 @@ SignalFfiError *signal_backup_key_derive_media_id(uint8_t (*out)[SignalMEDIA_ID_
 
 SignalFfiError *signal_backup_key_derive_thumbnail_transit_encryption_key(uint8_t (*out)[SignalMEDIA_ENCRYPTION_KEY_LEN], const uint8_t (*backup_key)[SignalBACKUP_KEY_LEN], const uint8_t (*media_id)[SignalMEDIA_ID_LEN]);
 
+SignalFfiError *signal_bridged_string_map_clone(SignalMutPointerBridgedStringMap *new_obj, SignalConstPointerBridgedStringMap obj);
+
+SignalFfiError *signal_bridged_string_map_destroy(SignalMutPointerBridgedStringMap p);
+
+SignalFfiError *signal_bridged_string_map_insert(SignalMutPointerBridgedStringMap map, const char *key, const char *value);
+
+SignalFfiError *signal_bridged_string_map_new(SignalMutPointerBridgedStringMap *out, uint32_t initial_capacity);
+
 SignalFfiError *signal_call_link_auth_credential_check_valid_contents(SignalBorrowedBuffer credential_bytes);
 
 SignalFfiError *signal_call_link_auth_credential_present_deterministic(SignalOwnedBuffer *out, SignalBorrowedBuffer credential_bytes, const SignalServiceIdFixedWidthBinaryBytes *user_id, uint64_t redemption_time, SignalBorrowedBuffer server_params_bytes, SignalBorrowedBuffer call_link_params_bytes, const uint8_t (*randomness)[SignalRANDOMNESS_LEN]);
@@ -1215,6 +1235,8 @@ SignalFfiError *signal_call_link_secret_params_decrypt_user_id(SignalServiceIdFi
 
 SignalFfiError *signal_call_link_secret_params_derive_from_root_key(SignalOwnedBuffer *out, SignalBorrowedBuffer root_key);
 
+SignalFfiError *signal_call_link_secret_params_encrypt_user_id(unsigned char (*out)[SignalUUID_CIPHERTEXT_LEN], SignalBorrowedBuffer params_bytes, const SignalServiceIdFixedWidthBinaryBytes *user_id);
+
 SignalFfiError *signal_call_link_secret_params_get_public_params(SignalOwnedBuffer *out, SignalBorrowedBuffer params_bytes);
 
 SignalFfiError *signal_cds2_client_state_new(SignalMutPointerSgxClientState *out, SignalBorrowedBuffer mrenclave, SignalBorrowedBuffer attestation_msg, uint64_t current_timestamp);
@@ -1224,8 +1246,6 @@ SignalFfiError *signal_cdsi_lookup_complete(SignalCPromiseFfiCdsiLookupResponse 
 SignalFfiError *signal_cdsi_lookup_destroy(SignalMutPointerCdsiLookup p);
 
 SignalFfiError *signal_cdsi_lookup_new(SignalCPromiseMutPointerCdsiLookup *promise, SignalConstPointerTokioAsyncContext async_runtime, SignalConstPointerConnectionManager connection_manager, const char *username, const char *password, SignalConstPointerLookupRequest request);
-
-SignalFfiError *signal_cdsi_lookup_new_routes(SignalCPromiseMutPointerCdsiLookup *promise, SignalConstPointerTokioAsyncContext async_runtime, SignalConstPointerConnectionManager connection_manager, const char *username, const char *password, SignalConstPointerLookupRequest request);
 
 SignalFfiError *signal_cdsi_lookup_token(SignalOwnedBuffer *out, SignalConstPointerCdsiLookup lookup);
 
@@ -1249,7 +1269,7 @@ SignalFfiError *signal_connection_manager_clear_proxy(SignalConstPointerConnecti
 
 SignalFfiError *signal_connection_manager_destroy(SignalMutPointerConnectionManager p);
 
-SignalFfiError *signal_connection_manager_new(SignalMutPointerConnectionManager *out, uint8_t environment, const char *user_agent);
+SignalFfiError *signal_connection_manager_new(SignalMutPointerConnectionManager *out, uint8_t environment, const char *user_agent, SignalMutPointerBridgedStringMap remote_config);
 
 SignalFfiError *signal_connection_manager_on_network_change(SignalConstPointerConnectionManager connection_manager);
 
@@ -1258,6 +1278,8 @@ SignalFfiError *signal_connection_manager_set_censorship_circumvention_enabled(S
 SignalFfiError *signal_connection_manager_set_invalid_proxy(SignalConstPointerConnectionManager connection_manager);
 
 SignalFfiError *signal_connection_manager_set_proxy(SignalConstPointerConnectionManager connection_manager, SignalConstPointerConnectionProxyConfig proxy);
+
+SignalFfiError *signal_connection_manager_set_remote_config(SignalConstPointerConnectionManager connection_manager, SignalMutPointerBridgedStringMap remote_config);
 
 SignalFfiError *signal_connection_proxy_config_clone(SignalMutPointerConnectionProxyConfig *new_obj, SignalConstPointerConnectionProxyConfig obj);
 
@@ -1409,6 +1431,8 @@ SignalFfiError *signal_group_send_derived_key_pair_check_valid_contents(SignalBo
 
 SignalFfiError *signal_group_send_derived_key_pair_for_expiration(SignalOwnedBuffer *out, uint64_t expiration, SignalConstPointerServerSecretParams server_params);
 
+SignalFfiError *signal_group_send_endorsement_call_link_params_to_token(SignalOwnedBuffer *out, SignalBorrowedBuffer endorsement, SignalBorrowedBuffer call_link_secret_params_serialized);
+
 SignalFfiError *signal_group_send_endorsement_check_valid_contents(SignalBorrowedBuffer bytes);
 
 SignalFfiError *signal_group_send_endorsement_combine(SignalOwnedBuffer *out, SignalBorrowedSliceOfBuffers endorsements);
@@ -1436,6 +1460,8 @@ SignalFfiError *signal_group_send_full_token_verify(SignalBorrowedBuffer token, 
 SignalFfiError *signal_group_send_token_check_valid_contents(SignalBorrowedBuffer bytes);
 
 SignalFfiError *signal_group_send_token_to_full_token(SignalOwnedBuffer *out, SignalBorrowedBuffer token, uint64_t expiration);
+
+SignalFfiError *signal_hex_encode(char *output, size_t output_len, const uint8_t *input, size_t input_len);
 
 SignalFfiError *signal_hkdf_derive(SignalBorrowedMutableBuffer output, SignalBorrowedBuffer ikm, SignalBorrowedBuffer label, SignalBorrowedBuffer salt);
 
@@ -1546,8 +1572,6 @@ SignalFfiError *signal_message_backup_key_destroy(SignalMutPointerMessageBackupK
 SignalFfiError *signal_message_backup_key_from_account_entropy_pool(SignalMutPointerMessageBackupKey *out, const char *account_entropy, const SignalServiceIdFixedWidthBinaryBytes *aci);
 
 SignalFfiError *signal_message_backup_key_from_backup_key_and_backup_id(SignalMutPointerMessageBackupKey *out, const uint8_t (*backup_key)[32], const uint8_t (*backup_id)[16]);
-
-SignalFfiError *signal_message_backup_key_from_master_key(SignalMutPointerMessageBackupKey *out, const uint8_t (*master_key)[32], const SignalServiceIdFixedWidthBinaryBytes *aci);
 
 SignalFfiError *signal_message_backup_key_get_aes_key(uint8_t (*out)[32], SignalConstPointerMessageBackupKey key);
 

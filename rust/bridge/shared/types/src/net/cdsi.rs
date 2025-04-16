@@ -54,30 +54,6 @@ pub struct CdsiLookup {
 }
 
 impl CdsiLookup {
-    pub async fn new(
-        connection_manager: &ConnectionManager,
-        auth: Auth,
-        request: cdsi::LookupRequest,
-    ) -> Result<Self, cdsi::LookupError> {
-        let transport_connector = connection_manager
-            .transport_connector
-            .lock()
-            .expect("not poisoned")
-            .clone();
-        let endpoints = connection_manager
-            .endpoints
-            .lock()
-            .expect("not poisoned")
-            .clone();
-        let connected = CdsiConnection::connect(&endpoints.cdsi, transport_connector, auth).await?;
-        let (token, remaining_response) = connected.send_request(request).await?;
-
-        Ok(CdsiLookup {
-            token,
-            remaining: std::sync::Mutex::new(Some(remaining_response)),
-        })
-    }
-
     pub async fn new_routes(
         connection_manager: &ConnectionManager,
         auth: Auth,
@@ -90,7 +66,7 @@ impl CdsiLookup {
             user_agent,
             transport_connector,
             endpoints,
-            network_change_event,
+            network_change_event_tx,
             ..
         } = connection_manager;
 
@@ -123,7 +99,7 @@ impl CdsiLookup {
         let connection_resources = ConnectionResources {
             connect_state: connect,
             dns_resolver,
-            network_change_event,
+            network_change_event: &network_change_event_tx.subscribe(),
             confirmation_header_name,
         };
 

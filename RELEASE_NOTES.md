@@ -1,14 +1,13 @@
-v0.68.0
+v0.70.0
 
-- Swift: Allow UnidentifiedSenderMessageContent to be constructed from a message type and opaque bytes. (Contributed by @saman3d!)
+- Resuming an existing registration session now requires the phone number with for which the session was created.
 
-- net: Add a client for the registration verification service. This is currently
-  only available via the Node bindings.
+- Make the registration service client available in Java.
 
-- Java: InputStreams created by MessageBackup.validate() are now correctly closed when the operation is complete.
+- Enable registering an account via the Node registration service client.
 
-- Node: The InputStream abstraction now has an optional close() method, which will be called by MessageBackup.validate() on any created streams when the operation is complete. If your InputStream already has a close() method, this may be a breaking change for you.
+- Java, Node, Swift: remove items marked as deprecated. This includes functions related to CDSI, HKDF, message backup validation, media sanitization, incremental MACs, and usernames.
 
-- backups: Enforce that messages with expiration timers < 24 hours are not included in Remote Backups.
+- Android: Build with NDK 28, the latest stable.
 
-- backups: Add support for LocalLocator for local backups
+- backups: Validate NotificationProfile::id
