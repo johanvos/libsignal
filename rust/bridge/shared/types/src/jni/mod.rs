@@ -6,19 +6,22 @@ use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::io::Error as IoError;
 use std::marker::PhantomData;
+use std::ptr::NonNull;
 
 use attest::enclave::Error as EnclaveError;
 use attest::hsm_enclave::Error as HsmEnclaveError;
 use device_transfer::Error as DeviceTransferError;
 use http::uri::InvalidUri;
 pub use jni::objects::{
-    AutoElements, JByteArray, JClass, JLongArray, JObject, JObjectArray, JString, ReleaseMode,
+    AutoElements, JByteArray, JClass, JLongArray, JObject, JObjectArray, JString, JValue,
+    ReleaseMode,
 };
-use jni::objects::{GlobalRef, JThrowable, JValue, JValueOwned};
+use jni::objects::{GlobalRef, JThrowable, JValueOwned};
 pub use jni::sys::{jboolean, jint, jlong};
 pub use jni::JNIEnv;
 use jni::JavaVM;
 use libsignal_account_keys::Error as PinError;
+use libsignal_core::try_scoped;
 use libsignal_net::chat::{ConnectError as ChatConnectError, SendError as ChatSendError};
 use libsignal_net::infra::errors::RetryLater;
 use libsignal_net::infra::ws::WebSocketServiceError;
@@ -36,6 +39,9 @@ pub use args::*;
 
 mod chat;
 pub use chat::*;
+
+mod call_method;
+pub use call_method::*;
 
 mod class_lookup;
 pub use class_lookup::*;
@@ -65,6 +71,7 @@ pub type JavaByteBufferArray<'a> = JObjectArray<'a>;
 pub type JavaObject<'a> = JObject<'a>;
 pub type JavaUUID<'a> = JObject<'a>;
 pub type JavaCiphertextMessage<'a> = JObject<'a>;
+pub type JavaSignedPublicPreKey<'a> = JObject<'a>;
 pub type JavaMap<'a> = JObject<'a>;
 
 /// Return type marker for `bridge_fn`s that return Result, which gen_java_decl.py will pick out
@@ -522,10 +529,11 @@ impl MessageOnlyExceptionJniError for signal_media::sanitize::webp::ParseErrorRe
 
 mod registration {
     use libsignal_core::try_scoped;
+    use libsignal_net::auth::Auth;
     use libsignal_net::registration::{
-        CreateSessionError, InvalidSessionId, RequestError, RequestVerificationCodeError,
-        ResumeSessionError, SubmitVerificationError, UpdateSessionError,
-        VerificationCodeNotDeliverable,
+        CheckSvr2CredentialsError, CreateSessionError, InvalidSessionId, RegisterAccountError,
+        RegistrationLock, RequestError, RequestVerificationCodeError, ResumeSessionError,
+        SubmitVerificationError, UpdateSessionError, VerificationCodeNotDeliverable,
     };
 
     use super::*;
@@ -683,6 +691,62 @@ mod registration {
             }
         }
     }
+
+    impl MessageOnlyExceptionJniError for CheckSvr2CredentialsError {
+        fn exception_class(&self) -> ClassName<'static> {
+            match self {
+                CheckSvr2CredentialsError::CredentialsCouldNotBeParsed => {
+                    ClassName("org.signal.libsignal.net.RegistrationException")
+                }
+            }
+        }
+    }
+
+    impl JniError for RegisterAccountError {
+        fn to_throwable<'a>(
+            &self,
+            env: &mut JNIEnv<'a>,
+        ) -> Result<JThrowable<'a>, BridgeLayerError> {
+            let class_name = match self {
+                RegisterAccountError::RetryLater(retry_later) => {
+                    return retry_later.to_throwable(env)
+                }
+                RegisterAccountError::RegistrationLock(registration_lock) => {
+                    let class_name =
+                        ClassName("org.signal.libsignal.net.RegistrationLockException");
+                    let RegistrationLock {
+                        time_remaining,
+                        svr2_credentials,
+                    } = registration_lock;
+                    let time_remaining_seconds: i64 =
+                        time_remaining.as_secs().try_into().map_err(|_| {
+                            BridgeLayerError::IntegerOverflow(
+                                "RegistrationLock.time_remaining_seconds too large".to_owned(),
+                            )
+                        })?;
+                    let (svr2_username, svr2_password) = try_scoped(|| {
+                        let Auth { username, password } = svr2_credentials;
+                        Ok((env.new_string(username)?, env.new_string(password)?))
+                    })
+                    .check_exceptions(env, "RegisterAccountError::to_throwable")?;
+                    return new_instance(
+                        env,
+                        class_name,
+                        jni_args!((time_remaining_seconds => long, svr2_username => java.lang.String, svr2_password => java.lang.String) -> void),
+                    )
+                    .map(Into::into);
+                }
+                RegisterAccountError::DeviceTransferIsPossibleButNotSkipped => {
+                    ClassName("org.signal.libsignal.net.DeviceTransferPossibleException")
+                }
+                RegisterAccountError::RegistrationRecoveryVerificationFailed => {
+                    ClassName("org.signal.libsignal.net.RegistrationRecoveryFailedException")
+                }
+            };
+
+            make_single_message_throwable(env, &self.to_string(), class_name)
+        }
+    }
 }
 
 impl JniError for CdsiError {
@@ -777,11 +841,13 @@ impl MessageOnlyExceptionJniError for KeyTransNetError {
         match &self {
             KeyTransNetError::ChatSendError(send_error) => send_error.exception_class(),
             KeyTransNetError::RequestFailed(_)
-            | KeyTransNetError::VerificationFailed(_)
+            | KeyTransNetError::NonFatalVerificationFailure(_)
             | KeyTransNetError::InvalidResponse(_)
-            | KeyTransNetError::InvalidRequest(_)
-            | KeyTransNetError::DecodingFailed(_) => {
-                ClassName("org.signal.libsignal.net.KeyTransparencyException")
+            | KeyTransNetError::InvalidRequest(_) => {
+                ClassName("org.signal.libsignal.keytrans.KeyTransparencyException")
+            }
+            KeyTransNetError::FatalVerificationFailure(_) => {
+                ClassName("org.signal.libsignal.keytrans.VerificationFailedException")
             }
         }
     }
@@ -813,11 +879,11 @@ impl JniError for RetryLater {
 /// appropriate Java exception class and thrown.
 fn throw_error(env: &mut JNIEnv, error: SignalJniError) {
     convert_to_exception(env, error, |env, throwable, error| match throwable {
-        Err(failure) => log::error!("failed to create exception for {}: {}", error, failure),
+        Err(failure) => log::error!("failed to create exception for {error}: {failure}"),
         Ok(throwable) => {
             let result = env.throw(throwable);
             if let Err(failure) = result {
-                log::error!("failed to throw exception for {}: {}", error, failure);
+                log::error!("failed to throw exception for {error}: {failure}");
             }
         }
     });
@@ -846,107 +912,17 @@ where
     }
 }
 
-/// Casts the given handle as a `&T`.
-///
-/// # Safety
-///
-/// The caller must ensure that the provided handle is in fact the Java
-/// representation of a pointer to a value of type `T`, and that the pointer
-/// remains valid as long as the returned reference is around.
-pub unsafe fn native_handle_cast<'l, T>(
-    handle: ObjectHandle,
-) -> Result<&'l mut T, BridgeLayerError> {
-    /*
-    Should we try testing the encoded pointer for sanity here, beyond
-    being null? For example verifying that lowest bits are zero,
-    highest bits are zero, greater than 64K, etc?
-    */
-    if handle == 0 {
-        return Err(BridgeLayerError::NullPointer(None));
-    }
-
-    Ok(&mut *(handle as *mut T))
-}
-
-/// Calls a method and translates any thrown exceptions to
-/// [`BridgeLayerError::CallbackException`].
-///
-/// Wraps [`JNIEnv::call_method`].
-/// The result must have the correct type, or [`BridgeLayerError::UnexpectedJniResultType`] will be
-/// returned instead.
-pub fn call_method_checked<
-    'input,
-    'output,
-    O: AsRef<JObject<'input>>,
-    R: TryFrom<JValueOwned<'output>>,
-    const LEN: usize,
->(
-    env: &mut JNIEnv<'output>,
-    obj: O,
-    fn_name: &'static str,
-    args: JniArgs<R, LEN>,
-) -> Result<R, BridgeLayerError> {
-    // Note that we are *not* unwrapping the result yet!
-    // We need to check for exceptions *first*.
-    let result = env.call_method(obj, fn_name, args.sig, &args.args);
-    check_exceptions_and_convert_result(env, fn_name, result)
-}
-
-/// Calls a method and translates any thrown exceptions to
-/// [`BridgeLayerError::CallbackException`].
-///
-/// Wraps [`JNIEnv::call_static_method`].
-/// The result must have the correct type, or [`BridgeLayerError::UnexpectedJniResultType`] will be
-/// returned instead.
-pub fn call_static_method_checked<
-    'input,
-    'output,
-    C: jni::descriptors::Desc<'output, JClass<'input>>,
-    R: TryFrom<JValueOwned<'output>>,
-    const LEN: usize,
->(
-    env: &mut JNIEnv<'output>,
-    cls: C,
-    fn_name: &'static str,
-    args: JniArgs<R, LEN>,
-) -> Result<R, BridgeLayerError> {
-    // Note that we are *not* unwrapping the result yet!
-    // We need to check for exceptions *first*.
-    let result = env.call_static_method(cls, fn_name, args.sig, &args.args);
-    check_exceptions_and_convert_result(env, fn_name, result)
-}
-
-fn check_exceptions_and_convert_result<'output, R: TryFrom<JValueOwned<'output>>>(
-    env: &mut JNIEnv<'output>,
-    fn_name: &'static str,
-    result: jni::errors::Result<JValueOwned<'output>>,
-) -> Result<R, BridgeLayerError> {
-    let result = result.check_exceptions(env, fn_name)?;
-    let type_name = result.type_name();
-    result
-        .try_into()
-        .map_err(|_| BridgeLayerError::UnexpectedJniResultType(fn_name, type_name))
-}
-
-/// Constructs a new object using [`JniArgs`].
-///
-/// Wraps [`JNIEnv::new_object`]; all arguments are the same.
-pub fn new_object<'output, 'a, const LEN: usize>(
-    env: &mut JNIEnv<'output>,
-    cls: impl AsRef<JClass<'a>>,
-    args: JniArgs<(), LEN>,
-) -> jni::errors::Result<JObject<'output>> {
-    env.new_object(cls.as_ref(), args.sig, &args.args)
-}
-
 /// Looks up a class by name and constructs a new instance using [`new_object`].
 pub fn new_instance<'output, const LEN: usize>(
     env: &mut JNIEnv<'output>,
     class_name: ClassName<'static>,
     args: JniArgs<(), LEN>,
 ) -> Result<JObject<'output>, BridgeLayerError> {
-    let class = find_class(env, class_name)?;
-    new_object(env, class, args).check_exceptions(env, class_name.0)
+    try_scoped(|| {
+        let class = find_class(env, class_name)?;
+        new_object(env, class, args)
+    })
+    .check_exceptions(env, class_name.0)
 }
 
 /// Constructs a Java object from the given boxed Rust value.
@@ -985,7 +961,7 @@ pub fn check_jobject_type(
         return Err(BridgeLayerError::NullPointer(Some(class_name.0)));
     }
 
-    let class = find_class(env, class_name)?;
+    let class = find_class(env, class_name).check_exceptions(env, class_name.0)?;
 
     if !env.is_instance_of(obj, class).expect_no_exceptions()? {
         return Err(BridgeLayerError::BadJniParameter(class_name.0));
@@ -1045,7 +1021,7 @@ pub fn with_local_frame_returning_local<'env>(
 ///
 /// The Java method is assumed to return a type that implements the
 /// `NativeHandleGuard.Owner` interface.
-pub fn get_object_with_native_handle<T: 'static + Clone, const LEN: usize>(
+pub fn get_object_with_native_handle<T: BridgeHandle + Clone, const LEN: usize>(
     env: &mut JNIEnv,
     store_obj: &JObject,
     callback_args: JniArgs<JObject<'_>, LEN>,
@@ -1062,21 +1038,17 @@ pub fn get_object_with_native_handle<T: 'static + Clone, const LEN: usize>(
             return Ok(None);
         }
 
-        let handle: jlong = env
-            .call_method(
-                obj,
-                "unsafeNativeHandleWithoutGuard",
-                jni_signature!(() -> long),
-                &[],
-            )
-            .check_exceptions(env, callback_fn)?
-            .try_into()
-            .expect_no_exceptions()?;
+        let handle: jlong = call_method_checked(
+            env,
+            obj,
+            "unsafeNativeHandleWithoutGuard",
+            jni_args!(() -> long),
+        )?;
         if handle == 0 {
             return Ok(None);
         }
 
-        let object = unsafe { native_handle_cast::<T>(handle)? };
+        let object = unsafe { T::native_handle_cast(handle)?.as_ref() };
         Ok(Some(object.clone()))
     })
 }
@@ -1163,11 +1135,47 @@ macro_rules! jni_bridge_handle_destroy {
                 handle: $crate::jni::ObjectHandle,
             ) {
                 if handle != 0 {
-                    let _boxed_value = Box::from_raw(handle as *mut $typ);
+                    drop(Box::from_raw(
+                        <$typ as $crate::jni::BridgeHandle>::native_handle_cast(handle)
+                            .expect("valid")
+                            .as_mut(),
+                    ));
                 }
             }
         }
     };
+}
+
+/// A constant **non-cryptographic** hash function for type tagging purposes.
+///
+/// With only 8 bits collisions are certainly possible, but hopefully uncommon enough to still catch
+/// simple mistakes, especially since mistaken types are probably defined near each other.
+pub const fn hash_location_for_type_tag(file: &'static str, line: u32) -> u8 {
+    // A const implementation of FNV-1a, a simple hash function in the public domain.
+    // http://www.isthe.com/chongo/tech/comp/fnv/index.html
+    const fn update(mut hash: u32, b: u8) -> u32 {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619u32);
+        hash
+    }
+
+    let mut hash = 2166136261u32;
+
+    let mut i = 0;
+    while i < file.len() {
+        hash = update(hash, file.as_bytes()[i]);
+        i += 1;
+    }
+    let [line_a, line_b, line_c, line_d] = line.to_le_bytes();
+    hash = update(hash, line_a);
+    hash = update(hash, line_b);
+    hash = update(hash, line_c);
+    hash = update(hash, line_d);
+
+    // One level of XOR-folding, as recommended by the section
+    // "For tiny x < 16 bit values, we recommend using a 32 bit FNV-1 hash as follows":
+    hash ^= hash >> 8;
+    (hash & 0xFF) as u8
 }
 
 /// A wrapper around a cloned [`JNIEnv`] that forces scoped use.

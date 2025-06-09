@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use libsignal_net::keytrans::Error;
 #[cfg(feature = "signal-media")]
 use signal_media::sanitize::mp4::{Error as Mp4Error, ParseError as Mp4ParseError};
 #[cfg(feature = "signal-media")]
@@ -15,7 +16,7 @@ use super::*;
 const ERRORS_PROPERTY_NAME: &str = "Errors";
 const ERROR_CLASS_NAME: &str = "LibSignalErrorBase";
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 fn node_registerErrors(mut cx: FunctionContext) -> JsResult<JsValue> {
     let errors_module = cx.argument::<JsObject>(0)?;
     cx.this::<JsObject>()?
@@ -104,8 +105,8 @@ impl From<&str> for ThrownException {
 impl std::fmt::Display for ThrownException {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Error(r) => write!(f, "{:?}", r),
-            Self::String(s) => write!(f, "{}", s),
+            Self::Error(r) => write!(f, "{r:?}"),
+            Self::String(s) => write!(f, "{s}"),
         }
     }
 }
@@ -557,8 +558,8 @@ impl SignalNodeError for libsignal_net::cdsi::LookupError {
 mod registration {
     use libsignal_net::infra::errors::RetryLater;
     use libsignal_net::registration::{
-        CreateSessionError, RegisterAccountError, RegistrationLock, RequestError,
-        RequestVerificationCodeError, ResumeSessionError, SubmitVerificationError,
+        CheckSvr2CredentialsError, CreateSessionError, RegisterAccountError, RegistrationLock,
+        RequestError, RequestVerificationCodeError, ResumeSessionError, SubmitVerificationError,
         UpdateSessionError, VerificationCodeNotDeliverable,
     };
 
@@ -714,6 +715,14 @@ mod registration {
         }
     }
 
+    impl From<CheckSvr2CredentialsError> for BridgedErrorVariant {
+        fn from(value: CheckSvr2CredentialsError) -> Self {
+            match value {
+                CheckSvr2CredentialsError::CredentialsCouldNotBeParsed => Self::RequestInvalid,
+            }
+        }
+    }
+
     impl From<RegisterAccountError> for BridgedErrorVariant {
         fn from(value: RegisterAccountError) -> Self {
             match value {
@@ -776,6 +785,33 @@ impl SignalNodeError for libsignal_message_backup::ReadError {
             &message,
             operation_name,
             make_props,
+        )
+    }
+}
+
+impl SignalNodeError for libsignal_net::keytrans::Error {
+    fn into_throwable<'a, C: Context<'a>>(
+        self,
+        cx: &mut C,
+        module: Handle<'a, JsObject>,
+        operation_name: &str,
+    ) -> Handle<'a, JsError> {
+        let name = match self {
+            Error::ChatSendError(err) => return err.into_throwable(cx, module, operation_name),
+            Error::RequestFailed(_)
+            | Error::NonFatalVerificationFailure(_)
+            | Error::InvalidResponse(_)
+            | Error::InvalidRequest(_) => "KeyTransparencyError",
+            Error::FatalVerificationFailure(_) => "KeyTransparencyVerificationFailed",
+        };
+        let message = self.to_string();
+        new_js_error(
+            cx,
+            module,
+            Some(name),
+            &message,
+            operation_name,
+            no_extra_properties,
         )
     }
 }

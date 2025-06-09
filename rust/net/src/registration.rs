@@ -6,7 +6,6 @@
 use std::future::Future;
 use std::panic::UnwindSafe;
 
-use libsignal_net_infra::route::Captures;
 use static_assertions::assert_impl_all;
 
 mod error;
@@ -215,7 +214,7 @@ impl<'c> RegistrationService<'c> {
         account_attributes: ProvidedAccountAttributes<'_>,
         device_transfer: Option<SkipDeviceTransfer>,
         keys: ForServiceIds<AccountKeys<'_>>,
-        account_password: &[u8],
+        account_password: &str,
     ) -> Result<RegisterAccountResponse, RequestError<RegisterAccountError>> {
         let Self {
             connection,
@@ -253,10 +252,8 @@ impl<'c> RegistrationService<'c> {
         request: R,
         // Write this as `impl Future` so we can include the `Send` bound, which
         // lets us surface errors earlier.
-    ) -> impl Future<Output = Result<(), RequestError<SessionRequestError>>>
-           + Send
-           + Captures<&'_ ()>
-           + Captures<&'c ()> {
+    ) -> impl Future<Output = Result<(), RequestError<SessionRequestError>>> + Send + use<'_, 'c, R>
+    {
         // Delegate to a non-templated function to reduce code size cost.
         async fn submit_request_impl(
             this: &mut RegistrationService<'_>,
@@ -302,7 +299,7 @@ pub async fn reregister_account(
     account_attributes: ProvidedAccountAttributes<'_>,
     device_transfer: Option<SkipDeviceTransfer>,
     keys: ForServiceIds<AccountKeys<'_>>,
-    account_password: &[u8],
+    account_password: &str,
 ) -> Result<RegisterAccountResponse, RequestError<RegisterAccountError>> {
     let request = crate::chat::Request::register_account(
         number,
@@ -414,6 +411,7 @@ mod test {
     use std::str::FromStr as _;
 
     use assert_matches::assert_matches;
+    use bytes::Bytes;
     use futures_util::future::BoxFuture;
     use futures_util::FutureExt as _;
     use tokio::sync::mpsc;
@@ -483,7 +481,7 @@ mod test {
                 WebSocketRequestMessage {
                     verb: Some("POST".to_string()),
                     path: Some("/v1/verification/session".to_string()),
-                    body: Some(b"{\"number\":\"+18005550101\"}".into()),
+                    body: Some(Bytes::from_static(b"{\"number\":\"+18005550101\"}")),
                     headers: vec!["content-type: application/json".to_string()],
                     id: Some(0),
                 }
@@ -641,7 +639,7 @@ mod test {
                 WebSocketRequestMessage {
                     verb: Some("PATCH".to_string()),
                     path: Some("/v1/verification/session/abcabc".to_string()),
-                    body: Some(b"{\"captcha\":\"captcha value\"}".into()),
+                    body: Some(Bytes::from_static(b"{\"captcha\":\"captcha value\"}")),
                     headers: vec!["content-type: application/json".to_owned()],
                     id: Some(1),
                 }

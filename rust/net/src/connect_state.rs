@@ -13,7 +13,6 @@ use std::time::Duration;
 use futures_util::TryFutureExt as _;
 use http::HeaderName;
 use itertools::Itertools as _;
-use libsignal_net_infra::connection_manager::{ErrorClass, ErrorClassifier as _};
 use libsignal_net_infra::dns::DnsResolver;
 use libsignal_net_infra::errors::{LogSafeDisplay, TransportConnectError};
 use libsignal_net_infra::route::{
@@ -21,10 +20,10 @@ use libsignal_net_infra::route::{
     ConnectorFactory, DelayBasedOnTransport, DescribeForLog, DescribedRouteConnector,
     DirectOrProxy, HttpRouteFragment, InterfaceChangedOr, InterfaceMonitor, LoggingConnector,
     ResettingConnectionOutcomes, ResolveHostnames, ResolveWithSavedDescription, ResolvedRoute,
-    RouteProvider, RouteProviderContext, RouteProviderExt as _, RouteResolver, ThrottlingConnector,
-    TransportRoute, UnresolvedRouteDescription, UnresolvedTransportRoute,
-    UnresolvedWebsocketServiceRoute, UsePreconnect, UsesTransport, VariableTlsTimeoutConnector,
-    WebSocketRouteFragment, WebSocketServiceRoute,
+    RouteProvider, RouteProviderContext, RouteProviderExt as _, RouteResolver,
+    StaticTcpTimeoutConnector, ThrottlingConnector, TransportRoute, UnresolvedRouteDescription,
+    UnresolvedTransportRoute, UnresolvedWebsocketServiceRoute, UsePreconnect, UsesTransport,
+    VariableTlsTimeoutConnector, WebSocketRouteFragment, WebSocketServiceRoute,
 };
 use libsignal_net_infra::tcp_ssl::{LONG_TCP_HANDSHAKE_THRESHOLD, LONG_TLS_HANDSHAKE_THRESHOLD};
 use libsignal_net_infra::timeouts::{
@@ -35,8 +34,8 @@ use libsignal_net_infra::utils::NetworkChangeEvent;
 use libsignal_net_infra::ws::{WebSocketConnectError, WebSocketStreamLike};
 use libsignal_net_infra::ws2::attested::AttestedConnection;
 use libsignal_net_infra::{AsHttpHeader as _, AsyncDuplexStream};
-use rand::Rng;
-use rand_core::OsRng;
+use rand::distr::uniform::{UniformSampler, UniformUsize};
+use rand_core::{OsRng, UnwrapErr};
 use static_assertions::assert_eq_size_val;
 use tokio::time::Instant;
 
@@ -110,7 +109,7 @@ pub struct ConnectState<ConnectorFactory = DefaultConnectorFactory> {
 pub type DefaultTransportConnector = VariableTlsTimeoutConnector<
     ThrottlingConnector<LoggingConnector<crate::infra::tcp_ssl::StatelessTls>>,
     crate::infra::route::DirectOrProxy<
-        LoggingConnector<crate::infra::tcp_ssl::StatelessTcp>,
+        LoggingConnector<StaticTcpTimeoutConnector<crate::infra::tcp_ssl::StatelessTcp>>,
         crate::infra::tcp_ssl::proxy::StatelessProxied,
         TransportConnectError,
     >,
@@ -146,7 +145,11 @@ where
             1,
         );
         let proxy_or_direct_connector = DirectOrProxy::new(
-            LoggingConnector::new(Default::default(), LONG_TCP_HANDSHAKE_THRESHOLD, "TCP"),
+            LoggingConnector::new(
+                StaticTcpTimeoutConnector::default(),
+                LONG_TCP_HANDSHAKE_THRESHOLD,
+                "TCP",
+            ),
             // Proxy connectors use LoggingConnector internally
             Default::default(),
         );
@@ -339,9 +342,32 @@ impl<TC> ConnectionResources<'_, TC> {
                     Instant::now(),
                 );
                 log::debug!("[{log_tag}] connection attempt failed with {error}");
-                match error.classify() {
-                    ErrorClass::Intermittent => ControlFlow::Continue(()),
-                    ErrorClass::Fatal | ErrorClass::RetryAt(_) => ControlFlow::Break(error),
+                let is_fatal = match &error {
+                    WebSocketServiceConnectError::RejectedByServer {
+                        response,
+                        received_at: _,
+                    } => {
+                        // Retry-After takes precedence over everything else.
+                        libsignal_net_infra::extract_retry_later(response.headers()).is_some() ||
+                        // If we're rejected based on the request (4xx), there's no point in retrying.
+                        response.status().is_client_error()
+                    }
+                    WebSocketServiceConnectError::Connect(
+                        connect_error,
+                        crate::ws::NotRejectedByServer { .. },
+                    ) => {
+                        // If we *locally* chose to abort, that isn't route-specific; treat it as fatal.
+                        // In any other case, if we didn't make it to the server, we should retry.
+                        matches!(
+                            connect_error,
+                            WebSocketConnectError::Transport(TransportConnectError::ClientAbort)
+                        )
+                    }
+                };
+                if is_fatal {
+                    ControlFlow::Break(error)
+                } else {
+                    ControlFlow::Continue(())
                 }
             },
         );
@@ -578,14 +604,14 @@ where
 }
 
 #[derive(Debug, Default, Clone)]
-struct RouteProviderContextImpl(OsRng);
+struct RouteProviderContextImpl(UnwrapErr<OsRng>);
 
 impl RouteProviderContext for RouteProviderContextImpl {
     fn random_usize(&self) -> usize {
         // OsRng is zero-sized, so we're not losing random values by copying it.
-        let mut owned_rng: OsRng = self.0;
+        let mut owned_rng: UnwrapErr<OsRng> = self.0;
         assert_eq_size_val!(owned_rng, ());
-        owned_rng.gen()
+        UniformUsize::sample_single_inclusive(0, usize::MAX, &mut owned_rng).expect("valid range")
     }
 }
 
@@ -625,6 +651,7 @@ mod test {
             root_certs: RootCertificates::Native,
             sni: Host::Domain("fake-sni".into()),
             alpn: Some(Alpn::Http1_1),
+            min_protocol_version: Some(boring_signal::ssl::SslVersion::TLS1_3),
         },
         inner: DirectOrProxyRoute::Direct(TcpRoute {
             address: UnresolvedHost::from(Arc::from(FAKE_HOST_NAME)),

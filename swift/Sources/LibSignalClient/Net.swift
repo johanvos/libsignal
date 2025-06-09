@@ -27,6 +27,7 @@ public class Net {
 
     /// Creates a new `Net` instance that enables interacting with services in the given Signal environment.
     public init(env: Environment, userAgent: String, remoteConfig: [String: String] = [:]) {
+        self.environment = env
         self.asyncContext = TokioAsyncContext()
         self.connectionManager = ConnectionManager(env: env, userAgent: userAgent, remoteConfig: remoteConfig)
     }
@@ -102,7 +103,18 @@ public class Net {
         self.connectionManager.setCensorshipCircumventionEnabled(enabled)
     }
 
-    /// Updates the remote config settings used by libsignal.
+    /// Updates the remote configuration settings used by libsignal.
+    ///
+    /// The provided dictionary should be preprocessed as follows:
+    /// - Include only keys representing enabled configurations (entries explicitly disabled by the server should be omitted).
+    /// - Remove any platform-specific prefixes from keys (e.g., `"ios.libsignal."`).
+    /// - Replace values originally set to `nil` by the server with an empty string (`""`).
+    /// - Values should otherwise maintain the same format as they are returned by the server.
+    ///
+    /// Only new connections made *after* this call will use the new remote config settings.
+    /// Existing connections are not affected.
+    ///
+    /// - Parameter remoteConfig: A dictionary containing preprocessed libsignal configuration keys and their associated values
     public func setRemoteConfig(_ remoteConfig: [String: String]) {
         self.connectionManager.setRemoteConfig(remoteConfig)
     }
@@ -250,12 +262,17 @@ public class Net {
     /// - Returns:
     ///   An object representing the established, but not active, connection.
     public func connectUnauthenticatedChat() async throws -> UnauthenticatedChatConnection {
-        return try await UnauthenticatedChatConnection(tokioAsyncContext: self.asyncContext, connectionManager: self.connectionManager)
+        return try await UnauthenticatedChatConnection(
+            tokioAsyncContext: self.asyncContext,
+            connectionManager:
+            self.connectionManager,
+            environment: self.environment
+        )
     }
 
-    private var asyncContext: TokioAsyncContext
-    /// Exposed for testing.
+    internal var asyncContext: TokioAsyncContext
     internal var connectionManager: ConnectionManager
+    internal let environment: Environment
 }
 
 /// Authentication information used for connecting to CDS and SVR servers.
