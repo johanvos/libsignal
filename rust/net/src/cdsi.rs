@@ -313,8 +313,8 @@ impl From<prost::DecodeError> for LookupError {
 }
 
 #[derive(serde::Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
 struct RateLimitExceededResponse {
+    #[serde(rename = "retry_after")]
     retry_after_seconds: u32,
 }
 
@@ -452,7 +452,8 @@ impl From<&LookupRequest> for LookupRequestDebugInfo {
 
 /// Numeric code set by the server on the websocket close frame.
 #[repr(u16)]
-#[derive(Copy, Clone, num_enum::TryFromPrimitive, strum::IntoStaticStr)]
+#[derive(Copy, Clone, derive_more::TryFrom, strum::IntoStaticStr)]
+#[try_from(repr)]
 enum CdsiCloseCode {
     InvalidArgument = 4003,
     RateLimitExceeded = 4008,
@@ -465,8 +466,8 @@ enum CdsiCloseCode {
 ///
 /// Returns `Some(err)` if there is a relevant `LookupError` value for the
 /// provided close frame. Otherwise returns `None`.
-fn err_for_close(close: Option<CloseFrame<'_>>) -> LookupError {
-    fn unexpected_close(close: Option<CloseFrame<'_>>) -> LookupError {
+fn err_for_close(close: Option<CloseFrame>) -> LookupError {
+    fn unexpected_close(close: Option<CloseFrame>) -> LookupError {
         LookupError::EnclaveProtocol(AttestedProtocolError::UnexpectedClose(close.into()))
     }
 
@@ -482,7 +483,7 @@ fn err_for_close(close: Option<CloseFrame<'_>>) -> LookupError {
 
     match code {
         CdsiCloseCode::InvalidArgument => LookupError::InvalidArgument {
-            server_reason: reason.clone().into_owned(),
+            server_reason: reason.as_str().to_owned(),
         },
         CdsiCloseCode::InvalidToken => LookupError::InvalidToken,
         CdsiCloseCode::RateLimitExceeded => {
@@ -507,6 +508,7 @@ fn err_for_close(close: Option<CloseFrame<'_>>) -> LookupError {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::num::NonZeroU64;
     use std::time::Duration;
 
@@ -521,7 +523,9 @@ mod test {
     use libsignal_net_infra::ws2::attested::testutil::{
         run_attested_server, AttestedServerOutput, FAKE_ATTESTATION,
     };
-    use libsignal_net_infra::{AsHttpHeader as _, EnableDomainFronting};
+    use libsignal_net_infra::{
+        AsStaticHttpHeader as _, EnableDomainFronting, RECOMMENDED_WS2_CONFIG,
+    };
     use nonzero_ext::nonzero;
     use tokio_stream::wrappers::UnboundedReceiverStream;
     use tungstenite::protocol::frame::coding::CloseCode;
@@ -532,7 +536,6 @@ mod test {
     use super::*;
     use crate::auth::Auth;
     use crate::connect_state::{ConnectState, SUGGESTED_CONNECT_CONFIG};
-    use crate::enclave::EnclaveEndpointConnection;
 
     #[test]
     fn parse_lookup_response_entries() {
@@ -690,7 +693,7 @@ mod test {
         fn into_handler_with_close_from(
             mut self,
             state_before_close: &'static FakeServerState,
-            close_frame: CloseFrame<'static>,
+            close_frame: CloseFrame,
         ) -> impl FnMut(NextOrClose<Vec<u8>>) -> AttestedServerOutput {
             move |frame| {
                 if &self == state_before_close {
@@ -864,8 +867,6 @@ mod test {
         assert_eq!(response.records.len(), LARGE_NUMBER_OF_ENTRIES as usize);
     }
 
-    const RETRY_AFTER_SECS: u32 = 12345;
-
     #[tokio::test]
     async fn websocket_close_with_rate_limit_exceeded_after_initial_request() {
         let (server, client) = fake_websocket().await;
@@ -874,11 +875,7 @@ mod test {
             &FakeServerState::AwaitingLookupRequest,
             CloseFrame {
                 code: CloseCode::Bad(4008),
-                reason: serde_json::to_string_pretty(&RateLimitExceededResponse {
-                    retry_after_seconds: RETRY_AFTER_SECS,
-                })
-                .expect("can JSON-encode")
-                .into(),
+                reason: r#"{"retry_after": 12345}"#.into(),
             },
         );
 
@@ -912,7 +909,7 @@ mod test {
         assert_matches!(
             response,
             Err(LookupError::RateLimited(RetryLater {
-                retry_after_seconds: RETRY_AFTER_SECS
+                retry_after_seconds: 12345
             }))
         );
     }
@@ -925,11 +922,7 @@ mod test {
             &FakeServerState::AwaitingTokenAck,
             CloseFrame {
                 code: CloseCode::Bad(4008),
-                reason: serde_json::to_string_pretty(&RateLimitExceededResponse {
-                    retry_after_seconds: RETRY_AFTER_SECS,
-                })
-                .expect("can JSON-encode")
-                .into(),
+                reason: r#"{"retry_after": 513}"#.into(),
             },
         );
 
@@ -966,7 +959,7 @@ mod test {
         assert_matches!(
             response,
             Err(LookupError::RateLimited(RetryLater {
-                retry_after_seconds: RETRY_AFTER_SECS
+                retry_after_seconds: 513
             }))
         )
     }
@@ -994,12 +987,7 @@ mod test {
         });
 
         let env = crate::env::PROD;
-        let ws2_config = EnclaveEndpointConnection::new(
-            &env.cdsi,
-            Duration::from_secs(10),
-            &no_network_change_events(),
-        )
-        .ws2_config();
+        let ws2_config = RECOMMENDED_WS2_CONFIG;
         let auth = Auth {
             username: "username".to_string(),
             password: "password".to_string(),
@@ -1008,7 +996,11 @@ mod test {
         let connect_state =
             ConnectState::new_with_transport_connector(SUGGESTED_CONNECT_CONFIG, connector);
         let network_change_event = no_network_change_events();
-        let dns_resolver = DnsResolver::new(&network_change_event);
+
+        // If we don't mock out the DNS, this test will fail on machines without internet access.
+        let static_map = HashMap::from([env.cdsi.domain_config.static_fallback()]);
+        let dns_resolver = DnsResolver::new_from_static_map(static_map);
+
         let result = CdsiConnection::connect_with(
             ConnectionResources {
                 connect_state: &connect_state,
@@ -1017,7 +1009,8 @@ mod test {
                 confirmation_header_name: None,
             },
             DirectOrProxyProvider::maybe_proxied(
-                env.cdsi.route_provider(EnableDomainFronting::No),
+                env.cdsi
+                    .enclave_websocket_provider(EnableDomainFronting::No),
                 None,
             ),
             ws2_config,

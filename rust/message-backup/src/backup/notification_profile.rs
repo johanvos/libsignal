@@ -3,11 +3,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-// Silence clippy's complains about private fields used to prevent construction
-// and recommends `#[non_exhaustive]`. The annotation only applies outside this
-// crate, but we want intra-crate privacy.
-#![allow(clippy::manual_non_exhaustive)]
-
 use intmap::IntMap;
 use itertools::Itertools;
 
@@ -16,7 +11,7 @@ use crate::backup::method::LookupPair;
 use crate::backup::recipient::{DestinationKind, MinimalRecipientData};
 use crate::backup::serialize::{SerializeOrder, UnorderedList};
 use crate::backup::time::{ReportUnusualTimestamp, Timestamp, TimestampError};
-use crate::backup::{Color, ColorError, TryFromWith};
+use crate::backup::{Color, ColorError, TryIntoWith};
 use crate::proto::backup as proto;
 
 /// Validated version of [`proto::NotificationProfile`].
@@ -35,7 +30,7 @@ pub struct NotificationProfile<Recipient> {
     days_enabled: UnorderedList<DayOfWeek>,
     #[serde(bound(serialize = "Recipient: serde::Serialize + SerializeOrder"))]
     allowed_members: UnorderedList<Recipient>,
-    id: Vec<u8>,
+    id: [u8; 16],
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -68,10 +63,10 @@ pub enum NotificationProfileError {
 }
 
 impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusualTimestamp>
-    TryFromWith<proto::NotificationProfile, C> for NotificationProfile<R>
+    TryIntoWith<NotificationProfile<R>, C> for proto::NotificationProfile
 {
     type Error = NotificationProfileError;
-    fn try_from_with(item: proto::NotificationProfile, context: &C) -> Result<Self, Self::Error> {
+    fn try_into_with(self, context: &C) -> Result<NotificationProfile<R>, Self::Error> {
         let proto::NotificationProfile {
             name,
             emoji,
@@ -86,7 +81,7 @@ impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusu
             allowedMembers,
             id,
             special_fields: _,
-        } = item;
+        } = self;
 
         if name.is_empty() {
             return Err(NotificationProfileError::MissingName);
@@ -141,11 +136,12 @@ impl<R: Clone, C: LookupPair<RecipientId, MinimalRecipientData, R> + ReportUnusu
         if id.is_empty() {
             return Err(NotificationProfileError::MissingId);
         }
-        if id.len() != 16 {
-            return Err(NotificationProfileError::InvalidId);
-        }
 
-        Ok(Self {
+        let id = id
+            .try_into()
+            .map_err(|_| NotificationProfileError::InvalidId)?;
+
+        Ok(NotificationProfile {
             name,
             emoji,
             color,
@@ -240,7 +236,6 @@ mod test {
     use crate::backup::recipient::FullRecipientData;
     use crate::backup::testutil::TestContext;
     use crate::backup::time::testutil::MillisecondsSinceEpoch;
-    use crate::backup::TryIntoWith as _;
 
     impl proto::NotificationProfile {
         const NOTIFICATION_PROFILE_ID: [u8; 16] = [0xa1; 16];
@@ -283,7 +278,7 @@ mod test {
                 end_time: ClockTime(1320),
                 days_enabled: vec![DayOfWeek::Wednesday, DayOfWeek::Monday].into(),
                 allowed_members: vec![TestContext::contact_recipient().clone()].into(),
-                id: vec![0xa1; 16],
+                id: [0xa1; 16],
             })
         )
     }

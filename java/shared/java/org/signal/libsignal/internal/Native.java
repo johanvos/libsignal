@@ -13,6 +13,7 @@ import org.signal.libsignal.protocol.state.SessionStore;
 import org.signal.libsignal.protocol.state.PreKeyStore;
 import org.signal.libsignal.protocol.state.SignedPreKeyStore;
 import org.signal.libsignal.protocol.state.KyberPreKeyStore;
+import org.signal.libsignal.protocol.SignedPublicPreKey;
 import org.signal.libsignal.protocol.groups.state.SenderKeyStore;
 import org.signal.libsignal.protocol.logging.Log;
 import org.signal.libsignal.protocol.logging.SignalProtocolLogger;
@@ -404,7 +405,7 @@ public final class Native {
   public static native CompletableFuture<byte[]> KeyTransparency_Distinguished(long asyncRuntime, int environment, long chatConnection, byte[] lastDistinguishedTreeHead);
   public static native byte[] KeyTransparency_E164SearchKey(String e164);
   public static native CompletableFuture<byte[]> KeyTransparency_Monitor(long asyncRuntime, int environment, long chatConnection, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
-  public static native CompletableFuture<Long> KeyTransparency_Search(long asyncRuntime, int environment, long chatConnection, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
+  public static native CompletableFuture<byte[]> KeyTransparency_Search(long asyncRuntime, int environment, long chatConnection, byte[] aci, long aciIdentityKey, String e164, byte[] unidentifiedAccessKey, byte[] usernameHash, byte[] accountData, byte[] lastDistinguishedTreeHead);
   public static native byte[] KeyTransparency_UsernameHashSearchKey(byte[] hash);
 
   public static native void KyberKeyPair_Destroy(long handle);
@@ -483,7 +484,7 @@ public final class Native {
   public static native void PreKeyBundle_Destroy(long handle);
   public static native int PreKeyBundle_GetDeviceId(long obj) throws Exception;
   public static native long PreKeyBundle_GetIdentityKey(long p) throws Exception;
-  public static native int PreKeyBundle_GetKyberPreKeyId(long obj) throws Exception;
+  public static native int PreKeyBundle_GetKyberPreKeyId(long bundle) throws Exception;
   public static native long PreKeyBundle_GetKyberPreKeyPublic(long bundle) throws Exception;
   public static native byte[] PreKeyBundle_GetKyberPreKeySignature(long bundle) throws Exception;
   public static native int PreKeyBundle_GetPreKeyId(long obj) throws Exception;
@@ -554,11 +555,37 @@ public final class Native {
   public static native long ReceiptCredential_GetReceiptExpirationTime(byte[] receiptCredential);
   public static native long ReceiptCredential_GetReceiptLevel(byte[] receiptCredential);
 
+  public static native long RegisterAccountRequest_Create();
+  public static native void RegisterAccountRequest_Destroy(long handle);
+  public static native void RegisterAccountRequest_SetAccountPassword(long registerAccount, String accountPassword);
+  public static native void RegisterAccountRequest_SetGcmPushToken(long registerAccount, String gcmPushToken);
+  public static native void RegisterAccountRequest_SetIdentityPqLastResortPreKey(long registerAccount, int identityType, SignedPublicPreKey pqLastResortPreKey);
+  public static native void RegisterAccountRequest_SetIdentityPublicKey(long registerAccount, int identityType, long identityKey);
+  public static native void RegisterAccountRequest_SetIdentitySignedPreKey(long registerAccount, int identityType, SignedPublicPreKey signedPreKey);
+  public static native void RegisterAccountRequest_SetSkipDeviceTransfer(long registerAccount);
+
+  public static native void RegisterAccountResponse_Destroy(long handle);
+  public static native long RegisterAccountResponse_GetEntitlementBackupExpirationSeconds(long response);
+  public static native long RegisterAccountResponse_GetEntitlementBackupLevel(long response);
+  public static native Object[] RegisterAccountResponse_GetEntitlementBadges(long response);
+  public static native byte[] RegisterAccountResponse_GetIdentity(long response, int identityType);
+  public static native String RegisterAccountResponse_GetNumber(long response);
+  public static native boolean RegisterAccountResponse_GetReregistration(long response);
+  public static native boolean RegisterAccountResponse_GetStorageCapable(long response);
+  public static native byte[] RegisterAccountResponse_GetUsernameHash(long response);
+  public static native UUID RegisterAccountResponse_GetUsernameLinkHandle(long response);
+
+  public static native long RegistrationAccountAttributes_Create(byte[] recoveryPassword, int aciRegistrationId, int pniRegistrationId, String registrationLock, byte[] unidentifiedAccessKey, boolean unrestrictedUnidentifiedAccess, Object[] capabilities, boolean discoverableByPhoneNumber);
+  public static native void RegistrationAccountAttributes_Destroy(long handle);
+
+  public static native CompletableFuture<Object> RegistrationService_CheckSvr2Credentials(long asyncRuntime, long service, Object[] svrTokens);
   public static native CompletableFuture<Long> RegistrationService_CreateSession(long asyncRuntime, Object createSession, ConnectChatBridge connectChat);
   public static native void RegistrationService_Destroy(long handle);
+  public static native CompletableFuture<Long> RegistrationService_RegisterAccount(long asyncRuntime, long service, long registerAccount, long accountAttributes);
   public static native long RegistrationService_RegistrationSession(long service);
   public static native CompletableFuture<Void> RegistrationService_RequestPushChallenge(long asyncRuntime, long service, String pushToken, Object pushTokenType);
   public static native CompletableFuture<Void> RegistrationService_RequestVerificationCode(long asyncRuntime, long service, String transport, String client, Object[] languages);
+  public static native CompletableFuture<Long> RegistrationService_ReregisterAccount(long asyncRuntime, ConnectChatBridge connectChat, String number, long registerAccount, long accountAttributes);
   public static native CompletableFuture<Long> RegistrationService_ResumeSession(long asyncRuntime, String sessionId, String number, ConnectChatBridge connectChat);
   public static native String RegistrationService_SessionId(long service);
   public static native CompletableFuture<Void> RegistrationService_SubmitCaptcha(long asyncRuntime, long service, String captchaValue);
@@ -586,13 +613,6 @@ public final class Native {
   public static native byte[] SealedSessionCipher_Encrypt(long destination, long content, IdentityKeyStore identityKeyStore) throws Exception;
   public static native byte[] SealedSessionCipher_MultiRecipientEncrypt(long[] recipients, long[] recipientSessions, byte[] excludedRecipients, long content, IdentityKeyStore identityKeyStore) throws Exception;
   public static native byte[] SealedSessionCipher_MultiRecipientMessageForSingleRecipient(byte[] encodedMultiRecipientMessage) throws Exception;
-
-  public static native void SearchResult_Destroy(long handle);
-  public static native byte[] SearchResult_GetAccountData(long res);
-  public static native byte[] SearchResult_GetAciForE164(long res);
-  public static native byte[] SearchResult_GetAciForUsernameHash(long res);
-  public static native long SearchResult_GetAciIdentityKey(long res);
-  public static native long SearchResult_GetTimestamp(long res);
 
   public static native long SenderCertificate_Deserialize(byte[] data) throws Exception;
   public static native void SenderCertificate_Destroy(long handle);
@@ -677,9 +697,9 @@ public final class Native {
   public static native String ServiceId_ServiceIdLog(byte[] value);
   public static native String ServiceId_ServiceIdString(byte[] value);
 
-  public static native void SessionBuilder_ProcessPreKeyBundle(long bundle, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore, long now) throws Exception;
+  public static native void SessionBuilder_ProcessPreKeyBundle(long bundle, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore, long now, boolean usePqRatchet) throws Exception;
 
-  public static native byte[] SessionCipher_DecryptPreKeySignalMessage(long message, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore, PreKeyStore prekeyStore, SignedPreKeyStore signedPrekeyStore, KyberPreKeyStore kyberPrekeyStore) throws Exception;
+  public static native byte[] SessionCipher_DecryptPreKeySignalMessage(long message, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore, PreKeyStore prekeyStore, SignedPreKeyStore signedPrekeyStore, KyberPreKeyStore kyberPrekeyStore, boolean usePqRatchet) throws Exception;
   public static native byte[] SessionCipher_DecryptSignalMessage(long message, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore) throws Exception;
   public static native CiphertextMessage SessionCipher_EncryptMessage(byte[] ptext, long protocolAddress, SessionStore sessionStore, IdentityKeyStore identityKeyStore, long now) throws Exception;
 
@@ -687,17 +707,12 @@ public final class Native {
   public static native boolean SessionRecord_CurrentRatchetKeyMatches(long s, long key) throws Exception;
   public static native long SessionRecord_Deserialize(byte[] data) throws Exception;
   public static native void SessionRecord_Destroy(long handle);
-  public static native byte[] SessionRecord_GetAliceBaseKey(long obj) throws Exception;
   public static native byte[] SessionRecord_GetLocalIdentityKeyPublic(long obj) throws Exception;
   public static native int SessionRecord_GetLocalRegistrationId(long obj) throws Exception;
-  public static native byte[] SessionRecord_GetReceiverChainKeyValue(long sessionState, long key) throws Exception;
   public static native byte[] SessionRecord_GetRemoteIdentityKeyPublic(long obj) throws Exception;
   public static native int SessionRecord_GetRemoteRegistrationId(long obj) throws Exception;
-  public static native byte[] SessionRecord_GetSenderChainKeyValue(long obj) throws Exception;
   public static native int SessionRecord_GetSessionVersion(long s) throws Exception;
   public static native boolean SessionRecord_HasUsableSenderChain(long s, long now) throws Exception;
-  public static native long SessionRecord_InitializeAliceSession(long identityKeyPrivate, long identityKeyPublic, long basePrivate, long basePublic, long theirIdentityKey, long theirSignedPrekey, long theirRatchetKey) throws Exception;
-  public static native long SessionRecord_InitializeBobSession(long identityKeyPrivate, long identityKeyPublic, long signedPrekeyPrivate, long signedPrekeyPublic, long ephPrivate, long ephPublic, long theirIdentityKey, long theirBaseKey) throws Exception;
   public static native long SessionRecord_NewFresh();
   public static native byte[] SessionRecord_Serialize(long obj) throws Exception;
 
@@ -714,9 +729,10 @@ public final class Native {
   public static native byte[] SignalMessage_GetBody(long obj) throws Exception;
   public static native int SignalMessage_GetCounter(long obj) throws Exception;
   public static native int SignalMessage_GetMessageVersion(long obj) throws Exception;
+  public static native byte[] SignalMessage_GetPqRatchet(long msg);
   public static native long SignalMessage_GetSenderRatchetKey(long m);
   public static native byte[] SignalMessage_GetSerialized(long obj) throws Exception;
-  public static native long SignalMessage_New(int messageVersion, byte[] macKey, long senderRatchetKey, int counter, int previousCounter, byte[] ciphertext, long senderIdentityKey, long receiverIdentityKey) throws Exception;
+  public static native long SignalMessage_New(int messageVersion, byte[] macKey, long senderRatchetKey, int counter, int previousCounter, byte[] ciphertext, long senderIdentityKey, long receiverIdentityKey, byte[] pqRatchet) throws Exception;
   public static native boolean SignalMessage_VerifyMac(long msg, long senderIdentityKey, long receiverIdentityKey, byte[] macKey) throws Exception;
 
   public static native long SignedPreKeyRecord_Deserialize(byte[] data) throws Exception;

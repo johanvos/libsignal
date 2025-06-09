@@ -21,6 +21,7 @@ use crate::io::{InputStream, SyncInputStream};
 use crate::message_backup::MessageBackupValidationOutcome;
 use crate::net::chat::ChatListener;
 use crate::net::registration::ConnectChatBridge;
+use crate::protocol::KyberPublicKey;
 use crate::support::{Array, AsType, FixedLengthBincodeSerializable, Serialized};
 
 /// Converts arguments from their JNI form to their Rust form.
@@ -155,8 +156,7 @@ impl SimpleArgTypeInfo<'_> for u32 {
     fn convert_from(_env: &mut JNIEnv, foreign: &jint) -> Result<Self, BridgeLayerError> {
         if *foreign < 0 {
             return Err(BridgeLayerError::IntegerOverflow(format!(
-                "{} to u32",
-                foreign
+                "{foreign} to u32"
             )));
         }
         Ok(*foreign as u32)
@@ -194,8 +194,7 @@ impl SimpleArgTypeInfo<'_> for crate::protocol::Timestamp {
     fn convert_from(_env: &mut JNIEnv, foreign: &jlong) -> Result<Self, BridgeLayerError> {
         if *foreign < 0 {
             return Err(BridgeLayerError::IntegerOverflow(format!(
-                "{} to Timestamp (u64)",
-                foreign
+                "{foreign} to Timestamp (u64)"
             )));
         }
         Ok(Self::from_epoch_millis(*foreign as u64))
@@ -211,8 +210,7 @@ impl SimpleArgTypeInfo<'_> for crate::zkgroup::Timestamp {
     fn convert_from(_env: &mut JNIEnv, foreign: &jlong) -> Result<Self, BridgeLayerError> {
         if *foreign < 0 {
             return Err(BridgeLayerError::IntegerOverflow(format!(
-                "{} to Timestamp (u64)",
-                foreign
+                "{foreign} to Timestamp (u64)"
             )));
         }
         Ok(Self::from_epoch_seconds(*foreign as u64))
@@ -224,7 +222,7 @@ impl SimpleArgTypeInfo<'_> for u8 {
     type ArgType = jint;
     fn convert_from(_env: &mut JNIEnv, foreign: &jint) -> Result<Self, BridgeLayerError> {
         u8::try_from(*foreign)
-            .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{} to u8", foreign)))
+            .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{foreign} to u8")))
     }
 }
 
@@ -233,7 +231,7 @@ impl SimpleArgTypeInfo<'_> for u16 {
     type ArgType = jint;
     fn convert_from(_env: &mut JNIEnv, foreign: &jint) -> Result<Self, BridgeLayerError> {
         u16::try_from(*foreign)
-            .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{} to u16", foreign)))
+            .map_err(|_| BridgeLayerError::IntegerOverflow(format!("{foreign} to u16")))
     }
 }
 
@@ -606,7 +604,7 @@ impl<'storage, 'param: 'storage, 'context: 'param> ArgTypeInfo<'storage, 'param,
 impl<'a> SimpleArgTypeInfo<'a> for CiphertextMessageRef<'a> {
     type ArgType = JavaCiphertextMessage<'a>;
     fn convert_from(env: &mut JNIEnv, foreign: &Self::ArgType) -> Result<Self, BridgeLayerError> {
-        fn native_handle_from_message<'a, T: 'static>(
+        fn native_handle_from_message<'a, T: BridgeHandle>(
             env: &mut JNIEnv,
             foreign: &JavaCiphertextMessage<'a>,
             class_name: &'static str,
@@ -616,17 +614,15 @@ impl<'a> SimpleArgTypeInfo<'a> for CiphertextMessageRef<'a> {
                 .is_instance_of(foreign, class_name)
                 .check_exceptions(env, "CiphertextMessageRef::convert_from")?
             {
-                let handle: jlong = env
-                    .call_method(
-                        foreign,
-                        "unsafeNativeHandleWithoutGuard",
-                        jni_signature!(() -> long),
-                        &[],
-                    )
-                    .check_exceptions(env, "CiphertextMessageRef::convert_from")?
-                    .try_into()
-                    .expect_no_exceptions()?;
-                Ok(Some(make_result(unsafe { native_handle_cast(handle)? })))
+                let handle: jlong = call_method_checked(
+                    env,
+                    foreign,
+                    "unsafeNativeHandleWithoutGuard",
+                    jni_args!(() -> long),
+                )?;
+                Ok(Some(make_result(unsafe {
+                    T::native_handle_cast(handle)?.as_ref()
+                })))
             } else {
                 Ok(None)
             }
@@ -686,11 +682,12 @@ impl<'a> ResultTypeInfo<'a> for crate::cds2::Cds2Metrics {
         let jobj = new_instance(env, ClassName("java.util.HashMap"), jni_args!(() -> void))?;
         let jmap = JMap::from_env(env, &jobj).check_exceptions(env, "Cds2Metrics::convert_into")?;
 
-        let long_class = find_class(env, ClassName("java.lang.Long"))?;
+        const LONG_CLASS_NAME: ClassName<'_> = ClassName("java.lang.Long");
+        let long_class = find_class(env, LONG_CLASS_NAME).expect_no_exceptions()?;
         for (k, v) in self.0 {
             let k = k.convert_into(env)?;
             let v = new_object(env, &long_class, jni_args!((v => long) -> void))
-                .check_exceptions(env, "java.lang.Long")?;
+                .check_exceptions(env, LONG_CLASS_NAME.0)?;
             jmap.put(env, &k, &v).check_exceptions(env, "put")?;
         }
         Ok(jobj)
@@ -759,6 +756,17 @@ impl ResultTypeInfo<'_> for crate::protocol::Timestamp {
     fn convert_into(self, _env: &mut JNIEnv) -> Result<Self::ResultType, BridgeLayerError> {
         // Note that we don't check bounds here.
         Ok(self.epoch_millis() as jlong)
+    }
+}
+
+/// Reinterprets the bits of the `u64` as a Java `long`. Returns `-1` for `None`.
+///
+/// Note that this is different from the implementation of [`ArgTypeInfo`] for `Option<u64>`.
+impl ResultTypeInfo<'_> for Option<u64> {
+    type ResultType = jlong;
+    fn convert_into(self, _env: &mut JNIEnv) -> Result<Self::ResultType, BridgeLayerError> {
+        // Note that we don't check bounds here.
+        Ok(self.unwrap_or(u64::MAX) as jlong)
     }
 }
 
@@ -865,6 +873,26 @@ impl<'storage, 'param: 'storage, 'context: 'param, const LEN: usize>
     }
 }
 
+impl<'storage, 'param: 'storage, 'context: 'param, const LEN: usize>
+    ArgTypeInfo<'storage, 'param, 'context> for Option<&'storage [u8; LEN]>
+{
+    type ArgType = JByteArray<'context>;
+    type StoredType = Option<AutoElements<'context, 'context, 'param, jbyte>>;
+    fn borrow(
+        env: &mut JNIEnv<'context>,
+        foreign: &'param Self::ArgType,
+    ) -> Result<Self::StoredType, BridgeLayerError> {
+        if foreign.is_null() {
+            Ok(None)
+        } else {
+            <&'storage [u8; LEN]>::borrow(env, foreign).map(Some)
+        }
+    }
+    fn load_from(stored: &'storage mut Self::StoredType) -> Self {
+        stored.as_mut().map(ArgTypeInfo::load_from)
+    }
+}
+
 impl<'a, const LEN: usize> ResultTypeInfo<'a> for [u8; LEN] {
     type ResultType = JByteArray<'a>;
     fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
@@ -885,6 +913,14 @@ impl<'a> ResultTypeInfo<'a> for uuid::Uuid {
                 jlong::from_be_bytes(lsb.try_into().expect("correct length")) => long,
             ) -> void),
         )
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for Option<uuid::Uuid> {
+    type ResultType = JObject<'a>;
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        self.map(|uuid| uuid.convert_into(env))
+            .unwrap_or(Ok(JObject::null()))
     }
 }
 
@@ -936,16 +972,67 @@ impl<'a> ResultTypeInfo<'a> for Option<JObject<'a>> {
     }
 }
 
+/// The offset, in bits, to store an 8-bit type tag in a pointer.
+///
+/// The top 8 bits of (64-bit) pointers get used for OS-based pointer integrity checks on some
+/// devices. The bottom 48 are the extent of a "normal" address space on both x86_64 and aarch64.
+/// That leaves 8 bits in the middle for us to store our own type tag. As long as we don't deploy to
+/// a server with a memory space bigger than a terabyte, we should be good.
+const TYPE_TAG_POINTER_OFFSET: usize = 48;
+
 /// A marker for Rust objects exposed as opaque handles (pointers converted to `jlong`).
 ///
 /// When we do this, we hand the lifetime over to the app. Since we don't know how long the object
 /// will be kept alive, it can't (safely) have references to anything with a non-static lifetime.
-pub trait BridgeHandle: 'static {}
+pub trait BridgeHandle: Sized + 'static {
+    const TYPE_TAG: u8;
+
+    /// Casts the given handle as a `NonNull<T>`.
+    ///
+    /// Does some rudimentary checks that the handle probably does represent a real object, but
+    /// cannot guarantee it.
+    fn native_handle_cast(handle: ObjectHandle) -> Result<NonNull<Self>, BridgeLayerError> {
+        if handle == 0 {
+            return Err(BridgeLayerError::NullPointer(None));
+        }
+
+        let addr = if cfg!(feature = "jni-type-tagging") {
+            if ((handle >> TYPE_TAG_POINTER_OFFSET) & 0xFF) as u8 != Self::TYPE_TAG {
+                return Err(BridgeLayerError::BadJniParameter(
+                    std::any::type_name::<Self>(),
+                ));
+            }
+            handle & !(0xFF << TYPE_TAG_POINTER_OFFSET)
+        } else {
+            handle
+        };
+
+        // We could add additional validity checks here (alignment, "not a very low address", etc)
+        // but the type tag is already a good check that we haven't been handed garbage.
+
+        // SAFETY: For this to fail, we would have needed to be passed a handle that has a correct
+        // type tag but no actual address.
+        Ok(unsafe { NonNull::new_unchecked(addr as *mut Self) })
+    }
+
+    /// Converts `boxed_value` to a raw pointer and then encodes it as a handle.
+    fn encode_as_handle(boxed_value: Box<Self>) -> ObjectHandle {
+        let mut addr = Box::into_raw(boxed_value) as ObjectHandle;
+        if cfg!(feature = "jni-type-tagging") {
+            assert!(
+                (addr >> TYPE_TAG_POINTER_OFFSET) & 0xFF == 0,
+                "type-tag bits already in use"
+            );
+            addr |= (Self::TYPE_TAG as ObjectHandle) << TYPE_TAG_POINTER_OFFSET;
+        }
+        addr
+    }
+}
 
 impl<T: BridgeHandle> SimpleArgTypeInfo<'_> for &T {
     type ArgType = ObjectHandle;
     fn convert_from(_env: &mut JNIEnv, foreign: &Self::ArgType) -> Result<Self, BridgeLayerError> {
-        Ok(unsafe { native_handle_cast(*foreign) }?)
+        Ok(unsafe { T::native_handle_cast(*foreign)?.as_ref() })
     }
 }
 
@@ -963,7 +1050,7 @@ impl<T: BridgeHandle> SimpleArgTypeInfo<'_> for Option<&T> {
 impl<T: BridgeHandle> SimpleArgTypeInfo<'_> for &mut T {
     type ArgType = ObjectHandle;
     fn convert_from(_env: &mut JNIEnv, foreign: &Self::ArgType) -> Result<Self, BridgeLayerError> {
-        unsafe { native_handle_cast(*foreign) }
+        Ok(unsafe { T::native_handle_cast(*foreign)?.as_mut() })
     }
 }
 
@@ -980,11 +1067,7 @@ impl<'storage, 'param: 'storage, 'context: 'param, T: BridgeHandle>
             .check_exceptions(env, "<&[&T]>::borrow")?;
         array
             .iter()
-            .map(|&raw_handle| unsafe {
-                (raw_handle as *const T)
-                    .as_ref()
-                    .ok_or(BridgeLayerError::NullPointer(None))
-            })
+            .map(|raw_handle| SimpleArgTypeInfo::convert_from(env, raw_handle))
             .collect()
     }
     fn load_from(stored: &'storage mut Self::StoredType) -> &'storage [&'storage T] {
@@ -995,7 +1078,7 @@ impl<'storage, 'param: 'storage, 'context: 'param, T: BridgeHandle>
 impl<T: BridgeHandle> ResultTypeInfo<'_> for T {
     type ResultType = ObjectHandle;
     fn convert_into(self, _env: &mut JNIEnv) -> Result<Self::ResultType, BridgeLayerError> {
-        Ok(Box::into_raw(Box::new(self)) as ObjectHandle)
+        Ok(T::encode_as_handle(Box::new(self)))
     }
 }
 
@@ -1253,6 +1336,80 @@ impl<'a> SimpleArgTypeInfo<'a> for libsignal_net::registration::PushTokenType {
     }
 }
 
+impl<'a> SimpleArgTypeInfo<'a> for crate::net::registration::SignedPublicPreKey {
+    type ArgType = JObject<'a>;
+    fn convert_from(env: &mut JNIEnv<'a>, obj: &Self::ArgType) -> Result<Self, BridgeLayerError> {
+        check_jobject_type(
+            env,
+            obj,
+            ClassName("org.signal.libsignal.protocol.SignedPublicPreKey"),
+        )?;
+
+        let values = try_scoped(|| {
+            let key_id = env.get_field(obj, "id", jni_signature!(int))?.i()?;
+
+            let public_key = env
+                .get_field(
+                    obj,
+                    "publicKey",
+                    jni_signature!(org.signal.libsignal.protocol.SerializablePublicKey),
+                )?
+                .l()?;
+
+            let signature = env
+                .get_field(obj, "signature", jni_signature!([byte]))?
+                .l()?;
+
+            Ok((key_id, public_key, signature.into()))
+        })
+        .check_exceptions(env, "SignedPreKeyBody::convert_from")?;
+
+        let (key_id, public_key, signature) = values;
+
+        let key_id = key_id.try_into().map_err(|_| {
+            BridgeLayerError::IntegerOverflow("id field is out of bounds".to_owned())
+        })?;
+
+        let public_key = {
+            let native_handle = call_method_checked(
+                env,
+                &public_key,
+                "unsafeNativeHandleWithoutGuard",
+                jni_args!(() -> long),
+            )?;
+
+            if env
+                .is_instance_of(
+                    &public_key,
+                    jni_class_name!(org.signal.libsignal.protocol.ecc.ECPublicKey),
+                )
+                .expect_no_exceptions()?
+            {
+                SimpleArgTypeInfo::convert_from(env, &native_handle).map(PublicKey::serialize)
+            } else if env
+                .is_instance_of(
+                    &public_key,
+                    jni_class_name!(org.signal.libsignal.protocol.kem.KEMPublicKey),
+                )
+                .expect_no_exceptions()?
+            {
+                SimpleArgTypeInfo::convert_from(env, &native_handle).map(KyberPublicKey::serialize)
+            } else {
+                Err(BridgeLayerError::BadArgument(
+                    "publicKey type is not supported".to_owned(),
+                ))
+            }?
+        };
+        let signature = <Box<[u8]>>::convert_from(env, &signature)?;
+
+        Ok(Self {
+            key_id,
+            public_key,
+            signature,
+        })
+    }
+}
+
 impl<'a, T> ResultTypeInfo<'a> for Serialized<T>
 where
     T: FixedLengthBincodeSerializable + serde::Serialize,
@@ -1281,7 +1438,8 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::cdsi::LookupResponse {
 
         const ENTRY_CLASS: ClassName =
             ClassName("org.signal.libsignal.net.CdsiLookupResponse$Entry");
-        let entry_class = find_class(env, ENTRY_CLASS)?;
+        let entry_class =
+            find_class(env, ENTRY_CLASS).check_exceptions(env, "LookupResponse::convert_into")?;
 
         for entry in records {
             let LookupResponseEntry { aci, e164, pni } = entry;
@@ -1311,7 +1469,7 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::cdsi::LookupResponse {
                     &entry_class,
                     jni_args!( (aci => [byte], pni => [byte]) -> void),
                 )
-                .check_exceptions(env, ENTRY_CLASS.0)?,
+                .check_exceptions(env, "LookupResponse::convert_into")?,
                 env,
             );
 
@@ -1383,21 +1541,24 @@ impl<'a> ResultTypeInfo<'a> for libsignal_net::registration::RequestedInformatio
     type ResultType = JObject<'a>;
 
     fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
-        let class = find_class(
-            env,
-            ClassName("org.signal.libsignal.net.RegistrationSessionState$RequestedInformation"),
-        )?;
+        try_scoped(|| {
+            let class = find_class(
+                env,
+                ClassName("org.signal.libsignal.net.RegistrationSessionState$RequestedInformation"),
+            )?;
 
-        let field_name = match self {
-            libsignal_net::registration::RequestedInformation::PushChallenge => "PUSH_CHALLENGE",
-            libsignal_net::registration::RequestedInformation::Captcha => "CAPTCHA",
-        };
-        env.get_static_field(
-            class,
-            field_name,
-            jni_signature!(org.signal.libsignal.net.RegistrationSessionState::RequestedInformation),
-        )
-        .and_then(|v| v.l())
+            let field_name = match self {
+                libsignal_net::registration::RequestedInformation::PushChallenge => {
+                    "PUSH_CHALLENGE"
+                }
+                libsignal_net::registration::RequestedInformation::Captcha => "CAPTCHA",
+            };
+            env.get_static_field(
+                class,
+                field_name,
+                jni_signature!(org.signal.libsignal.net.RegistrationSessionState::RequestedInformation),
+            )?.l()
+        })
         .check_exceptions(env, "RequestedInformation::convert_into")
     }
 }
@@ -1411,6 +1572,82 @@ impl<'a> ResultTypeInfo<'a> for Box<[libsignal_net::registration::RequestedInfor
             jni_class_name!(org.signal.libsignal.net.RegistrationSessionState::RequestedInformation),
             self,
         )
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for libsignal_net::registration::RegisterResponseBadge {
+    type ResultType = JObject<'a>;
+
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        const CLASS_NAME: ClassName<'_> =
+            ClassName("org.signal.libsignal.net.RegisterAccountResponse$BadgeEntitlement");
+        let class = find_class(env, CLASS_NAME)
+            .check_exceptions(env, "RegisterResponseBadge::convert_into")?;
+
+        let Self {
+            id,
+            visible,
+            expiration,
+        } = self;
+
+        let expiration_seconds = expiration.as_secs().convert_into(env)?;
+        try_scoped(|| {
+            let id = env.new_string(id)?;
+
+            new_object(
+                env,
+                class,
+                jni_args!((
+                    id => java.lang.String,
+                    visible => boolean,
+                    expiration_seconds => long
+                ) -> void),
+            )
+        })
+        .check_exceptions(env, "RegisterResponseBadge::convert_into")
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for Box<[libsignal_net::registration::RegisterResponseBadge]> {
+    type ResultType = JObjectArray<'a>;
+
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        make_object_array(
+            env,
+            jni_class_name!(org.signal.libsignal.net.RegisterAccountResponse::BadgeEntitlement),
+            self,
+        )
+    }
+}
+
+impl<'a> ResultTypeInfo<'a> for libsignal_net::registration::CheckSvr2CredentialsResponse {
+    type ResultType = JObject<'a>;
+    fn convert_into(self, env: &mut JNIEnv<'a>) -> Result<Self::ResultType, BridgeLayerError> {
+        const RESULT_CLASS_NAME: &str =
+            "org.signal.libsignal.net.RegistrationService$Svr2CredentialsResult";
+        let jobj = new_instance(env, ClassName("java.util.HashMap"), jni_args!(() -> void))?;
+        let (jmap, response_class) = try_scoped(|| {
+            Ok((
+                JMap::from_env(env, &jobj)?,
+                find_class(env, ClassName(RESULT_CLASS_NAME))?,
+            ))
+        })
+        .check_exceptions(env, "CheckSvr2CredentialsResponse::convert_into")?;
+
+        let Self { matches } = self;
+        for (k, v) in matches {
+            let k = k.convert_into(env)?;
+            let name = match v {
+                libsignal_net::registration::Svr2CredentialsResult::Match => "MATCH",
+                libsignal_net::registration::Svr2CredentialsResult::NoMatch => "NO_MATCH",
+                libsignal_net::registration::Svr2CredentialsResult::Invalid => "INVALID",
+            };
+            let v = env.get_static_field(&response_class, name, jni_signature!(org.signal.libsignal.net.RegistrationService::Svr2CredentialsResult))
+            .and_then(|v| v.l())
+                .check_exceptions(env, "Svr2CredentialsResult")?;
+            jmap.put(env, &k, &v).check_exceptions(env, "put")?;
+        }
+        Ok(jobj)
     }
 }
 
@@ -1503,7 +1740,9 @@ impl<'a> ResultTypeInfo<'a> for MessageBackupValidationOutcome {
 macro_rules! jni_bridge_as_handle {
     ( $typ:ty as false $(, $($_:tt)*)? ) => {};
     ( $typ:ty as $jni_name:ident ) => {
-        impl $crate::jni::BridgeHandle for $typ {}
+        impl $crate::jni::BridgeHandle for $typ {
+            const TYPE_TAG: u8 = $crate::jni::hash_location_for_type_tag(file!(), line!());
+        }
     };
     ( $typ:ty ) => {
         // `paste!` turns the type back into an identifier.
@@ -1611,6 +1850,9 @@ macro_rules! jni_arg_type {
     (RegistrationPushTokenType) => {
         ::jni::objects::JObject<'local>
     };
+    (SignedPublicPreKey) => {
+        jni::JavaSignedPublicPreKey<'local>
+    };
     (&mut [u8]) => {
         ::jni::objects::JByteArray<'local>
     };
@@ -1624,6 +1866,9 @@ macro_rules! jni_arg_type {
         ::jni::objects::JObjectArray<'local>
     };
     (Option<Box<[u8]> >) => {
+        ::jni::objects::JByteArray<'local>
+    };
+    (Option<&[u8; $len:expr] >) => {
         ::jni::objects::JByteArray<'local>
     };
     (ServiceId) => {
@@ -1686,6 +1931,7 @@ macro_rules! jni_arg_type {
     (CreateSession) => {
         $crate::jni::JObject<'local>
     };
+    (TestingFutureCancellationGuard) => { ::jni::sys::jlong };
 
     (Ignored<$typ:ty>) => (::jni::objects::JObject<'local>);
 }
@@ -1818,6 +2064,12 @@ macro_rules! jni_result_type {
     };
     (Box<[RegistrationSessionRequestedInformation] >) => {
         ::jni::objects::JObjectArray<'local>
+    };
+    (Box<[RegisterResponseBadge] >) => {
+        ::jni::objects::JObjectArray<'local>
+    };
+    (CheckSvr2CredentialsResponse) => {
+        ::jni::objects::JObject<'local>
     };
     (Serialized<$typ:ident>) => {
         ::jni::objects::JByteArray<'local>
