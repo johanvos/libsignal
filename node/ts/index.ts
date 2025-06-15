@@ -47,6 +47,11 @@ export enum ContentHint {
   Implicit = 2,
 }
 
+export enum UsePQRatchet {
+  Yes,
+  No,
+}
+
 export type Uuid = string;
 
 export function hkdf(
@@ -252,24 +257,23 @@ export class PreKeyBundle {
     signed_prekey: PublicKey,
     signed_prekey_signature: Buffer,
     identity_key: PublicKey,
-    kyber_prekey_id?: number | null,
-    kyber_prekey?: KEMPublicKey | null,
-    kyber_prekey_signature?: Buffer | null
+    kyber_prekey_id: number,
+    kyber_prekey: KEMPublicKey,
+    kyber_prekey_signature: Buffer
   ): PreKeyBundle {
     return new PreKeyBundle(
       Native.PreKeyBundle_New(
         registration_id,
         device_id,
         prekey_id,
-        prekey != null ? prekey : null,
-        //prekey?,
+        prekey,
         signed_prekey_id,
         signed_prekey,
         signed_prekey_signature,
         identity_key,
-        kyber_prekey_id ?? null,
-        kyber_prekey ?? null,
-        kyber_prekey_signature ?? Buffer.alloc(0)
+        kyber_prekey_id,
+        kyber_prekey,
+        kyber_prekey_signature
       )
     );
   }
@@ -309,18 +313,18 @@ export class PreKeyBundle {
     return Native.PreKeyBundle_GetSignedPreKeySignature(this);
   }
 
-  kyberPreKeyId(): number | null {
+  kyberPreKeyId(): number {
     return Native.PreKeyBundle_GetKyberPreKeyId(this);
   }
 
-  kyberPreKeyPublic(): KEMPublicKey | null {
-    const handle = Native.PreKeyBundle_GetKyberPreKeyPublic(this);
-    return handle == null ? null : KEMPublicKey._fromNativeHandle(handle);
+  kyberPreKeyPublic(): KEMPublicKey {
+    return KEMPublicKey._fromNativeHandle(
+      Native.PreKeyBundle_GetKyberPreKeyPublic(this)
+    );
   }
 
-  kyberPreKeySignature(): Buffer | null {
-    const buf = Native.PreKeyBundle_GetKyberPreKeySignature(this);
-    return buf.length == 0 ? null : buf;
+  kyberPreKeySignature(): Buffer {
+    return Native.PreKeyBundle_GetKyberPreKeySignature(this);
   }
 }
 
@@ -500,7 +504,8 @@ export class SignalMessage {
     previousCounter: number,
     ciphertext: Buffer,
     senderIdentityKey: PublicKey,
-    receiverIdentityKey: PublicKey
+    receiverIdentityKey: PublicKey,
+    pqRatchet: Buffer
   ): SignalMessage {
     return new SignalMessage(
       Native.SignalMessage_New(
@@ -511,7 +516,8 @@ export class SignalMessage {
         previousCounter,
         ciphertext,
         senderIdentityKey,
-        receiverIdentityKey
+        receiverIdentityKey,
+        pqRatchet
       )
     );
   }
@@ -522,6 +528,10 @@ export class SignalMessage {
 
   body(): Buffer {
     return Native.SignalMessage_GetBody(this);
+  }
+
+  pqRatchet(): Buffer {
+    return Native.SignalMessage_GetPqRatchet(this);
   }
 
   counter(): number {
@@ -1036,6 +1046,12 @@ export abstract class SessionStore implements Native.SessionStore {
   ): Promise<SessionRecord[]>;
 }
 
+export enum IdentityChange {
+  // This must be kept in sync with the Rust enum of the same name.
+  NewOrUnchanged = 0,
+  ReplacedExisting = 1,
+}
+
 export abstract class IdentityKeyStore implements Native.IdentityKeyStore {
   async _getIdentityKey(): Promise<Native.PrivateKey> {
     const key = await this.getIdentityKey();
@@ -1048,7 +1064,7 @@ export abstract class IdentityKeyStore implements Native.IdentityKeyStore {
   async _saveIdentity(
     name: Native.ProtocolAddress,
     key: Native.PublicKey
-  ): Promise<boolean> {
+  ): Promise<Native.IdentityChange> {
     return this.saveIdentity(
       ProtocolAddress._fromNativeHandle(name),
       PublicKey._fromNativeHandle(key)
@@ -1083,7 +1099,7 @@ export abstract class IdentityKeyStore implements Native.IdentityKeyStore {
   abstract saveIdentity(
     name: ProtocolAddress,
     key: PublicKey
-  ): Promise<boolean>;
+  ): Promise<IdentityChange>;
   abstract isTrustedIdentity(
     name: ProtocolAddress,
     key: PublicKey,
@@ -1395,6 +1411,7 @@ export function processPreKeyBundle(
   address: ProtocolAddress,
   sessionStore: SessionStore,
   identityStore: IdentityKeyStore,
+  usePqRatchet: UsePQRatchet,
   now: Date = new Date()
 ): Promise<void> {
   return Native.SessionBuilder_ProcessPreKeyBundle(
@@ -1402,7 +1419,8 @@ export function processPreKeyBundle(
     address,
     sessionStore,
     identityStore,
-    now.getTime()
+    now.getTime(),
+    usePqRatchet == UsePQRatchet.Yes
   );
 }
 
@@ -1445,7 +1463,8 @@ export function signalDecryptPreKey(
   identityStore: IdentityKeyStore,
   prekeyStore: PreKeyStore,
   signedPrekeyStore: SignedPreKeyStore,
-  kyberPrekeyStore: KyberPreKeyStore
+  kyberPrekeyStore: KyberPreKeyStore,
+  usePqRatchet: UsePQRatchet
 ): Promise<Buffer> {
   return Native.SessionCipher_DecryptPreKeySignalMessage(
     message,
@@ -1454,7 +1473,8 @@ export function signalDecryptPreKey(
     identityStore,
     prekeyStore,
     signedPrekeyStore,
-    kyberPrekeyStore
+    kyberPrekeyStore,
+    usePqRatchet == UsePQRatchet.Yes
   );
 }
 
@@ -1557,7 +1577,8 @@ export async function sealedSenderDecryptMessage(
   identityStore: IdentityKeyStore,
   prekeyStore: PreKeyStore,
   signedPrekeyStore: SignedPreKeyStore,
-  kyberPrekeyStore: KyberPreKeyStore
+  kyberPrekeyStore: KyberPreKeyStore,
+  usePqRatchet: UsePQRatchet
 ): Promise<SealedSenderDecryptionResult> {
   const ssdr = await Native.SealedSender_DecryptMessage(
     message,
@@ -1570,7 +1591,8 @@ export async function sealedSenderDecryptMessage(
     identityStore,
     prekeyStore,
     signedPrekeyStore,
-    kyberPrekeyStore
+    kyberPrekeyStore,
+    usePqRatchet == UsePQRatchet.Yes
   );
   return SealedSenderDecryptionResult._fromNativeHandle(ssdr);
 }

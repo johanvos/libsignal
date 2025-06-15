@@ -149,7 +149,8 @@ impl TransportConnector for SocksConnector {
 
         log::debug!("connecting TLS through proxy");
         let stream =
-            crate::tcp_ssl::connect_tls(socks_stream, connection_params, alpn, log_tag).await?;
+            crate::tcp_ssl::connect_tls(socks_stream, connection_params, alpn, None, log_tag)
+                .await?;
 
         log::info!("connection through SOCKS proxy established successfully");
         Ok(StreamAndInfo(
@@ -183,10 +184,7 @@ impl Connector<SocksRoute<IpAddr>, ()> for super::StatelessProxied {
 
         async move {
             log::info!("[{log_tag}] establishing connection to host over SOCKS proxy");
-            log::debug!(
-                "[{log_tag}] establishing connection to {:?} over SOCKS proxy",
-                target_addr
-            );
+            log::debug!("[{log_tag}] establishing connection to {target_addr:?} over SOCKS proxy");
 
             log::info!("[{log_tag}] connecting to {protocol:?} proxy over TCP");
             let TcpRoute {

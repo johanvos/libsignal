@@ -215,7 +215,6 @@ async fn spawn_connected_chat(
     };
     let (sender, receiver) = mpsc::channel(MAX_PENDING_REQUESTS);
     let on_disconnect = on_disconnect_rx.map(|r| match r {
-        Ok(infallible) => match infallible {},
         Err(_recv_error) => (),
     });
     log::info!("successfully connecting chat for registration");
@@ -295,7 +294,7 @@ async fn send_request_to_connected_chat(
 async fn spawned_task_body(
     chat: ChatConnection,
     incoming_requests: impl Stream<Item = IncomingRequest> + Send,
-    mut on_disconnect: impl Future<Output = ()>,
+    on_disconnect: impl Future<Output = ()>,
 ) {
     let mut on_disconnect = std::pin::pin!(on_disconnect);
 

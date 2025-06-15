@@ -14,6 +14,7 @@ import org.signal.libsignal.protocol.state.SessionStore;
 import org.signal.libsignal.protocol.state.PreKeyStore;
 import org.signal.libsignal.protocol.state.SignedPreKeyStore;
 import org.signal.libsignal.protocol.state.KyberPreKeyStore;
+import org.signal.libsignal.protocol.SignedPublicPreKey;
 import org.signal.libsignal.protocol.groups.state.SenderKeyStore;
 import org.signal.libsignal.protocol.logging.Log;
 import org.signal.libsignal.protocol.logging.SignalProtocolLogger;
@@ -55,6 +56,12 @@ public final class NativeTesting {
 
   public static native void OtherTestingHandleType_Destroy(long handle);
 
+  public static native byte[] SessionRecord_GetAliceBaseKey(long obj) throws Exception;
+  public static native byte[] SessionRecord_GetReceiverChainKeyValue(long sessionState, long key) throws Exception;
+  public static native byte[] SessionRecord_GetSenderChainKeyValue(long obj) throws Exception;
+  public static native byte[] SessionRecord_InitializeAliceSession(long identityKeyPrivate, long identityKeyPublic, long basePrivate, long basePublic, long theirIdentityKey, long theirSignedPrekey, long theirRatchetKey, boolean usePqRatchet) throws Exception;
+  public static native byte[] SessionRecord_InitializeBobSession(long identityKeyPrivate, long identityKeyPublic, long signedPrekeyPrivate, long signedPrekeyPublic, long ephPrivate, long ephPublic, long theirIdentityKey, long theirBaseKey, boolean usePqRatchet) throws Exception;
+
   public static native String TESTING_BridgedStringMap_dump_to_json(long map);
   public static native void TESTING_CdsiLookupErrorConvert(String errorDescription) throws Exception;
   public static native CompletableFuture<Object> TESTING_CdsiLookupResponseConvert(long asyncRuntime);
@@ -65,9 +72,9 @@ public final class NativeTesting {
   public static native String TESTING_ChatRequestGetMethod(long request);
   public static native String TESTING_ChatRequestGetPath(long request);
   public static native Object TESTING_ChatResponseConvert(boolean bodyPresent);
-  public static native long TESTING_ChatSearchResult();
   public static native void TESTING_ChatSendErrorConvert(String errorDescription) throws Exception;
   public static native int TESTING_ConnectionManager_isUsingProxy(long manager);
+  public static native UUID TESTING_ConvertOptionalUuid(boolean present);
   public static native void TESTING_ErrorOnBorrowAsync(Object input);
   public static native CompletableFuture TESTING_ErrorOnBorrowIo(long asyncRuntime, Object input);
   public static native void TESTING_ErrorOnBorrowSync(Object input);
@@ -89,15 +96,21 @@ public final class NativeTesting {
   public static native long TESTING_FakeChatServer_Create();
   public static native CompletableFuture<Long> TESTING_FakeChatServer_GetNextRemote(long asyncRuntime, long server);
   public static native CompletableFuture<Long> TESTING_FakeRegistrationSession_CreateSession(long asyncRuntime, Object createSession, long chat);
+  public static native long TESTING_FutureCancellationCounter_Create(int initialValue);
+  public static native CompletableFuture TESTING_FutureCancellationCounter_WaitForCount(long asyncRuntime, long count, int target);
   public static native CompletableFuture<Integer> TESTING_FutureFailure(long asyncRuntime, int input);
+  public static native CompletableFuture TESTING_FutureIncrementOnCancel(long asyncRuntime, long guard);
   public static native CompletableFuture<Long> TESTING_FutureProducesOtherPointerType(long asyncRuntime, String input);
   public static native CompletableFuture<Long> TESTING_FutureProducesPointerType(long asyncRuntime, int input);
   public static native CompletableFuture<Integer> TESTING_FutureSuccess(long asyncRuntime, int input);
   public static native CompletableFuture<Void> TESTING_FutureThrowsCustomErrorType(long asyncRuntime);
   public static native byte[] TESTING_InputStreamReadIntoZeroLengthSlice(InputStream capsAlphabetInput);
   public static native String TESTING_JoinStringArray(Object[] array, String joinWith);
+  public static native void TESTING_KeyTransChatSendError() throws Exception;
+  public static native void TESTING_KeyTransFatalVerificationFailure() throws Exception;
+  public static native void TESTING_KeyTransNonFatalVerificationFailure() throws Exception;
   public static native void TESTING_NonSuspendingBackgroundThreadRuntime_Destroy(long handle);
-  public static native CompletableFuture TESTING_OnlyCompletesByCancellation(long asyncRuntime);
+  public static native long TESTING_NonSuspendingBackgroundThreadRuntime_New();
   public static native String TESTING_OtherTestingHandleType_getValue(long handle);
   public static native void TESTING_PanicInBodyAsync(Object input);
   public static native CompletableFuture TESTING_PanicInBodyIo(long asyncRuntime, Object input);
@@ -112,7 +125,11 @@ public final class NativeTesting {
   public static native CompletableFuture<Object> TESTING_PanicOnReturnIo(long asyncRuntime, Object needsCleanup);
   public static native Object TESTING_PanicOnReturnSync(Object needsCleanup);
   public static native byte[][] TESTING_ProcessBytestringArray(ByteBuffer[] input);
+  public static native long TESTING_RegisterAccountResponse_CreateTestValue();
+  public static native void TESTING_RegistrationService_CheckSvr2CredentialsErrorConvert(String errorDescription) throws Exception;
+  public static native Object TESTING_RegistrationService_CheckSvr2CredentialsResponseConvert();
   public static native void TESTING_RegistrationService_CreateSessionErrorConvert(String errorDescription) throws Exception;
+  public static native void TESTING_RegistrationService_RegisterAccountErrorConvert(String errorDescription) throws Exception;
   public static native void TESTING_RegistrationService_RequestVerificationCodeErrorConvert(String errorDescription) throws Exception;
   public static native void TESTING_RegistrationService_ResumeSessionErrorConvert(String errorDescription) throws Exception;
   public static native void TESTING_RegistrationService_SubmitVerificationErrorConvert(String errorDescription) throws Exception;
@@ -124,7 +141,11 @@ public final class NativeTesting {
   public static native int TESTING_RoundTripU32(int input);
   public static native long TESTING_RoundTripU64(long input);
   public static native int TESTING_RoundTripU8(int input);
+  public static native void TESTING_SignedPublicPreKey_CheckBridgesCorrectly(long sourcePublicKey, SignedPublicPreKey signedPreKey);
   public static native int TESTING_TestingHandleType_getValue(long handle);
+  public static native CompletableFuture<Integer> TESTING_TokioAsyncFuture(long asyncRuntime, int input);
+
+  public static native void TestingFutureCancellationCounter_Destroy(long handle);
 
   public static native void TestingHandleType_Destroy(long handle);
 

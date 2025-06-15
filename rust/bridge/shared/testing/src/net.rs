@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::*;
 
 pub mod chat;
+pub mod keytrans;
 pub mod registration;
 
 #[bridge_io(TokioAsyncContext)]
@@ -47,11 +48,6 @@ async fn TESTING_CdsiLookupResponseConvert() -> LookupResponse {
         ],
         debug_permits_used: DEBUG_PERMITS_USED,
     }
-}
-
-#[bridge_io(TokioAsyncContext)]
-async fn TESTING_OnlyCompletesByCancellation() {
-    std::future::pending::<()>().await
 }
 
 macro_rules! make_error_testing_enum {
