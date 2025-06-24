@@ -119,6 +119,7 @@ async fn process_prekey_impl(
     }
 
     let our_one_time_pre_key_pair = if let Some(pre_key_id) = message.pre_key_id() {
+        println!("[LIBSIGNAL] processing PreKey message from {remote_address}");
         log::info!("processing PreKey message from {remote_address}");
         Some(pre_key_store.get_pre_key(pre_key_id).await?.key_pair()?)
     } else {
@@ -220,6 +221,7 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
 
     let mut session = ratchet::initialize_alice_session(&parameters, csprng)?;
 
+    println!("[LIBSIGNAL] set_unacknowledged_pre_key_message for XX with preKeyId: YY");
     log::info!(
         "set_unacknowledged_pre_key_message for: {} with preKeyId: {}",
         remote_address,
@@ -234,7 +236,10 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     );
 
     if let Some(kyber_pre_key_id) = bundle.kyber_pre_key_id()? {
+        println!("[LIBSIGNAL] KYBERYES");
         session.set_unacknowledged_kyber_pre_key_id(kyber_pre_key_id);
+    } else {
+        println!("[LIBSIGNAL] KYBERNO");
     }
 
     session.set_local_registration_id(identity_store.get_local_registration_id().await?);

@@ -38,11 +38,16 @@ public class SignalMessage extends NativeHandleGuard.SimpleOwner
             InvalidKeyException.class,
             LegacyMessageException.class,
             () -> Native.SignalMessage_Deserialize(serialized)));
+    System.err.println("[LIBSIGNAL] created SignalMessage from " + serialized.length + " bytes");
+    System.err.println("[LIBSIGNAL] messageVersion = " + getMessageVersion());
+    System.err.println("[LIBSIGNAL] pqratchet = " + getPqRatchet().length);
+    Thread.dumpStack();
   }
 
   @CalledFromNative
   public SignalMessage(long nativeHandle) {
     super(nativeHandle);
+    Thread.dumpStack();
   }
 
   public ECPublicKey getSenderRatchetKey() {
@@ -90,6 +95,8 @@ public class SignalMessage extends NativeHandleGuard.SimpleOwner
 
   @Override
   public byte[] serialize() {
+    System.err.println("[LIBSIGNAL] outgoing messageVersion = " + getMessageVersion());
+    Thread.dumpStack();
     return filterExceptions(() -> guardedMapChecked(Native::SignalMessage_GetSerialized));
   }
 

@@ -189,6 +189,20 @@ public class SealedSessionCipher {
         () -> Native.SealedSessionCipher_MultiRecipientMessageForSingleRecipient(message));
   }
 
+  public UnidentifiedSenderMessageContent decrypt(byte[] ciphertext) throws Exception {
+    System.err.println("[LIBSIGNAL] sealedsessioncipher.decrypttoUsmc " );
+    UnidentifiedSenderMessageContent content;
+    try {
+      content =
+          new UnidentifiedSenderMessageContent(
+              Native.SealedSessionCipher_DecryptToUsmc(ciphertext, this.signalProtocolStore));
+      return content;
+    } catch (Exception e) {
+      throw new InvalidMetadataMessageException(e);
+    }
+  }
+
+
   public DecryptionResult decrypt(
       CertificateValidator validator, byte[] ciphertext, long timestamp, UsePqRatchet usePqRatchet)
       throws InvalidMetadataMessageException,
@@ -202,6 +216,8 @@ public class SealedSessionCipher {
           ProtocolInvalidKeyIdException,
           ProtocolUntrustedIdentityException,
           SelfSendException {
+    System.err.println("[LIBSIGNAL] sealedsessioncipher.decrypt with pqratched = " + usePqRatchet);
+Thread.dumpStack();
     UnidentifiedSenderMessageContent content;
     try {
       content =
@@ -273,9 +289,11 @@ public class SealedSessionCipher {
 
     switch (message.getType()) {
       case CiphertextMessage.WHISPER_TYPE:
+System.err.println("USMC LIBSIGNAL, mc size = " + message.getContent().length);
         return new SessionCipher(signalProtocolStore, sender)
             .decrypt(new SignalMessage(message.getContent()));
       case CiphertextMessage.PREKEY_TYPE:
+        Thread.dumpStack();
         return new SessionCipher(signalProtocolStore, sender)
             .decrypt(new PreKeySignalMessage(message.getContent()), usePqRatchet);
       case CiphertextMessage.SENDERKEY_TYPE:

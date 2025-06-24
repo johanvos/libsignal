@@ -56,6 +56,7 @@ impl ClientConnection {
 
     /// Unwrap a ciphertext message that's been received, returning the plaintext.
     pub fn recv(&mut self, received_ciphertext: &[u8]) -> Result<Vec<u8>> {
+        eprintln!("[LIBSIGNAL] recv");
         let mut received_plaintext: Vec<u8> = vec![0u8; received_ciphertext.len()];
         let mut total_size = 0;
         for chunk in received_ciphertext.chunks(NOISE_TRANSPORT_PER_PACKET_MAX) {

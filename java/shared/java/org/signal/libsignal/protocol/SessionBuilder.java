@@ -113,6 +113,7 @@ public class SessionBuilder {
       throws InvalidKeyException, UntrustedIdentityException {
     try (NativeHandleGuard preKeyGuard = new NativeHandleGuard(preKey);
         NativeHandleGuard remoteAddressGuard = new NativeHandleGuard(this.remoteAddress)) {
+      System.err.println("[LIBSIGNAL JAVA] process new session, ratchet = " + usePqRatchet);
       filterExceptions(
           InvalidKeyException.class,
           UntrustedIdentityException.class,

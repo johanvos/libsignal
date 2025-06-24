@@ -53,31 +53,39 @@ const MAX_VALID_DEVICE_ID: u32 = 127;
 
 impl ServerCertificate {
     pub fn deserialize(data: &[u8]) -> Result<Self> {
+        eprintln!("[LIBSIGNAL] sc 1a");
         let pb = proto::sealed_sender::ServerCertificate::decode(data)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
+        eprintln!("[LIBSIGNAL] sc 1b");
         if pb.certificate.is_none() || pb.signature.is_none() {
             return Err(SignalProtocolError::InvalidProtobufEncoding);
         }
 
+        eprintln!("[LIBSIGNAL] sc 1c");
         let certificate = pb
             .certificate
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 1d, cert = {:?}", certificate);
         let signature = pb
             .signature
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 1e");
         let certificate_data =
             proto::sealed_sender::server_certificate::Certificate::decode(certificate.as_ref())
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 1f");
         let key = PublicKey::try_from(
             &certificate_data
                 .key
                 .ok_or(SignalProtocolError::InvalidProtobufEncoding)?[..],
         )?;
+        eprintln!("[LIBSIGNAL] sc 1g");
         let key_id = certificate_data
             .id
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
 
+        eprintln!("[LIBSIGNAL] sc 1z");
         Ok(Self {
             serialized: data.to_vec(),
             certificate,
@@ -171,32 +179,41 @@ pub struct SenderCertificate {
 
 impl SenderCertificate {
     pub fn deserialize(data: &[u8]) -> Result<Self> {
+        eprintln!("[LIBSIGNAL] sc 2a");
         let pb = proto::sealed_sender::SenderCertificate::decode(data)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2b");
         let certificate = pb
             .certificate
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2c");
         let signature = pb
             .signature
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2d");
         let certificate_data =
             proto::sealed_sender::sender_certificate::Certificate::decode(certificate.as_ref())
                 .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
+        eprintln!("[LIBSIGNAL] sc 2e");
         let sender_device_id: DeviceId = certificate_data
             .sender_device
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?
             .into();
+        eprintln!("[LIBSIGNAL] sc 2f");
         let expiration = certificate_data
             .expires
             .map(Timestamp::from_epoch_millis)
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2g");
         let signer_pb = certificate_data
             .signer
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2h");
         let sender_uuid = certificate_data
             .sender_uuid
             .ok_or(SignalProtocolError::InvalidProtobufEncoding)?;
+        eprintln!("[LIBSIGNAL] sc 2i");
         let sender_e164 = certificate_data.sender_e164;
 
         let key = PublicKey::try_from(
@@ -204,9 +221,11 @@ impl SenderCertificate {
                 .identity_key
                 .ok_or(SignalProtocolError::InvalidProtobufEncoding)?[..],
         )?;
+        eprintln!("[LIBSIGNAL] sc 2j");
 
         let signer_bits = signer_pb.encode_to_vec();
         let signer = ServerCertificate::deserialize(&signer_bits)?;
+        eprintln!("[LIBSIGNAL] sc 2k");
 
         Ok(Self {
             signer,
@@ -415,6 +434,7 @@ pub struct UnidentifiedSenderMessageContent {
 
 impl UnidentifiedSenderMessageContent {
     pub fn deserialize(data: &[u8]) -> Result<Self> {
+        eprintln!("[LIBSIGNAL] sc 3");
         let pb = proto::sealed_sender::unidentified_sender_message::Message::decode(data)
             .map_err(|_| SignalProtocolError::InvalidProtobufEncoding)?;
 
@@ -542,6 +562,7 @@ impl<'a> UnidentifiedSenderMessage<'a> {
         })?;
         let version = version_byte >> 4;
         log::debug!("deserializing UnidentifiedSenderMessage with version {version}");
+        eprintln!("[LIBSIGNAL] sc 4");
 
         match version {
             0 | SEALED_SENDER_V1_MAJOR_VERSION => {
@@ -1544,6 +1565,7 @@ impl<'a> SealedSenderV2SentMessage<'a> {
             return Err(SignalProtocolError::UnknownSealedSenderVersion(version));
         }
 
+        eprintln!("[LIBSIGNAL] sc 5");
         fn advance<'a, const N: usize>(buf: &mut &'a [u8]) -> Result<&'a [u8; N]> {
             let (prefix, remaining) = buf
                 .split_first_chunk()

@@ -130,6 +130,8 @@ public class SessionCipher {
           UntrustedIdentityException {
     try (NativeHandleGuard ciphertextGuard = new NativeHandleGuard(ciphertext);
         NativeHandleGuard remoteAddressGuard = new NativeHandleGuard(this.remoteAddress); ) {
+      System.err.println(
+          "[LIBSIGNAL] protocol.sessionCipher.decrypt with pqRatched = " + usePqRatchet);
       return filterExceptions(
           DuplicateMessageException.class,
           InvalidMessageException.class,

@@ -350,6 +350,7 @@ bridge_get!(SignalMessage::message_version -> u32, ffi = "message_get_message_ve
 // Normal bridge_get!() doesn't work here, since msg.pq_ratchet() returns a &spqr::SerializedMessage.
 #[bridge_fn(ffi = "message_get_pq_ratchet")]
 fn SignalMessage_GetPqRatchet(msg: &SignalMessage) -> &[u8] {
+    println!("pq_ratchet asked!");
     msg.pq_ratchet()
 }
 
@@ -1090,6 +1091,9 @@ async fn SessionCipher_DecryptPreKeySignalMessage(
     kyber_prekey_store: &mut dyn KyberPreKeyStore,
     use_pq_ratchet: bool,
 ) -> Result<Vec<u8>> {
+    println!("[LIBSIGNAL] DECRYPTPREKEYSIGNALMESSAGEinf pr");
+    log::info!("[LIBSIGNAL] DECRYPTPREKEYSIGNALMESSAGEinf");
+    log::warn!("[LIBSIGNAL] DECRYPTPREKEYSIGNALMESSAGE");
     let mut csprng = rand::rngs::OsRng.unwrap_err();
     message_decrypt_prekey(
         message,

@@ -85,6 +85,12 @@ impl SignalMessage {
         receiver_identity_key: &IdentityKey,
         pq_ratchet: &[u8],
     ) -> Result<Self> {
+        if pq_ratchet.is_empty() {
+            println!("[LIBSIGNAL] empty ratchet");
+            log::warn!("[LIBSIGNAL] empty ratchet");
+        } else {
+            println!("[LIBSIGNAL] non-empty ratchet");
+        }
         let message = proto::wire::SignalMessage {
             ratchet_key: Some(sender_ratchet_key.serialize().into_vec()),
             counter: Some(counter),
@@ -210,6 +216,7 @@ impl TryFrom<&[u8]> for SignalMessage {
             return Err(SignalProtocolError::CiphertextMessageTooShort(value.len()));
         }
         let message_version = value[0] >> 4;
+        eprintln!("[LIBSIGNAL] create sm, value0 = {} and mv = {}", value[0], message_version);
         if message_version < CIPHERTEXT_MESSAGE_PRE_KYBER_VERSION {
             return Err(SignalProtocolError::LegacyCiphertextVersion(
                 message_version,

@@ -14,10 +14,18 @@ use crate::proto::storage::{session_structure, RecordStructure, SessionStructure
 use crate::ratchet::{ChainKey, MessageKeyGenerator, RootKey};
 use crate::state::{KyberPreKeyId, PreKeyId, SignedPreKeyId};
 use crate::{consts, kem, IdentityKey, KeyPair, PrivateKey, PublicKey, SignalProtocolError};
+use std::backtrace::Backtrace;
 
 /// A distinct error type to keep from accidentally propagating deserialization errors.
 #[derive(Debug)]
 pub(crate) struct InvalidSessionError(&'static str);
+
+fn dump_stack() {
+    println!("STACK2!");
+    std::env::set_var("RUST_BACKTRACE", "1"); // Ensure it's enabled
+    let bt = Backtrace::capture();
+    println!("{:?}", bt);
+}
 
 impl std::fmt::Display for InvalidSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,6 +113,7 @@ impl SessionState {
         alice_base_key: &PublicKey,
         pq_ratchet_state: spqr::SerializedState,
     ) -> Self {
+        println!("[LIBSIGNAL RUST] pq_ratchet_state in Sessionstate - new with {:?}", pq_ratchet_state);
         Self {
             session: SessionStructure {
                 session_version: version as u32,
@@ -494,6 +503,7 @@ impl SessionState {
     pub(crate) fn clear_unacknowledged_pre_key_message(&mut self) {
         // Explicitly destructuring the SessionStructure in case there are new
         // pending fields that need to be cleared.
+        println!("[LIBSIGNAL RUST] pq_ratchet_state in Sessionstate - IGNORE?");
         let SessionStructure {
             session_version: _session_version,
             local_identity_public: _local_identity_public,
@@ -544,6 +554,11 @@ impl SessionState {
         msg: &spqr::SerializedMessage,
     ) -> Result<spqr::MessageKey, spqr::Error> {
         let spqr::Recv { state, key } = spqr::recv(&self.session.pq_ratchet_state, msg)?;
+        println!("[LIBSIGNAL RUST] RECEIVE PQ_RATCHET! pq_ratchet_state in Sessionstate - now with {:?}", state);
+        println!("[LIBSIGNAL RUST] RECEIVE PQ_RATCHET! pq_ratchet_state in Sessionstate - now with key = {:?}", key);
+        println!("[LIBSIGNAL RUST] RECEIVE PQ_RATCHET! pq_ratchet_state in Sessionstate - version {:?}", self.session.session_version);
+        println!("[LIBSIGNAL RUST] RECEIVE PQ_RATCHET! pq_ratchet_state in Sessionstate - lip {:?}", self.session.local_identity_public);
+        dump_stack();
         self.session.pq_ratchet_state = state;
         Ok(key)
     }
@@ -552,7 +567,9 @@ impl SessionState {
         &mut self,
         csprng: &mut R,
     ) -> Result<(spqr::SerializedMessage, spqr::MessageKey), spqr::Error> {
+        println!("[LIBSIGNAL RUST] selfsessionpqratchetstate = {:?}", &self.session.pq_ratchet_state);
         let spqr::Send { state, key, msg } = spqr::send(&self.session.pq_ratchet_state, csprng)?;
+        println!("[LIBSIGNAL RUST] selfsessionpqratchetstate  now to = {:?}", state);
         self.session.pq_ratchet_state = state;
         Ok((msg, key))
     }

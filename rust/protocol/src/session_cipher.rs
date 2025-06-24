@@ -33,6 +33,7 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
         .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
     let chain_key = session_state.get_sender_chain_key()?;
+    println!("[LIBSIGNAL RUST] message_encrypt");
 
     let (pqr_msg, pqr_key) = session_state.pq_ratchet_send(csprng).map_err(|e| {
         // Since we're sending, this must be an error with the state.
@@ -41,6 +42,7 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
             format!("post-quantum ratchet send error: {e}"),
         )
     })?;
+    println!("[LIBSIGNAL RUST] pqr_msg = {:?} and pqr_key = {:?}", pqr_msg, pqr_key);
     let message_keys = chain_key.message_keys().generate_keys(pqr_key);
 
     let sender_ephemeral = session_state.sender_ratchet_key()?;
@@ -601,6 +603,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
     remote_address: &ProtocolAddress,
     csprng: &mut R,
 ) -> Result<Vec<u8>> {
+    println!("[LIBSIGNAL] decrypt_message_with_state");
     // Check for a completely empty or invalid session state before we do anything else.
     let _ = state.root_key().map_err(|_| {
         SignalProtocolError::InvalidMessage(
@@ -642,6 +645,7 @@ fn decrypt_message_with_state<R: Rng + CryptoRng>(
                 )
             }
         })?;
+    println!("[LIBSIGNAL] pqr_key = {:?}", pqr_key);
     let message_keys = message_key_gen.generate_keys(pqr_key);
 
     let their_identity_key =
